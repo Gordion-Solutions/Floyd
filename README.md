@@ -4,62 +4,130 @@
 [![crates.io: cargo-floyd](https://img.shields.io/crates/v/cargo-floyd.svg?label=cargo-floyd)](https://crates.io/crates/cargo-floyd)
 [![license: MIT OR Apache-2.0](https://img.shields.io/crates/l/floyd.svg)](#license)
 
-Floyd is an open-source MC/DC (Modified Condition/Decision Coverage) engine
-for Rust, focused on automotive safety-critical use cases (ISO 26262,
-ASIL-D, TCL3).
+Floyd is an open-source MC/DC (Modified Condition/Decision Coverage)
+engine for Rust, focused on automotive safety-critical code
+(ISO 26262, ASIL-D, TCL3).
 
-## Status — Phase 0
+```
+$ cargo floyd test
+floyd  runtime MC/DC analysis of Cargo.toml
 
-🚧 **This repo is currently scaffolding only.** Names are reserved on
-crates.io (`floyd`, `cargo-floyd`). The actual engine — MIR/HIR decision
-decomposition, masking analysis, condition independence proofs, and the
-`cargo floyd` developer workflow — is under active development.
+Tests discovered: 4
+Observations:     4
+Conditions:       channel_a_ok, channel_b_ok, master_enable
 
-## Architectural commitment
+Per-condition MC/DC status:
+  ✓ master_enable: EXERCISED  via (channel_a_ok=T, channel_b_ok=T, master_enable=F) -> F   vs   (channel_a_ok=T, channel_b_ok=T, master_enable=T) -> T
+  ✓ channel_a_ok:  EXERCISED  via (channel_a_ok=F, channel_b_ok=T, master_enable=T) -> F   vs   (channel_a_ok=T, channel_b_ok=T, master_enable=T) -> T
+  ✓ channel_b_ok:  EXERCISED  via (channel_a_ok=T, channel_b_ok=F, master_enable=T) -> F   vs   (channel_a_ok=T, channel_b_ok=T, master_enable=T) -> T
 
-Floyd is an **external** MC/DC engine: it consumes rustc's existing
-`-Cinstrument-coverage` + `-Zcoverage-options=branch,condition` output
-and performs MC/DC reasoning in its own code. No rustc fork, no required
-upstream change. The primary qualification target is **ISO 26262 TCL3**
-via the qualification-by-validation path, with the benchmark corpus as
-the central evidence artifact. See
+MC/DC coverage: 3 of 3 conditions exercised (100%)
+```
+
+## Install
+
+```sh
+# Nightly toolchain + LLVM coverage tools (one-time).
+rustup install nightly
+rustup component add llvm-tools-preview --toolchain nightly
+
+# Floyd itself.
+cargo install cargo-floyd
+```
+
+Then, inside any cargo project with `#[test]` functions:
+
+```sh
+cargo floyd test
+```
+
+Floyd builds the project's tests with `-Cinstrument-coverage
+-Zcoverage-options=branch,condition`, runs each test in isolation,
+ingests its `profraw` via `llvm-profdata` + `llvm-cov`, and reports
+which decisions the test suite exercises under masking MC/DC.
+
+## What works (and what doesn't)
+
+Floyd recovers logical decisions from rustc MIR and analyses them
+against the [masking MC/DC variant][cast-10] (the modern qualified
+default). The recovered Phase 0 decision shapes are:
+
+| Shape | Status |
+|-------|--------|
+| `a && b`, `a \|\| b`, `!a`, arbitrary nesting | ✅ |
+| `if let Some(x) = opt { ... } else { ... }` (with binding) | ✅ |
+| `let x = opt?; <expression using x>` (skip-through) | ✅ |
+| `match n { 0 => ..., 1 => ..., _ => ... }` on integer scrutinees | ✅ |
+| `match m { Variant => ... }` on enum scrutinees (no binding) | ❌ declined |
+| Match guards (`match n { 0 if c => ... }`) | ❌ declined |
+| Multi-decision functions | ❌ first decision only |
+| Pattern destructuring beyond a single bound value | ❌ |
+| Async desugaring, macro expansion provenance | ❌ |
+
+"Declined" means the engine returns *no decision* rather than wrong
+output. The pattern shapes the engine doesn't yet recover stay
+visible to the test harness — they just don't contribute to the MC/DC
+report. Engineers wanting MC/DC on an enum variant should use
+`if let` with a binding so the dedicated `if let` handler can
+recover the variant name.
+
+The engine is correct on what it claims to recover. The
+[`corpus/`](corpus/) directory holds the ground-truth analyses
+Floyd's output is checked against — see "Qualification stance" below.
+
+[cast-10]: https://www.faa.gov/aircraft/air_cert/design_approvals/air_software/cast/cast_papers (CAST-10 — Modified Condition/Decision Coverage)
+
+## Why MC/DC, why this engine
+
+DO-178C, ISO 26262, and IEC 61508 require MC/DC analysis at the
+highest safety levels. Until recently `rustc` shipped partial MC/DC
+instrumentation behind `-Zcoverage-options=mcdc`, but that
+implementation was removed in August 2025 (PR #144999). No
+cargo-native open-source MC/DC tool exists at the time of writing.
+Floyd fills that gap.
+
+The closest neighbouring tool is AdaCore's [gnatcov][gnatcov],
+which is qualified for DO-178C Level A and ISO 26262 ASIL-D — but
+only on Ada and SPARK, and via the AdaCore toolchain. Floyd takes
+the qualification-by-validation route on rustc's existing
+instrumentation, with the differential corpus in this repo as the
+load-bearing evidence artifact.
+
+[gnatcov]: https://www.adacore.com/gnatpro/toolsuite/gnatcoverage
+
+## Qualification stance
+
+Floyd's qualification target is ISO 26262 TCL3 via the
+qualification-by-validation path. The
+[`corpus/`](corpus/) directory pins every decision shape Floyd
+claims to handle, alongside the hand-computed MC/DC analysis a
+qualified reviewer would produce. CI re-runs the corpus on every
+commit; any drift between engine output and pinned ground truth
+fails the build. This is the substrate auditors use to trust the
+engine without reading its source.
+
+See
 [ADR-0001](architecture/decisions/0001-external-engine-automotive-first.md)
-for the full rationale and alternatives considered.
-
-## Why MC/DC
-
-DO-178C, ISO 26262, and IEC 61508 require MC/DC analysis at the highest
-safety levels. Until recently `rustc` shipped partial MC/DC instrumentation
-behind `-Zcoverage-options=mcdc`, but that implementation was removed in
-August 2025 (PR #144999). No cargo-native open-source MC/DC tool exists at
-the time of writing. Floyd aims to fill that gap and become the canonical
-evaluation substrate for Rust MC/DC.
+for the architectural commitment (external engine, no rustc fork,
+automotive-first scope) and
+[ADR-0002](architecture/decisions/0002-runtime-pipeline.md) for the
+runtime pipeline design.
 
 ## Layout
 
 ```
 .
-├── floyd/              — the engine (library crate)
-├── cargo-floyd/        — `cargo floyd` subcommand driver (binary)
-└── architecture/       — workflow + per-tool design graphs
-    ├── workflow.toml     Top-level pipeline (stages + typed data contracts)
-    ├── tools/            Per-tool sub-graphs (entry fn, internal calls)
-    └── types/            Payload type definitions referenced by edges
+├── floyd/              the engine (library crate)
+├── cargo-floyd/        cargo subcommand driver (binary)
+├── corpus/             qualification evidence
+│   ├── v0/             synthetic decision patterns
+│   └── v1/             safety-critical decision patterns
+├── architecture/       workflow + per-tool design graphs
+│   ├── workflow.toml     top-level pipeline (stages + typed contracts)
+│   ├── decisions/        accepted architecture decision records
+│   └── tools/            per-tool sub-graphs
+└── tests/end_to_end_001.rs    gated full-pipeline integration test
 ```
-
-The `architecture/` graph is the design source of truth. As code lands,
-the per-tool sub-graphs are checked against the actual `syn`-extracted call
-graph in CI — drift between design and implementation fails the build.
-
-## Roadmap
-
-The open-source v0.x line ships the `cargo floyd test` workflow end to
-end on Rust source files with `#[test]` functions, including a
-real-crate benchmark corpus and a `crates.io` v0.1.0 release. The
-in-scope feature set is pinned in
-[ADR-0003](architecture/decisions/0003-open-source-vs-commercial-scope.md);
-items beyond that are addressed by Floyd's commercial editions, outside
-this repository.
 
 ## License
 
@@ -68,12 +136,17 @@ Dual-licensed under either:
 - MIT License ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
 
-at your option. Unless you explicitly state otherwise, any contribution
-intentionally submitted for inclusion in this project shall be dual licensed
-as above, without any additional terms or conditions.
+at your option. Unless you explicitly state otherwise, any
+contribution intentionally submitted for inclusion in this project
+shall be dual licensed as above, without any additional terms or
+conditions.
 
 ## Contributing
 
-Floyd is in early scaffolding — issues are welcome, but rapid breaking
-changes should be expected. See [architecture/](architecture/) for the
-planned design before opening larger PRs.
+Issues and PRs are welcome — see [architecture/](architecture/) for
+the design source of truth before proposing larger changes. New
+corpus patterns are the highest-value contribution: open a PR
+adding a directory under `corpus/v<N>/patterns/` with
+`pattern.toml` (analysis) + `src.rs` (the function under test).
+The schema is documented in
+[`corpus/README.md`](corpus/README.md).

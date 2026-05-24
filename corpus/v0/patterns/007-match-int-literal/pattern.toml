@@ -1,0 +1,57 @@
+# Floyd corpus pattern.
+# Schema documented at corpus/README.md.
+
+schema_version = 1
+id = "007-match-int-literal"
+name = "Match on integer literal"
+description = """
+Canonical literal `match` on an integer scrutinee. Rust lowers it to
+a single-arm `switchInt(copy _1) -> [0: bb_zero, otherwise: bb_other]`.
+The shape is identical to the MIR for `if a { ... }` on a `bool`, so
+the decomposer disambiguates by type: when `_1` is `bool` the
+existing short-circuit handler emits a condition named `a`; when
+`_1` is an integer the literal-`match` handler emits a condition
+named `n == 0` instead.
+
+The pattern is a one-condition decision: MC/DC is trivially achieved
+by exercising both `n == 0` (the matched arm) and `n != 0` (the
+wildcard arm).
+"""
+
+source = "src.rs"
+function = "decide"
+signature = "fn decide(n: i32) -> bool"
+
+[decision]
+expr = "match n { 0 => false, _ => true }"
+conditions = ["n == 0"]
+short_circuit = false
+
+variant = "masking"
+
+# Single condition => 2^1 = 2 truth-table rows.
+[[truth_table]]
+inputs    = { "n == 0" = false }
+result    = true
+evaluated = ["n == 0"]
+
+[[truth_table]]
+inputs    = { "n == 0" = true }
+result    = false
+evaluated = ["n == 0"]
+
+# MC/DC independence pair: the single condition is its own pair.
+[[independence_pair]]
+condition     = "n == 0"
+held_constant = []
+test_1 = { "n == 0" = false, result = true }
+test_2 = { "n == 0" = true,  result = false }
+
+# Minimum test set: two tests, one per truth-table row.
+[[minimum_test_set]]
+inputs = { "n == 0" = false }
+result = true
+
+[[minimum_test_set]]
+inputs = { "n == 0" = true }
+result = false

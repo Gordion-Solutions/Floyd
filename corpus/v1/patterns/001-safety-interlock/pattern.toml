@@ -1,0 +1,101 @@
+# Floyd corpus pattern.
+# Schema documented at corpus/README.md.
+
+schema_version = 1
+id = "001-safety-interlock"
+name = "Triple-redundant safety interlock"
+description = """
+Three-condition AND gate over the master enable and two safety
+channels. Each condition has the safety effect that a fault on a
+single channel must inhibit the output regardless of the other
+channels' state.
+
+Short-circuit evaluation collapses the right two conditions when
+the master enable is false: the rest of the gate isn't checked at
+all. MC/DC for this decision requires demonstrating that each of
+the three conditions independently changes the output — i.e. that
+the test suite contains a pair of tests for each condition where
+flipping only that condition flips the verdict, which together
+prove no single channel is silently ignored.
+"""
+
+source = "src.rs"
+function = "allow_actuation"
+signature = "fn allow_actuation(master_enable: bool, channel_a_ok: bool, channel_b_ok: bool) -> bool"
+
+[decision]
+expr = "master_enable && channel_a_ok && channel_b_ok"
+conditions = ["master_enable", "channel_a_ok", "channel_b_ok"]
+short_circuit = true
+
+variant = "masking"
+
+# Full truth table — 8 rows for 3 conditions.
+[[truth_table]]
+inputs    = { master_enable = false, channel_a_ok = false, channel_b_ok = false }
+result    = false
+evaluated = ["master_enable"]
+[[truth_table]]
+inputs    = { master_enable = false, channel_a_ok = false, channel_b_ok = true }
+result    = false
+evaluated = ["master_enable"]
+[[truth_table]]
+inputs    = { master_enable = false, channel_a_ok = true, channel_b_ok = false }
+result    = false
+evaluated = ["master_enable"]
+[[truth_table]]
+inputs    = { master_enable = false, channel_a_ok = true, channel_b_ok = true }
+result    = false
+evaluated = ["master_enable"]
+[[truth_table]]
+inputs    = { master_enable = true, channel_a_ok = false, channel_b_ok = false }
+result    = false
+evaluated = ["master_enable", "channel_a_ok"]
+[[truth_table]]
+inputs    = { master_enable = true, channel_a_ok = false, channel_b_ok = true }
+result    = false
+evaluated = ["master_enable", "channel_a_ok"]
+[[truth_table]]
+inputs    = { master_enable = true, channel_a_ok = true, channel_b_ok = false }
+result    = false
+evaluated = ["master_enable", "channel_a_ok", "channel_b_ok"]
+[[truth_table]]
+inputs    = { master_enable = true, channel_a_ok = true, channel_b_ok = true }
+result    = true
+evaluated = ["master_enable", "channel_a_ok", "channel_b_ok"]
+
+# Independence pairs (masking MC/DC). All three pairs share the
+# all-true test, which lets the minimum test set hit the theoretical
+# n+1 = 4-test minimum for 3 conditions.
+[[independence_pair]]
+condition     = "master_enable"
+held_constant = ["channel_a_ok", "channel_b_ok"]
+test_1 = { master_enable = false, channel_a_ok = true, channel_b_ok = true, result = false }
+test_2 = { master_enable = true,  channel_a_ok = true, channel_b_ok = true, result = true }
+
+[[independence_pair]]
+condition     = "channel_a_ok"
+held_constant = ["master_enable", "channel_b_ok"]
+test_1 = { master_enable = true, channel_a_ok = false, channel_b_ok = true, result = false }
+test_2 = { master_enable = true, channel_a_ok = true,  channel_b_ok = true, result = true }
+
+[[independence_pair]]
+condition     = "channel_b_ok"
+held_constant = ["master_enable", "channel_a_ok"]
+test_1 = { master_enable = true, channel_a_ok = true, channel_b_ok = false, result = false }
+test_2 = { master_enable = true, channel_a_ok = true, channel_b_ok = true,  result = true }
+
+# Minimum test set sufficient for full MC/DC — 4 tests, the
+# theoretical n+1 minimum for n=3 conditions.
+[[minimum_test_set]]
+inputs = { master_enable = false, channel_a_ok = true, channel_b_ok = true }
+result = false
+[[minimum_test_set]]
+inputs = { master_enable = true, channel_a_ok = false, channel_b_ok = true }
+result = false
+[[minimum_test_set]]
+inputs = { master_enable = true, channel_a_ok = true, channel_b_ok = false }
+result = false
+[[minimum_test_set]]
+inputs = { master_enable = true, channel_a_ok = true, channel_b_ok = true }
+result = true

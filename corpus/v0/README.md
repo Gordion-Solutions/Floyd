@@ -25,3 +25,6 @@ in the field — Phase 0 only commits to the simple cases.
 | [002-simple-or](patterns/002-simple-or/)         | `a \|\| b`         | Canonical two-condition OR (mirror of 001) |
 | [003-nested-and-or](patterns/003-nested-and-or/) | `(a && b) \|\| c`  | First nested pattern; rustc flattens both operators into one CFG of two switchInts |
 | [004-not-and](patterns/004-not-and/)             | `!a && b`        | Negated AND; rustc folds `!` into switchInt arm swap (no Not variant needed) |
+| [005-if-let-some](patterns/005-if-let-some/)     | `if let Some(x) = opt { x } else { false }` | `if let` with a binding; pattern-match becomes a synthetic condition |
+| [006-try-with-and](patterns/006-try-with-and/)   | `let x = opt?; Some(x && b)` | `?` operator skip-through: engine looks past `Try::branch` plumbing and recovers the inner `&&` |
+| [007-match-int-literal](patterns/007-match-int-literal/) | `match n { 0 => false, _ => true }` | Literal `match` on an integer; engine emits a single condition `n == 0` |

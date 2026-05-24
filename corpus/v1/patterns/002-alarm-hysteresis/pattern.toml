@@ -1,0 +1,100 @@
+# Floyd corpus pattern.
+# Schema documented at corpus/README.md.
+
+schema_version = 1
+id = "002-alarm-hysteresis"
+name = "Alarm with hysteresis"
+description = """
+Three-condition expression `over_max || (was_alarming && over_threshold)`.
+Rust lowers it to a CFG of two `switchInt`s that share a common
+evaluate-the-rest block. The decomposer must recover the full ITE
+structure from this flattened CFG rather than just the immediate
+outer `switchInt`.
+
+For this expression, masking MC/DC and unique-cause MC/DC produce
+the same independence pairs.
+"""
+
+source = "src.rs"
+function = "raise_alarm"
+signature = "fn raise_alarm(over_max: bool, was_alarming: bool, over_threshold: bool) -> bool"
+
+[decision]
+expr = "over_max || (was_alarming && over_threshold)"
+conditions = ["over_max", "was_alarming", "over_threshold"]
+short_circuit = true
+
+variant = "masking"
+
+# Truth table — 8 rows for 3 conditions.
+# `was_alarming` and `over_threshold` are masked when `over_max` is
+# true (|| short-circuits); `over_threshold` is masked when
+# `was_alarming` is false (&& short-circuits).
+[[truth_table]]
+inputs    = { over_max = false, was_alarming = false, over_threshold = false }
+result    = false
+evaluated = ["over_max", "was_alarming"]
+[[truth_table]]
+inputs    = { over_max = false, was_alarming = false, over_threshold = true }
+result    = false
+evaluated = ["over_max", "was_alarming"]
+[[truth_table]]
+inputs    = { over_max = false, was_alarming = true, over_threshold = false }
+result    = false
+evaluated = ["over_max", "was_alarming", "over_threshold"]
+[[truth_table]]
+inputs    = { over_max = false, was_alarming = true, over_threshold = true }
+result    = true
+evaluated = ["over_max", "was_alarming", "over_threshold"]
+[[truth_table]]
+inputs    = { over_max = true, was_alarming = false, over_threshold = false }
+result    = true
+evaluated = ["over_max"]
+[[truth_table]]
+inputs    = { over_max = true, was_alarming = false, over_threshold = true }
+result    = true
+evaluated = ["over_max"]
+[[truth_table]]
+inputs    = { over_max = true, was_alarming = true, over_threshold = false }
+result    = true
+evaluated = ["over_max"]
+[[truth_table]]
+inputs    = { over_max = true, was_alarming = true, over_threshold = true }
+result    = true
+evaluated = ["over_max"]
+
+# Independence pairs (masking MC/DC). Chosen to overlap maximally
+# so the minimum test set below hits the theoretical n+1 = 4-test
+# minimum for 3 conditions.
+
+[[independence_pair]]
+condition     = "over_max"
+held_constant = ["was_alarming", "over_threshold"]
+test_1 = { over_max = false, was_alarming = false, over_threshold = false, result = false }
+test_2 = { over_max = true,  was_alarming = false, over_threshold = false, result = true }
+
+[[independence_pair]]
+condition     = "was_alarming"
+held_constant = ["over_max", "over_threshold"]
+test_1 = { over_max = false, was_alarming = false, over_threshold = true, result = false }
+test_2 = { over_max = false, was_alarming = true,  over_threshold = true, result = true }
+
+[[independence_pair]]
+condition     = "over_threshold"
+held_constant = ["over_max", "was_alarming"]
+test_1 = { over_max = false, was_alarming = true, over_threshold = false, result = false }
+test_2 = { over_max = false, was_alarming = true, over_threshold = true,  result = true }
+
+# Minimum test set sufficient for full MC/DC — 4 tests.
+[[minimum_test_set]]
+inputs = { over_max = false, was_alarming = false, over_threshold = false }
+result = false
+[[minimum_test_set]]
+inputs = { over_max = true, was_alarming = false, over_threshold = false }
+result = true
+[[minimum_test_set]]
+inputs = { over_max = false, was_alarming = false, over_threshold = true }
+result = false
+[[minimum_test_set]]
+inputs = { over_max = false, was_alarming = true, over_threshold = true }
+result = true

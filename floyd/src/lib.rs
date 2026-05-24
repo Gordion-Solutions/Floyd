@@ -20,8 +20,14 @@
 //!
 //! ## Status
 //!
-//! Phase 0 scaffolding. The public API is not yet stable; expect breaking
-//! changes until v0.1.0.
+//! v0.1.0 — first usable cut. The `cargo floyd test` workflow runs
+//! end-to-end on real cargo projects, recovering boolean decisions
+//! built from `&&`, `||`, `!`, `if let` with a binding, the `?`
+//! operator (skip-through), and literal integer `match`. The
+//! recovered pattern set is pinned by the `corpus/` directory; see
+//! [`corpus/v1/`](https://github.com/Gordion-Solutions/Floyd/tree/main/corpus/v1)
+//! for the safety-critical decision patterns the engine is
+//! validated against.
 //!
 //! See the repository's
 //! [`architecture/`](https://github.com/Gordion-Solutions/Floyd/tree/main/architecture)

@@ -1,0 +1,98 @@
+# Floyd corpus pattern.
+# Schema documented at corpus/README.md.
+
+schema_version = 1
+id = "003-command-validation"
+name = "Guarded command validation"
+description = """
+`if let` with an inner `&&`. The pattern match contributes a
+synthetic boolean condition (`req is Some`); the matched arm runs
+a two-condition AND over the bound payload-validity flag and the
+external armed signal.
+
+The decomposer recovers this as a nested ITE — the outer ITE on
+`req is Some`, the inner ITE on `payload_ok` with `armed` in its
+then-branch — which yields the same boolean function as a flat
+three-condition AND.
+"""
+
+source = "src.rs"
+function = "accept_command"
+signature = "fn accept_command(req: Option<bool>, armed: bool) -> bool"
+
+# `req is Some` is the synthetic pattern-match condition; `payload_ok`
+# is the bound value from the `if let`; `armed` is a direct argument.
+[decision]
+expr = "if let Some(payload_ok) = req { payload_ok && armed } else { false }"
+conditions = ["req is Some", "payload_ok", "armed"]
+short_circuit = true
+
+variant = "masking"
+
+# Truth table — 8 rows for 3 conditions. `payload_ok` is irrelevant
+# when `req is Some` is false (else arm); `armed` is masked when
+# `payload_ok` is false (&&-short-circuit).
+[[truth_table]]
+inputs    = { "req is Some" = false, payload_ok = false, armed = false }
+result    = false
+evaluated = ["req is Some"]
+[[truth_table]]
+inputs    = { "req is Some" = false, payload_ok = false, armed = true }
+result    = false
+evaluated = ["req is Some"]
+[[truth_table]]
+inputs    = { "req is Some" = false, payload_ok = true, armed = false }
+result    = false
+evaluated = ["req is Some"]
+[[truth_table]]
+inputs    = { "req is Some" = false, payload_ok = true, armed = true }
+result    = false
+evaluated = ["req is Some"]
+[[truth_table]]
+inputs    = { "req is Some" = true, payload_ok = false, armed = false }
+result    = false
+evaluated = ["req is Some", "payload_ok"]
+[[truth_table]]
+inputs    = { "req is Some" = true, payload_ok = false, armed = true }
+result    = false
+evaluated = ["req is Some", "payload_ok"]
+[[truth_table]]
+inputs    = { "req is Some" = true, payload_ok = true, armed = false }
+result    = false
+evaluated = ["req is Some", "payload_ok", "armed"]
+[[truth_table]]
+inputs    = { "req is Some" = true, payload_ok = true, armed = true }
+result    = true
+evaluated = ["req is Some", "payload_ok", "armed"]
+
+[[independence_pair]]
+condition     = "req is Some"
+held_constant = ["payload_ok", "armed"]
+test_1 = { "req is Some" = false, payload_ok = true, armed = true, result = false }
+test_2 = { "req is Some" = true,  payload_ok = true, armed = true, result = true }
+
+[[independence_pair]]
+condition     = "payload_ok"
+held_constant = ["req is Some", "armed"]
+test_1 = { "req is Some" = true, payload_ok = false, armed = true, result = false }
+test_2 = { "req is Some" = true, payload_ok = true,  armed = true, result = true }
+
+[[independence_pair]]
+condition     = "armed"
+held_constant = ["req is Some", "payload_ok"]
+test_1 = { "req is Some" = true, payload_ok = true, armed = false, result = false }
+test_2 = { "req is Some" = true, payload_ok = true, armed = true,  result = true }
+
+# Minimum test set sufficient for full MC/DC — 4 tests.
+[[minimum_test_set]]
+inputs = { "req is Some" = false, payload_ok = true, armed = true }
+result = false
+[[minimum_test_set]]
+inputs = { "req is Some" = true, payload_ok = false, armed = true }
+result = false
+[[minimum_test_set]]
+inputs = { "req is Some" = true, payload_ok = true, armed = false }
+result = false
+[[minimum_test_set]]
+inputs = { "req is Some" = true, payload_ok = true, armed = true }
+result = true

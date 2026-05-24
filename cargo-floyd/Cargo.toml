@@ -1,13 +1,15 @@
 [package]
 name = "cargo-floyd"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
-description = "Cargo subcommand for the Floyd Rust MC/DC coverage engine. Initial release in development."
+description = "Cargo subcommand for the Floyd Rust MC/DC coverage engine."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Gordion-Solutions/Floyd"
 readme = "README.md"
+keywords = ["mcdc", "coverage", "safety", "iso26262", "cargo-subcommand"]
+categories = ["development-tools::testing", "development-tools::cargo-plugins"]
 
 [dependencies]
-floyd = { path = "../floyd", version = "0.0.0" }
+floyd = { path = "../floyd", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

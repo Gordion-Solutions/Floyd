@@ -33,21 +33,26 @@ notes = "Short-circuit evaluation makes this the source of most masking subtleti
 
 [[fn]]
 id = "handle_if_let"
-sig = "fn handle_if_let(expr: &IfLet) -> Node"
+sig = "fn handle_if_let(expr: &IfLetExpr) -> Node"
+handles = ["if let"]
+notes = "MVP scope: patterns that bind a value (`if let Some(x) = opt`, `if let Ok(v) = r`). The presence of an `AssignDowncast` statement in an arm block is what distinguishes the matched arm from the unmatched arm; pattern shapes with no binding (`if let Some(_) = opt`) yield no decision."
 
 [[fn]]
 id = "handle_match"
-sig = "fn handle_match(expr: &Match) -> Node"
-notes = "Partial support only in Phase 0. Full pattern-matching MC/DC is a Phase 2 deliverable — it's an acknowledged open problem in the field."
+sig = "fn handle_match(expr: &MatchExpr) -> Node"
+handles = ["match"]
+notes = "MVP scope: literal patterns on integer scrutinees. Each arm `v: bb_a` becomes one ITE with cond `<scrutinee> == <v>`; multi-arm matches nest right-leaning. Bool `match` continues to flow through `handle_boolean`. Enum-discriminant matches (`AssignDiscriminant` + `switchInt`) are declined — engineers wanting MC/DC on enum variants should use `if let` with a binding. Full pattern-matching MC/DC is a Phase 2 deliverable — it's an acknowledged open problem in the field."
 
 [[fn]]
 id = "handle_match_guard"
 sig = "fn handle_match_guard(guard: &Guard) -> Node"
+notes = "Out of MVP scope. Stubbed; kept reachable from `handle_match` so the architecture call graph stays valid for the Phase 2 implementation."
 
 [[fn]]
 id = "handle_try"
-sig = "fn handle_try(expr: &Try) -> Node"
+sig = "fn handle_try(expr: &TryExpr, f: &MirFunction) -> Option<Node>"
 handles = ["?"]
+notes = "Skip-through semantics: the `?` operator's MIR prefix (`Try::branch` → `discriminant` → `switchInt` over `ControlFlow`) is recognised, the Continue arm is selected by structural match (presence of an `AssignDowncast` with variant `Continue`), and decomposition resumes from the Continue arm. The early-return arm is propagation and carries no user-level decision. Chained `?`s recurse naturally through the same path."
 
 # ---------------------------------------------------------------------------
 # Intra-tool call edges

@@ -1,0 +1,83 @@
+# Floyd corpus pattern.
+# Schema documented at corpus/README.md.
+
+schema_version = 1
+id = "006-try-with-and"
+name = "`?` with inner AND"
+description = """
+The `?` operator wraps a boolean `&&` decision. Rust desugars `opt?`
+into a call to `<Option<T> as Try>::branch` followed by a
+`discriminant` + `switchInt` over `ControlFlow<Residual, Output>`;
+the Continue arm carries the rest of the user's code, the Break arm
+calls `from_residual` and returns early.
+
+The decomposer treats the `?` prefix as plumbing — there is no
+user-level boolean decision at the `?` itself (it's either success
+or propagation) — and resumes decomposition inside the Continue
+arm, where the real `x && b` decision lives. The recovered MC/DC
+analysis is therefore identical to pattern 001-simple-and, with the
+condition `a` renamed `x` (the bound value from `opt?`).
+
+Chained `?`s would recurse through the same path; this pattern pins
+the single-`?` case as the canonical instance.
+"""
+
+source = "src.rs"
+function = "decide"
+signature = "fn decide(opt: Option<bool>, b: bool) -> Option<bool>"
+
+# The boolean decision lives inside the `?` Continue arm. The `?`
+# success/failure itself is not represented as a condition (see the
+# description above for the rationale).
+[decision]
+expr = "x && b"
+conditions = ["x", "b"]
+short_circuit = true
+
+variant = "masking"
+
+# Truth table — same shape as 001-simple-and; `b` is masked when `x`
+# is false because `&&` short-circuits.
+[[truth_table]]
+inputs    = { x = false, b = false }
+result    = false
+evaluated = ["x"]
+
+[[truth_table]]
+inputs    = { x = false, b = true }
+result    = false
+evaluated = ["x"]
+
+[[truth_table]]
+inputs    = { x = true, b = false }
+result    = false
+evaluated = ["x", "b"]
+
+[[truth_table]]
+inputs    = { x = true, b = true }
+result    = true
+evaluated = ["x", "b"]
+
+[[independence_pair]]
+condition     = "x"
+held_constant = ["b"]
+test_1 = { x = false, b = true, result = false }
+test_2 = { x = true,  b = true, result = true }
+
+[[independence_pair]]
+condition     = "b"
+held_constant = ["x"]
+test_1 = { x = true, b = false, result = false }
+test_2 = { x = true, b = true,  result = true }
+
+[[minimum_test_set]]
+inputs = { x = false, b = true }
+result = false
+
+[[minimum_test_set]]
+inputs = { x = true, b = false }
+result = false
+
+[[minimum_test_set]]
+inputs = { x = true, b = true }
+result = true

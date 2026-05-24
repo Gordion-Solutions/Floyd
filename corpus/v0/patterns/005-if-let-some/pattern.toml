@@ -1,0 +1,83 @@
+# Floyd corpus pattern.
+# Schema documented at corpus/README.md.
+
+schema_version = 1
+id = "005-if-let-some"
+name = "If-let Some(x)"
+description = """
+Canonical `if let` with a binding. The pattern match contributes a
+synthetic boolean condition (`opt is Some`); the matched arm's body
+references the bound value `x`. The decomposer recovers the
+combination as an If-Then-Else: `if (opt is Some) then x else false`,
+which is the same boolean function as `(opt is Some) && x`.
+
+The matched arm is identified by the presence of a downcast statement
+in its MIR block — `_X = copy ((_S as Some).0: bool)` — which lets
+the decomposer locate it without knowing the discriminant integer
+assigned to each variant. The unreachable arm rustc emits for the
+impossible discriminant values is filtered out before deciding the
+shape.
+"""
+
+source = "src.rs"
+function = "decide"
+signature = "fn decide(opt: Option<bool>) -> bool"
+
+# The boolean decision and its atomic conditions. `opt is Some` is a
+# synthetic condition naming the pattern match; `x` is the bound
+# value referenced by the matched arm.
+[decision]
+expr = "if let Some(x) = opt { x } else { false }"
+conditions = ["opt is Some", "x"]
+short_circuit = true
+
+variant = "masking"
+
+# Full truth table.
+# When `opt is Some` is false, the else arm runs and `x` is irrelevant
+# (it does not exist at runtime); the `evaluated` set excludes it.
+[[truth_table]]
+inputs    = { "opt is Some" = false, x = false }
+result    = false
+evaluated = ["opt is Some"]
+
+[[truth_table]]
+inputs    = { "opt is Some" = false, x = true }
+result    = false
+evaluated = ["opt is Some"]
+
+[[truth_table]]
+inputs    = { "opt is Some" = true, x = false }
+result    = false
+evaluated = ["opt is Some", "x"]
+
+[[truth_table]]
+inputs    = { "opt is Some" = true, x = true }
+result    = true
+evaluated = ["opt is Some", "x"]
+
+# MC/DC independence pairs.
+[[independence_pair]]
+condition     = "opt is Some"
+held_constant = ["x"]
+test_1 = { "opt is Some" = false, x = true, result = false }
+test_2 = { "opt is Some" = true,  x = true, result = true }
+
+[[independence_pair]]
+condition     = "x"
+held_constant = ["opt is Some"]
+test_1 = { "opt is Some" = true, x = false, result = false }
+test_2 = { "opt is Some" = true, x = true,  result = true }
+
+# Minimum test set sufficient for full MC/DC.
+[[minimum_test_set]]
+inputs = { "opt is Some" = false, x = true }
+result = false
+
+[[minimum_test_set]]
+inputs = { "opt is Some" = true, x = false }
+result = false
+
+[[minimum_test_set]]
+inputs = { "opt is Some" = true, x = true }
+result = true

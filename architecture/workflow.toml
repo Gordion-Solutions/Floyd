@@ -49,7 +49,7 @@ purpose = "Compute condition independence matrices and identify missing conditio
 [[node]]
 id = "report"
 kind = "stage"
-purpose = "Render coverage report. Phase 0: HTML. Phase 1: also JSON / SARIF / LCOV / XML."
+purpose = "Render coverage report. Default: human-readable text; `--format=json` emits a machine-readable variant of the same analysis."
 
 [[node]]
 id = "corpus-v0"

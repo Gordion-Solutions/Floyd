@@ -27,7 +27,7 @@
 //! handlers (`if let`, `match`, match guards, `?`) are stubs that
 //! graduate alongside their corpus patterns.
 
-use crate::mir::{BlockId, MirBlock, MirFunction, MirStatement, MirTerminator};
+use crate::mir::{BlockId, LocalId, MirBlock, MirFunction, MirStatement, MirTerminator};
 use crate::Mir;
 
 /// A set of per-decision condition trees recovered from a single
@@ -85,14 +85,33 @@ struct BoolExpr {
     else_branch: Node,
 }
 
-#[derive(Debug, Clone)]
-struct IfLet;
-#[derive(Debug, Clone)]
-struct Match;
+/// Recovered `if let` decision: a single synthetic boolean condition
+/// (the pattern match) with its two arms.
+struct IfLetExpr {
+    cond: String,
+    then_branch: Node,
+    else_branch: Node,
+}
+
+/// Recovered `match` arm: one synthetic literal-equality condition
+/// (e.g. `n == 0`) with its then/else arms. Multi-arm matches nest
+/// these recursively.
+struct MatchExpr {
+    cond: String,
+    then_branch: Node,
+    else_branch: Node,
+}
+
 #[derive(Debug, Clone)]
 struct Guard;
-#[derive(Debug, Clone)]
-struct Try;
+
+/// Recovered `?` operator: the Continue arm of the
+/// `Try::branch` + `discriminant` + `switchInt` prefix. The early
+/// return arm carries no user-level decision (it's just propagation
+/// of the residual), so only the Continue arm matters for MC/DC.
+struct TryExpr {
+    continue_arm: BlockId,
+}
 
 /// Evaluate a [`Node`] under a partial condition assignment.
 ///
@@ -164,26 +183,46 @@ fn handle_boolean(expr: &BoolExpr) -> Node {
 // Phase 0 stubs. Each gains a real implementation alongside its
 // corpus pattern.
 
-#[allow(dead_code)]
-fn handle_if_let(_expr: &IfLet) -> Node {
-    Node::Const { value: false }
+// `if let` handler: wrap a recovered IfLetExpr into a Node::Ite where
+// the condition is a synthetic name like `<scrutinee> is <Variant>`.
+// Matches `handle_if_let` in decomposer.toml.
+fn handle_if_let(expr: &IfLetExpr) -> Node {
+    Node::Ite {
+        cond: expr.cond.clone(),
+        then_branch: Box::new(expr.then_branch.clone()),
+        else_branch: Box::new(expr.else_branch.clone()),
+    }
 }
 
-#[allow(dead_code)]
-fn handle_match(_expr: &Match) -> Node {
-    // handle_match -> handle_match_guard, per decomposer.toml.
+// `match` handler: wrap a recovered MatchExpr into a Node::Ite. The
+// caller is responsible for unrolling multi-arm matches into nested
+// MatchExpr applications (the right-leaning shape mirrors C-style
+// `switch/case`). Match guards are out of MVP scope; they delegate
+// to a no-op `handle_match_guard` per decomposer.toml's call graph.
+fn handle_match(expr: &MatchExpr) -> Node {
     let _ = handle_match_guard(&Guard);
-    Node::Const { value: false }
+    Node::Ite {
+        cond: expr.cond.clone(),
+        then_branch: Box::new(expr.then_branch.clone()),
+        else_branch: Box::new(expr.else_branch.clone()),
+    }
 }
 
-#[allow(dead_code)]
+// Match-guard handler. MVP scope is literal patterns only; guarded
+// arms (`match n { 0 if c => ... }`) yield no decision. Kept as a
+// reachable function so decomposer.toml's call graph stays valid
+// when the Phase 2 implementation lands.
 fn handle_match_guard(_guard: &Guard) -> Node {
     Node::Const { value: false }
 }
 
-#[allow(dead_code)]
-fn handle_try(_expr: &Try) -> Node {
-    Node::Const { value: false }
+// `?` handler: decompose the Continue arm. Skip-through semantics —
+// the early-return arm is propagation, not a user decision, so the
+// MC/DC content of a function with `?` is whatever logic the success
+// path contains. Returns `None` if the Continue arm has no recoverable
+// decision (e.g. a plain `let x = opt?; Some(x)`).
+fn handle_try(expr: &TryExpr, f: &MirFunction) -> Option<Node> {
+    build_decision_from_block(expr.continue_arm, f)
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +250,15 @@ fn handle_try(_expr: &Try) -> Node {
 fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node> {
     let block = f.blocks.iter().find(|b| b.id == block_id)?;
 
+    // `?` operator: skip the `Try::branch` + `discriminant` prefix
+    // and decompose the Continue arm. Chained `?`s recurse through
+    // this same path. Must run before `extract_terminal_value` so
+    // that a function whose entire body is `let x = a?; <expr>`
+    // doesn't get misread as a no-decision block.
+    if let Some(expr) = try_match_try_prefix(block_id, f) {
+        return handle_try(&expr, f);
+    }
+
     // If the block's statements set the return value, that IS the
     // block's value. We don't need to follow the terminator —
     // anything beyond that point is either a no-op coverage
@@ -220,6 +268,13 @@ fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node>
         return Some(value);
     }
 
+    // `if let` shape: a `discriminant(...)` assignment followed by a
+    // multi-arm switchInt with one matched arm (identified by a
+    // downcast statement) and one unmatched arm.
+    if let Some(node) = try_if_let_from_block(block, f) {
+        return Some(node);
+    }
+
     match &block.terminator {
         MirTerminator::SwitchInt {
             discr,
@@ -227,24 +282,289 @@ fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node>
             otherwise,
             ..
         } => {
-            // Phase 0: single-target boolean switchInt only.
-            if targets.len() != 1 || targets[0].0 != 0 {
-                return None;
+            // Bool short-circuit: single-arm `[0: bb_else, otherwise: bb_then]`
+            // on a `bool` discriminant. The type check is what
+            // distinguishes this case from a literal `match n { 0 =>
+            // ..., _ => ... }` on an integer (same MIR shape, different
+            // intent).
+            let is_bool_discr = local_type(f, *discr) == Some("bool");
+            if is_bool_discr && targets.len() == 1 && targets[0].0 == 0 {
+                let cond = f.debug_names.get(discr)?.clone();
+                // `0` arm is the `else` branch (condition was false);
+                // `otherwise` is the `then` branch (condition was true).
+                let else_branch = build_decision_from_block(targets[0].1, f)?;
+                let then_branch = build_decision_from_block(*otherwise, f)?;
+                return Some(handle_boolean(&BoolExpr {
+                    cond,
+                    then_branch,
+                    else_branch,
+                }));
             }
-            let cond = f.debug_names.get(discr)?.clone();
-            // `0` arm is the `else` branch (condition was false);
-            // `otherwise` is the `then` branch (condition was true).
-            let else_branch = build_decision_from_block(targets[0].1, f)?;
-            let then_branch = build_decision_from_block(*otherwise, f)?;
-            Some(handle_boolean(&BoolExpr {
-                cond,
-                then_branch,
-                else_branch,
-            }))
+            // Literal `match` on a non-bool integer.
+            try_match_from_block(block, f, *discr, targets, *otherwise)
         }
-        MirTerminator::Goto { .. } | MirTerminator::Return { .. } => None,
-        MirTerminator::Other { .. } => None,
+        MirTerminator::Goto { .. }
+        | MirTerminator::Return { .. }
+        | MirTerminator::Unreachable { .. }
+        | MirTerminator::Call { .. }
+        | MirTerminator::Other { .. } => None,
     }
+}
+
+/// Type of a local as declared in the function header or `let`
+/// declarations. Returns `None` for synthetic locals (return place,
+/// temporaries) that don't appear in either list.
+fn local_type(f: &MirFunction, local: LocalId) -> Option<&str> {
+    f.args
+        .iter()
+        .find(|a| a.local == local)
+        .map(|a| a.ty.as_str())
+        .or_else(|| {
+            f.locals
+                .iter()
+                .find(|l| l.local == local)
+                .map(|l| l.ty.as_str())
+        })
+}
+
+/// Recover a literal `match` decision rooted at `block`.
+///
+/// MVP scope is literal patterns only — integer literals on a non-
+/// `bool` scrutinee. Enum matches (whose `switchInt` is preceded by
+/// an `AssignDiscriminant`) are declined; engineers wanting MC/DC
+/// on an enum variant should use `if let` with a binding so the
+/// dedicated `if let` handler can recover the variant name.
+///
+/// Each explicit arm `v: bb_a` becomes one ITE level with condition
+/// `<name> == <v>`. Multi-arm matches nest right-leaning, so
+/// `match n { 0 => A, 1 => B, _ => C }` becomes
+/// `Ite{n==0, A, Ite{n==1, B, C}}`. When the `otherwise` arm is
+/// unreachable (exhaustive match), the last explicit arm becomes
+/// the unconditional else.
+fn try_match_from_block(
+    block: &MirBlock,
+    f: &MirFunction,
+    discr: LocalId,
+    targets: &[(u128, BlockId)],
+    otherwise: BlockId,
+) -> Option<Node> {
+    let is_enum_discriminant = block.statements.iter().any(|s| {
+        matches!(
+            s,
+            MirStatement::AssignDiscriminant { dst, .. } if *dst == discr
+        )
+    });
+    if is_enum_discriminant {
+        return None;
+    }
+
+    let scrutinee_name = f
+        .debug_names
+        .get(&discr)
+        .cloned()
+        .unwrap_or_else(|| format!("_{discr}"));
+
+    // Reachable explicit arms, in declared order.
+    let arms: Vec<(u128, BlockId)> = targets
+        .iter()
+        .copied()
+        .filter(|(_, t)| !is_unreachable_block(*t, f))
+        .collect();
+    if arms.is_empty() {
+        return None;
+    }
+
+    // Build from the bottom up so the produced ITE matches source-
+    // order semantics (first arm wraps outermost).
+    let other_reachable = !is_unreachable_block(otherwise, f);
+    let mut iter = arms.into_iter();
+    let (last_v, last_t) = iter.next_back()?;
+    let mut tail = if other_reachable {
+        let then_branch = build_decision_from_block(last_t, f)?;
+        let else_branch = build_decision_from_block(otherwise, f)?;
+        handle_match(&MatchExpr {
+            cond: format!("{scrutinee_name} == {last_v}"),
+            then_branch,
+            else_branch,
+        })
+    } else {
+        // Exhaustive match: the last arm is the only remaining
+        // possibility, so it's the unconditional fallback. No ITE
+        // wrapping needed for the last arm itself.
+        build_decision_from_block(last_t, f)?
+    };
+    for (v, t) in iter.rev() {
+        let then_branch = build_decision_from_block(t, f)?;
+        tail = handle_match(&MatchExpr {
+            cond: format!("{scrutinee_name} == {v}"),
+            then_branch,
+            else_branch: tail,
+        });
+    }
+    Some(tail)
+}
+
+/// Recognise a `?` operator's MIR prefix rooted at `block_id`.
+///
+/// The shape is:
+///
+/// ```text
+/// bb_call: { _D = <T as Try>::branch(<scrutinee>) -> [return: bb_disc, ...]; }
+/// bb_disc: { _E = discriminant(_D); switchInt(move _E) -> [v1: bb_a, v2: bb_b, otherwise: bb_other]; }
+/// ```
+///
+/// where one of the two reachable arms (the Continue arm) begins
+/// with `_X = copy ((_D as Continue).0: <Output>);` — that arm is
+/// the rest of the user's code; the other arm is the early-return
+/// path (a `from_residual` call). Returns a [`TryExpr`] pointing at
+/// the Continue arm if all of that lines up, otherwise `None`.
+fn try_match_try_prefix(block_id: BlockId, f: &MirFunction) -> Option<TryExpr> {
+    let block = f.blocks.iter().find(|b| b.id == block_id)?;
+    let (call_dst, call_target) = match &block.terminator {
+        MirTerminator::Call { dst, target, .. } => (*dst, *target),
+        _ => return None,
+    };
+
+    let disc_block = f.blocks.iter().find(|b| b.id == call_target)?;
+    let discr_local = disc_block.statements.iter().find_map(|s| match s {
+        MirStatement::AssignDiscriminant { dst, src, .. } if *src == call_dst => Some(*dst),
+        _ => None,
+    })?;
+    let (targets, otherwise) = match &disc_block.terminator {
+        MirTerminator::SwitchInt {
+            discr,
+            targets,
+            otherwise,
+            ..
+        } if *discr == discr_local => (targets, *otherwise),
+        _ => return None,
+    };
+
+    let mut reachable: Vec<BlockId> = Vec::new();
+    for &(_, t) in targets {
+        if !is_unreachable_block(t, f) && !reachable.contains(&t) {
+            reachable.push(t);
+        }
+    }
+    if !is_unreachable_block(otherwise, f) && !reachable.contains(&otherwise) {
+        reachable.push(otherwise);
+    }
+    if reachable.len() != 2 {
+        return None;
+    }
+
+    let continue_arm = reachable.iter().copied().find(|&id| {
+        let Some(b) = f.blocks.iter().find(|b| b.id == id) else {
+            return false;
+        };
+        b.statements.iter().any(|s| {
+            matches!(
+                s,
+                MirStatement::AssignDowncast { src, variant, .. }
+                    if *src == call_dst && variant == "Continue"
+            )
+        })
+    })?;
+    Some(TryExpr { continue_arm })
+}
+
+/// Recover an `if let` decision rooted at `block`, if its shape matches.
+///
+/// The MIR shape rustc emits for `if let <Pat> = <scrutinee> { A } else { B }`
+/// is:
+///
+/// ```text
+/// bb0: {
+///     _D = discriminant(_S);
+///     switchInt(move _D) -> [v1: bb_a, v2: bb_b, ..., otherwise: bb_other];
+/// }
+/// ```
+///
+/// where one of the target blocks (the matched arm) begins with a
+/// downcast statement `_X = copy ((_S as <Variant>).<field>: <Ty>);`
+/// and the other (the unmatched arm) does not. Any arm whose block
+/// has an `unreachable;` terminator is filtered out — the compiler
+/// emits one such arm when every enum variant is covered by an
+/// explicit value, so it doesn't represent a real path.
+///
+/// Returns `None` if the block doesn't match this shape, leaving the
+/// caller to try the next decoder (e.g. boolean short-circuit).
+fn try_if_let_from_block(block: &MirBlock, f: &MirFunction) -> Option<Node> {
+    let (discr_local, scrutinee) = block.statements.iter().find_map(|s| match s {
+        MirStatement::AssignDiscriminant { dst, src, .. } => Some((*dst, *src)),
+        _ => None,
+    })?;
+
+    let (targets, otherwise) = match &block.terminator {
+        MirTerminator::SwitchInt {
+            discr,
+            targets,
+            otherwise,
+            ..
+        } if *discr == discr_local => (targets, *otherwise),
+        _ => return None,
+    };
+
+    // Collect each distinct, reachable target block in switchInt order
+    // (explicit arms first, then `otherwise`). Distinctness keeps the
+    // matched/unmatched identification well-defined even if two arms
+    // share a successor.
+    let mut reachable: Vec<BlockId> = Vec::new();
+    for &(_, t) in targets {
+        if !is_unreachable_block(t, f) && !reachable.contains(&t) {
+            reachable.push(t);
+        }
+    }
+    if !is_unreachable_block(otherwise, f) && !reachable.contains(&otherwise) {
+        reachable.push(otherwise);
+    }
+    if reachable.len() != 2 {
+        return None;
+    }
+
+    let matched_idx = reachable.iter().enumerate().find_map(|(i, &id)| {
+        let b = f.blocks.iter().find(|b| b.id == id)?;
+        downcast_variant_for(b, scrutinee).map(|_| i)
+    })?;
+    let matched_id = reachable[matched_idx];
+    let unmatched_id = reachable[1 - matched_idx];
+
+    let scrutinee_name = f
+        .debug_names
+        .get(&scrutinee)
+        .cloned()
+        .unwrap_or_else(|| format!("_{scrutinee}"));
+    let matched_block = f.blocks.iter().find(|b| b.id == matched_id)?;
+    let variant_name = downcast_variant_for(matched_block, scrutinee);
+    let cond = match variant_name {
+        Some(v) => format!("{scrutinee_name} is {v}"),
+        None => format!("{scrutinee_name} matches"),
+    };
+
+    let then_branch = build_decision_from_block(matched_id, f)?;
+    let else_branch = build_decision_from_block(unmatched_id, f)?;
+    Some(handle_if_let(&IfLetExpr {
+        cond,
+        then_branch,
+        else_branch,
+    }))
+}
+
+fn is_unreachable_block(id: BlockId, f: &MirFunction) -> bool {
+    f.blocks
+        .iter()
+        .find(|b| b.id == id)
+        .map(|b| matches!(b.terminator, MirTerminator::Unreachable { .. }))
+        .unwrap_or(false)
+}
+
+fn downcast_variant_for(b: &MirBlock, scrutinee: LocalId) -> Option<String> {
+    b.statements.iter().find_map(|s| match s {
+        MirStatement::AssignDowncast { src, variant, .. } if *src == scrutinee => {
+            Some(variant.clone())
+        }
+        _ => None,
+    })
 }
 
 /// Extract a leaf [`Node`] from a terminal block.
@@ -263,7 +583,13 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
                     return Some(Node::Condition { name: name.clone() });
                 }
             }
-            MirStatement::Other { .. } => {}
+            // Skipped: informational for the `if let` detector
+            // (`AssignDiscriminant` opens an if-let block;
+            // `AssignDowncast` precedes the use of a bound value) but
+            // they never *are* the block's return value.
+            MirStatement::AssignDiscriminant { .. }
+            | MirStatement::AssignDowncast { .. }
+            | MirStatement::Other { .. } => {}
         }
     }
     None
@@ -446,6 +772,574 @@ fn decide(_1: bool, _2: bool, _3: bool) -> bool {
         let tree = decompose(&mir);
         assert_eq!(tree.decisions.len(), 1);
         assert_eq!(tree.decisions[0], ite("a", const_(false), cond("b")));
+    }
+
+    /// `rustc --emit=mir` output for
+    /// `fn decide(opt: Option<bool>) -> bool { if let Some(x) = opt { x } else { false } }`.
+    const DECIDE_IF_LET_SIMPLE_MIR: &str = r#"
+fn decide(_1: Option<bool>) -> bool {
+    debug opt => _1;
+    let mut _0: bool;
+    let mut _2: isize;
+    scope 1 {
+        debug x => _3;
+        let _3: bool;
+    }
+
+    bb0: {
+        _2 = discriminant(_1);
+        switchInt(move _2) -> [1: bb1, 0: bb2, otherwise: bb4];
+    }
+
+    bb1: {
+        _3 = copy ((_1 as Some).0: bool);
+        _0 = copy _3;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+
+    bb4: {
+        unreachable;
+    }
+}
+"#;
+
+    /// `rustc --emit=mir` output for
+    /// `fn decide(opt: Option<bool>, b: bool) -> bool { if let Some(x) = opt { x && b } else { false } }`.
+    const DECIDE_IF_LET_WITH_AND_MIR: &str = r#"
+fn decide(_1: Option<bool>, _2: bool) -> bool {
+    debug opt => _1;
+    debug b => _2;
+    let mut _0: bool;
+    let mut _3: isize;
+    scope 1 {
+        debug x => _4;
+        let _4: bool;
+    }
+
+    bb0: {
+        _3 = discriminant(_1);
+        switchInt(move _3) -> [1: bb1, 0: bb4, otherwise: bb6];
+    }
+
+    bb1: {
+        _4 = copy ((_1 as Some).0: bool);
+        switchInt(copy _4) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        _0 = copy _2;
+        goto -> bb5;
+    }
+
+    bb3: {
+        _0 = const false;
+        goto -> bb5;
+    }
+
+    bb4: {
+        _0 = const false;
+        goto -> bb5;
+    }
+
+    bb5: {
+        return;
+    }
+
+    bb6: {
+        unreachable;
+    }
+}
+"#;
+
+    /// `rustc --emit=mir` output for
+    /// `fn decide(r: Result<bool, ()>) -> bool { if let Ok(v) = r { v } else { false } }`.
+    /// Note the arm value ordering is `[0: bb1, 1: bb2]` — Ok = 0, Err = 1.
+    /// The decomposer must not rely on a specific variant integer.
+    const DECIDE_IF_LET_RESULT_MIR: &str = r#"
+fn decide(_1: Result<bool, ()>) -> bool {
+    debug r => _1;
+    let mut _0: bool;
+    let mut _2: isize;
+    scope 1 {
+        debug v => _3;
+        let _3: bool;
+    }
+
+    bb0: {
+        _2 = discriminant(_1);
+        switchInt(move _2) -> [0: bb1, 1: bb2, otherwise: bb4];
+    }
+
+    bb1: {
+        _3 = copy ((_1 as Ok).0: bool);
+        _0 = copy _3;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+
+    bb4: {
+        unreachable;
+    }
+}
+"#;
+
+    /// `rustc --emit=mir` output for
+    /// `fn decide(t: Three) -> bool { if let Three::A(v) = t { v } else { false } }`
+    /// with `enum Three { A(bool), B, C }`. The unmatched arm is the
+    /// `otherwise` target (rustc collapses the two non-matched variants
+    /// into a single fallthrough; there is no `unreachable` arm here).
+    const DECIDE_IF_LET_THREE_VARIANT_MIR: &str = r#"
+fn decide(_1: Three) -> bool {
+    debug t => _1;
+    let mut _0: bool;
+    let mut _2: isize;
+    scope 1 {
+        debug v => _3;
+        let _3: bool;
+    }
+
+    bb0: {
+        _2 = discriminant(_1);
+        switchInt(move _2) -> [0: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        _3 = copy ((_1 as A).0: bool);
+        _0 = copy _3;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    /// `rustc --emit=mir` output for
+    /// `fn decide(opt: Option<bool>) -> bool { if let Some(_) = opt { true } else { false } }`.
+    /// No binding => no downcast => the decomposer cannot tell the
+    /// matched arm from the unmatched arm by structure alone, so it
+    /// declines (returns no decision) rather than guess.
+    const DECIDE_IF_LET_NO_BINDING_MIR: &str = r#"
+fn decide(_1: Option<bool>) -> bool {
+    debug opt => _1;
+    let mut _0: bool;
+    let mut _2: isize;
+    scope 1 {
+    }
+
+    bb0: {
+        _2 = discriminant(_1);
+        switchInt(move _2) -> [1: bb1, 0: bb2, otherwise: bb4];
+    }
+
+    bb1: {
+        _0 = const true;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+
+    bb4: {
+        unreachable;
+    }
+}
+"#;
+
+    #[test]
+    fn decompose_recognises_if_let_some_as_ite() {
+        // if let Some(x) = opt { x } else { false }
+        //   <=>   if (opt is Some) then x else false
+        let mir = mir::parse_text(DECIDE_IF_LET_SIMPLE_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(
+            tree.decisions[0],
+            ite("opt is Some", cond("x"), const_(false))
+        );
+    }
+
+    #[test]
+    fn decompose_recognises_if_let_combined_with_and() {
+        // if let Some(x) = opt { x && b } else { false }
+        //   <=>   if (opt is Some) then (if x then b else false) else false
+        // The inner `x && b` is the existing boolean handler; this
+        // confirms that an `if let` arm recursively decomposes through
+        // the rest of the engine without any special-casing.
+        let mir = mir::parse_text(DECIDE_IF_LET_WITH_AND_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(
+            tree.decisions[0],
+            ite(
+                "opt is Some",
+                ite("x", cond("b"), const_(false)),
+                const_(false),
+            )
+        );
+    }
+
+    #[test]
+    fn decompose_handles_result_variant_ordering() {
+        // Result swaps the arm-value order (Ok = 0, Err = 1). The
+        // decomposer must locate the matched arm by structure (the
+        // downcast statement), not by arm index.
+        let mir = mir::parse_text(DECIDE_IF_LET_RESULT_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(tree.decisions[0], ite("r is Ok", cond("v"), const_(false)));
+    }
+
+    #[test]
+    fn decompose_handles_if_let_with_otherwise_unmatched() {
+        // Three-variant enum: the unmatched arm is the `otherwise`
+        // target (no `unreachable` block emitted by rustc). The
+        // matched arm is still identified by the downcast.
+        let mir = mir::parse_text(DECIDE_IF_LET_THREE_VARIANT_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(tree.decisions[0], ite("t is A", cond("v"), const_(false)));
+    }
+
+    #[test]
+    fn decompose_declines_no_binding_if_let() {
+        // if let Some(_) = opt { true } else { false }
+        // No downcast => the decomposer can't tell matched from
+        // unmatched by structure. It declines to guess.
+        let mir = mir::parse_text(DECIDE_IF_LET_NO_BINDING_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert!(tree.decisions.is_empty());
+    }
+
+    /// `rustc --emit=mir` output for
+    /// `fn decide(n: i32) -> bool { match n { 0 => false, _ => true } }`.
+    const DECIDE_MATCH_INT_TWO_MIR: &str = r#"
+fn decide(_1: i32) -> bool {
+    debug n => _1;
+    let mut _0: bool;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = const true;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    /// `rustc --emit=mir` output for
+    /// `fn decide(n: i32) -> bool { match n { 0 => false, 1 => true, _ => false } }`.
+    const DECIDE_MATCH_INT_THREE_MIR: &str = r#"
+fn decide(_1: i32) -> bool {
+    debug n => _1;
+    let mut _0: bool;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb3, 1: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = const false;
+        goto -> bb4;
+    }
+
+    bb2: {
+        _0 = const true;
+        goto -> bb4;
+    }
+
+    bb3: {
+        _0 = const false;
+        goto -> bb4;
+    }
+
+    bb4: {
+        return;
+    }
+}
+"#;
+
+    /// `rustc --emit=mir` output for
+    /// `fn decide(b: bool) -> bool { match b { true => true, false => false } }`.
+    /// Same shape as `match n { 0 => ..., _ => ... }` but `_1` is
+    /// `bool` — the engine must keep using the bool short-circuit
+    /// handler (condition name is just `b`, not `b == 0`).
+    const DECIDE_MATCH_BOOL_MIR: &str = r#"
+fn decide(_1: bool) -> bool {
+    debug b => _1;
+    let mut _0: bool;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        _0 = const false;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const true;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    /// `rustc --emit=mir` output for
+    /// `fn decide(m: Mode) -> bool { match m { Mode::On => true, Mode::Off => false } }`.
+    /// Enum match without binding — declined for MVP. The discriminant
+    /// is produced by an `AssignDiscriminant`, which both the if-let
+    /// detector and the literal-match handler use as a "skip me" signal.
+    const DECIDE_MATCH_ENUM_NO_BINDING_MIR: &str = r#"
+fn decide(_1: Mode) -> bool {
+    debug m => _1;
+    let mut _0: bool;
+    let mut _2: isize;
+
+    bb0: {
+        _2 = discriminant(_1);
+        switchInt(move _2) -> [0: bb3, 1: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        unreachable;
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb4;
+    }
+
+    bb3: {
+        _0 = const true;
+        goto -> bb4;
+    }
+
+    bb4: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn decompose_recognises_match_two_arm_int() {
+        // `match n { 0 => false, _ => true }`
+        //   <=>   if (n == 0) then false else true
+        let mir = mir::parse_text(DECIDE_MATCH_INT_TWO_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(
+            tree.decisions[0],
+            ite("n == 0", const_(false), const_(true))
+        );
+    }
+
+    #[test]
+    fn decompose_recognises_match_three_arm_int_as_nested_ite() {
+        // `match n { 0 => false, 1 => true, _ => false }`
+        //   <=>   if (n == 0) then false else (if (n == 1) then true else false)
+        let mir = mir::parse_text(DECIDE_MATCH_INT_THREE_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(
+            tree.decisions[0],
+            ite(
+                "n == 0",
+                const_(false),
+                ite("n == 1", const_(true), const_(false)),
+            )
+        );
+    }
+
+    #[test]
+    fn decompose_match_bool_keeps_bool_naming() {
+        // `match b { true => true, false => false }` shares MIR shape
+        // with `match n { 0 => ..., _ => ... }` — the bool handler
+        // must still fire (cond name `b`, not `b == 0`).
+        let mir = mir::parse_text(DECIDE_MATCH_BOOL_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(tree.decisions[0], ite("b", const_(true), const_(false)));
+    }
+
+    #[test]
+    fn decompose_declines_enum_match_without_binding() {
+        // MVP scope: enum-discriminant matches (no bindings) yield no
+        // decision. Engineers wanting MC/DC on an enum variant
+        // should use `if let` with a binding.
+        let mir = mir::parse_text(DECIDE_MATCH_ENUM_NO_BINDING_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert!(tree.decisions.is_empty());
+    }
+
+    /// `rustc --emit=mir` output for
+    /// `fn decide(opt: Option<bool>) -> Option<bool> { let x = opt?; Some(x) }`.
+    /// Plain `?` followed by a non-decision body — no recoverable
+    /// MC/DC content. The engine should decline cleanly, not crash.
+    const DECIDE_TRY_PLAIN_MIR: &str = r#"
+fn decide(_1: Option<bool>) -> Option<bool> {
+    debug opt => _1;
+    let mut _0: std::option::Option<bool>;
+    let mut _2: std::ops::ControlFlow<std::option::Option<std::convert::Infallible>, bool>;
+    let mut _3: isize;
+    let _4: bool;
+    scope 1 {
+        debug x => _4;
+    }
+
+    bb0: {
+        _2 = <Option<bool> as Try>::branch(copy _1) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _3 = discriminant(_2);
+        switchInt(move _3) -> [0: bb3, 1: bb4, otherwise: bb2];
+    }
+
+    bb2: {
+        unreachable;
+    }
+
+    bb3: {
+        _4 = copy ((_2 as Continue).0: bool);
+        _0 = Option::<bool>::Some(copy _4);
+        goto -> bb5;
+    }
+
+    bb4: {
+        _0 = <Option<bool> as FromResidual<Option<Infallible>>>::from_residual(const Option::<Infallible>::None) -> [return: bb5, unwind continue];
+    }
+
+    bb5: {
+        return;
+    }
+}
+"#;
+
+    /// `rustc --emit=mir` output for
+    /// `fn decide(opt: Option<bool>, b: bool) -> Option<bool> { let x = opt?; Some(x && b) }`.
+    /// The `?` is plumbing; the real boolean decision is `x && b`
+    /// inside the Continue arm. The engine should look through the
+    /// `?` and recover the inner `&&`.
+    const DECIDE_TRY_WITH_AND_MIR: &str = r#"
+fn decide(_1: Option<bool>, _2: bool) -> Option<bool> {
+    debug opt => _1;
+    debug b => _2;
+    let mut _0: std::option::Option<bool>;
+    let mut _3: std::ops::ControlFlow<std::option::Option<std::convert::Infallible>, bool>;
+    let mut _4: isize;
+    let _5: bool;
+    let mut _6: bool;
+    scope 1 {
+        debug x => _5;
+    }
+
+    bb0: {
+        _3 = <Option<bool> as Try>::branch(copy _1) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _4 = discriminant(_3);
+        switchInt(move _4) -> [0: bb3, 1: bb4, otherwise: bb2];
+    }
+
+    bb2: {
+        unreachable;
+    }
+
+    bb3: {
+        _5 = copy ((_3 as Continue).0: bool);
+        switchInt(copy _5) -> [0: bb6, otherwise: bb5];
+    }
+
+    bb4: {
+        _0 = <Option<bool> as FromResidual<Option<Infallible>>>::from_residual(const Option::<Infallible>::None) -> [return: bb8, unwind continue];
+    }
+
+    bb5: {
+        _6 = copy _2;
+        goto -> bb7;
+    }
+
+    bb6: {
+        _6 = const false;
+        goto -> bb7;
+    }
+
+    bb7: {
+        _0 = Option::<bool>::Some(move _6);
+        goto -> bb8;
+    }
+
+    bb8: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn decompose_declines_plain_try() {
+        // `let x = opt?; Some(x)` — no internal boolean decision; the
+        // skip-through lands on the Continue arm which has no
+        // recoverable structure, so the engine declines (no panic).
+        let mir = mir::parse_text(DECIDE_TRY_PLAIN_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert!(tree.decisions.is_empty());
+    }
+
+    #[test]
+    fn decompose_looks_through_try_to_find_inner_and() {
+        // `let x = opt?; Some(x && b)` — the `?` is plumbing; the
+        // engine looks through it and recovers `x && b` as the
+        // decision.
+        let mir = mir::parse_text(DECIDE_TRY_WITH_AND_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(tree.decisions[0], ite("x", cond("b"), const_(false)));
     }
 
     #[test]

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "cargo-floyd"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "floyd",
  "serde",
@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "floyd"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rustc-demangle",
  "serde",
