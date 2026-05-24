@@ -193,16 +193,32 @@ fn handle_try(_expr: &Try) -> Node {
 /// Recursively convert one MIR block (and its CFG descendants) into a
 /// [`Node`].
 ///
-/// - Branching block (`switchInt` terminator): emit a [`Node::Ite`],
-///   recursing into the two successor blocks.
-/// - Terminal block (`Goto` / `Return` with a value-setting statement):
-///   emit the corresponding [`Node::Const`] or [`Node::Condition`].
+/// - Block sets the return value (`_0`) in its statements: emit that
+///   value as the block's [`Node`]. The terminator is ignored even if
+///   it's a `switchInt` — this is the load-bearing case for
+///   coverage-instrumented MIR, which wraps each condition in an
+///   extra `switchInt` *after* the value-setting copy.
+/// - Branching block (`switchInt` terminator, no value-setting
+///   statements): emit a [`Node::Ite`], recursing into the two
+///   successor blocks.
+/// - Terminal block (`Goto` / `Return`): emit the corresponding
+///   [`Node::Const`] or [`Node::Condition`] if statements set `_0`,
+///   else `None`.
 ///
 /// Returns `None` if the block's shape isn't recognised — keeps the
 /// engine conservative when corpus patterns exercise new shapes
 /// before the engine learns them.
 fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node> {
     let block = f.blocks.iter().find(|b| b.id == block_id)?;
+
+    // If the block's statements set the return value, that IS the
+    // block's value. We don't need to follow the terminator —
+    // anything beyond that point is either a no-op coverage
+    // counter or an instrumentation switchInt that doesn't change
+    // the result. See the module-level docs for the canonical shapes.
+    if let Some(value) = extract_terminal_value(block, f) {
+        return Some(value);
+    }
 
     match &block.terminator {
         MirTerminator::SwitchInt {
@@ -226,9 +242,7 @@ fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node>
                 else_branch,
             }))
         }
-        MirTerminator::Goto { .. } | MirTerminator::Return { .. } => {
-            extract_terminal_value(block, f)
-        }
+        MirTerminator::Goto { .. } | MirTerminator::Return { .. } => None,
         MirTerminator::Other { .. } => None,
     }
 }

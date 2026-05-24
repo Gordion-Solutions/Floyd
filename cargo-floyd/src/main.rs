@@ -85,17 +85,21 @@ fn main() -> ExitCode {
         args.remove(0);
     }
 
-    let source = match args.first() {
-        Some(p) => Path::new(*p),
-        None => {
+    // Detect what `source` actually refers to:
+    //   - missing -> default to current dir's Cargo.toml (cargo subcommand idiom)
+    //   - a directory -> assume it contains Cargo.toml
+    //   - Cargo.toml -> cargo project
+    //   - <something>.rs -> single source file
+    let arg_path = args.first().map(|s| Path::new(*s));
+    let source = match resolve_source(arg_path) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("cargo-floyd: {msg}");
+            eprintln!();
             print_usage();
             return ExitCode::from(2);
         }
     };
-    if !source.exists() {
-        eprintln!("cargo-floyd: source not found: {}", source.display());
-        return ExitCode::from(2);
-    }
 
     let workdir = std::env::temp_dir().join(format!("cargo-floyd-{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&workdir) {
@@ -103,11 +107,59 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    if is_test_mode {
-        run_test_mode(source, &workdir, format)
-    } else {
-        run_static_mode(source, &workdir, format)
+    match (is_test_mode, source) {
+        (true, Source::Cargo(p)) => run_test_mode_cargo(&p, &workdir, format),
+        (true, Source::SingleFile(p)) => run_test_mode_single(&p, &workdir, format),
+        (false, Source::Cargo(_)) => {
+            eprintln!("cargo-floyd: static analysis on a cargo project is not supported yet;");
+            eprintln!("  pass a single .rs file, or use `cargo floyd test` for runtime analysis.");
+            ExitCode::from(2)
+        }
+        (false, Source::SingleFile(p)) => run_static_mode(&p, &workdir, format),
     }
+}
+
+enum Source {
+    SingleFile(std::path::PathBuf),
+    Cargo(std::path::PathBuf),
+}
+
+fn resolve_source(arg: Option<&Path>) -> Result<Source, String> {
+    let path = match arg {
+        None => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| format!("cannot read current directory: {e}"))?;
+            let manifest = cwd.join("Cargo.toml");
+            if !manifest.exists() {
+                return Err(format!(
+                    "no Cargo.toml in {} and no path argument given; specify a source file or run from a cargo project",
+                    cwd.display()
+                ));
+            }
+            return Ok(Source::Cargo(manifest));
+        }
+        Some(p) => p,
+    };
+    if !path.exists() {
+        return Err(format!("source not found: {}", path.display()));
+    }
+    if path.is_dir() {
+        let manifest = path.join("Cargo.toml");
+        if manifest.exists() {
+            return Ok(Source::Cargo(manifest));
+        }
+        return Err(format!("directory {} has no Cargo.toml", path.display()));
+    }
+    if path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+        return Ok(Source::Cargo(path.to_path_buf()));
+    }
+    if path.extension() == Some(std::ffi::OsStr::new("rs")) {
+        return Ok(Source::SingleFile(path.to_path_buf()));
+    }
+    Err(format!(
+        "unsupported source: {} (expected a .rs file, a Cargo.toml, or a directory containing one)",
+        path.display()
+    ))
 }
 
 fn run_static_mode(source: &Path, workdir: &Path, format: Format) -> ExitCode {
@@ -149,7 +201,146 @@ fn run_static_mode(source: &Path, workdir: &Path, format: Format) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_test_mode(source: &Path, workdir: &Path, format: Format) -> ExitCode {
+fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitCode {
+    // Build all test artifacts in the cargo project.
+    let build = match instrument::compile_cargo_project(manifest) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("cargo-floyd: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let profdata_tool = match runner::llvm_tool("llvm-profdata") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("cargo-floyd: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let cov_tool = match runner::llvm_tool("llvm-cov") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("cargo-floyd: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut all_tests = Vec::new();
+    let mut all_observations = Vec::new();
+    let mut chosen_tree: Option<floyd::DecisionTree> = None;
+
+    for (art_idx, artifact) in build.test_artifacts.iter().enumerate() {
+        let mir_text = match std::fs::read_to_string(&artifact.mir_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mir = match mir::parse_text(&mir_text) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let tree = decision::decompose(&mir);
+        if tree.decisions.is_empty() {
+            continue;
+        }
+        // Phase 1 first cut: take the first non-empty decision tree as
+        // THE decision under analysis. Multi-decision aggregation lands
+        // in a future release.
+        if chosen_tree.is_none() {
+            chosen_tree = Some(tree.clone());
+        }
+
+        let tests = match runner::list_tests(&artifact.binary_path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("cargo-floyd: {e}");
+                return ExitCode::from(1);
+            }
+        };
+
+        for (test_idx, test_name) in tests.iter().enumerate() {
+            let prof = workdir.join(format!("cov-{art_idx:03}-{test_idx:03}.profraw"));
+            if let Err(e) = runner::run_test_isolated(&artifact.binary_path, test_name, &prof) {
+                eprintln!("cargo-floyd: {e}");
+                return ExitCode::from(1);
+            }
+            let coverage = match runner::profraw_to_coverage(
+                &prof,
+                &profdata_tool,
+                &cov_tool,
+                &artifact.binary_path,
+                workdir,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("cargo-floyd: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            if let Some(obs) = correlate::observation_from_coverage(
+                Some(test_name.clone()),
+                &mir,
+                &coverage,
+                &tree,
+            ) {
+                all_observations.push(obs);
+            }
+            all_tests.push(test_name.clone());
+        }
+    }
+
+    let tree = match chosen_tree {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "cargo-floyd: no recognised decisions in any test target. \
+                 The engine currently supports `&&`, `||`, `!`, and nested \
+                 combinations; `if let`, `?`, and `match` patterns are not \
+                 yet implemented."
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let analysis = masking::analyze_with_runtime(&tree, &all_observations, Variant::Masking);
+
+    match format {
+        Format::Text => {
+            println!("floyd  runtime MC/DC analysis of {}", manifest.display());
+            println!();
+            println!("Test targets: {}", build.test_artifacts.len());
+            print_runtime_report_body(&all_tests, &all_observations, &analysis);
+        }
+        Format::Json => {
+            #[derive(serde::Serialize)]
+            struct Report<'a> {
+                manifest: String,
+                workspace_root: String,
+                test_targets: usize,
+                tests_discovered: &'a [String],
+                observations: &'a [ConditionObservation],
+                analysis: &'a RuntimeAnalysis,
+            }
+            let report = Report {
+                manifest: manifest.display().to_string(),
+                workspace_root: build.workspace_root.display().to_string(),
+                test_targets: build.test_artifacts.len(),
+                tests_discovered: &all_tests,
+                observations: &all_observations,
+                analysis: &analysis,
+            };
+            match serde_json::to_string_pretty(&report) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("cargo-floyd: serialize JSON: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCode {
     // 1. Build the file as a #[test]-enabled instrumented binary.
     let compiled = match instrument::compile_test_target(source, workdir) {
         Ok(r) => r,
@@ -271,15 +462,19 @@ fn print_usage() {
     eprintln!("cargo-floyd  MC/DC coverage analysis for Rust");
     eprintln!();
     eprintln!("Usage:");
+    eprintln!("    cargo floyd test [--format=text|json] [<path>]");
+    eprintln!("        Runtime MC/DC analysis: builds the project as a test");
+    eprintln!("        crate with coverage instrumentation, runs each #[test]");
+    eprintln!("        function individually, and reports which conditions the");
+    eprintln!("        test suite exercises under masking MC/DC.");
+    eprintln!();
+    eprintln!("        <path> defaults to the current directory (cargo project).");
+    eprintln!("        Pass an explicit Cargo.toml, a directory, or a single .rs");
+    eprintln!("        file to override.");
+    eprintln!();
     eprintln!("    cargo floyd [--format=text|json] <path/to/source.rs>");
     eprintln!("        Static MC/DC analysis: prints the recovered truth table");
-    eprintln!("        and per-condition independence pairs.");
-    eprintln!();
-    eprintln!("    cargo floyd test [--format=text|json] <path/to/source.rs>");
-    eprintln!("        Runtime MC/DC analysis: compiles the source as a test");
-    eprintln!("        crate, runs each #[test] function individually with");
-    eprintln!("        coverage instrumentation, and reports which conditions");
-    eprintln!("        the test suite exercises under masking MC/DC.");
+    eprintln!("        and per-condition independence pairs for one source file.");
     eprintln!();
     eprintln!("Requires nightly Rust + the llvm-tools-preview component:");
     eprintln!("    rustup component add llvm-tools-preview --toolchain nightly");
@@ -341,6 +536,14 @@ fn print_runtime_report(
 ) {
     println!("floyd  runtime MC/DC analysis of {}", source.display());
     println!();
+    print_runtime_report_body(tests, observations, analysis);
+}
+
+fn print_runtime_report_body(
+    tests: &[String],
+    observations: &[ConditionObservation],
+    analysis: &RuntimeAnalysis,
+) {
     println!("Tests discovered: {}", tests.len());
     println!("Observations:     {}", observations.len());
     println!(

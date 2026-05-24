@@ -90,7 +90,7 @@ pub fn correlate(mir: &Mir, coverage: &CoverageReport) -> DecisionMap {
         let mut conditions = BTreeMap::new();
         for (name, span) in &condition_spans {
             if let Some(cov_fn) = cov_fn {
-                if let Some(branch) = cov_fn.branches.iter().find(|b| b.span == *span) {
+                if let Some(branch) = cov_fn.branches.iter().find(|b| spans_match(&b.span, span)) {
                     conditions.insert(
                         name.clone(),
                         ConditionRuntime {
@@ -156,6 +156,22 @@ pub fn observation_from_coverage(
 ///
 /// Both `switchInt` discriminants (condition tests) and `AssignCopy`
 /// sources (condition reads) are considered. First occurrence wins.
+///
+/// Two source spans match if the line/col coordinates are identical
+/// AND the file paths are compatible: equal, or one is a suffix of
+/// the other. The suffix case handles the common cargo project
+/// asymmetry where MIR emits relative paths (`src/lib.rs:2:5: 2:6`)
+/// while `llvm-cov export` reports absolute paths
+/// (`/abs/.../src/lib.rs:2:5: 2:6`).
+fn spans_match(a: &SourceSpan, b: &SourceSpan) -> bool {
+    if (a.start_line, a.start_col, a.end_line, a.end_col)
+        != (b.start_line, b.start_col, b.end_line, b.end_col)
+    {
+        return false;
+    }
+    a.file == b.file || a.file.ends_with(&b.file) || b.file.ends_with(&a.file)
+}
+
 fn collect_condition_spans(f: &MirFunction) -> BTreeMap<String, SourceSpan> {
     let mut spans = BTreeMap::new();
     for block in &f.blocks {
