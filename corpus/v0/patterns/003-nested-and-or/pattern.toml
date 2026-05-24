@@ -1,0 +1,103 @@
+# Floyd corpus pattern.
+# Schema documented at corpus/README.md.
+
+schema_version = 1
+id = "003-nested-and-or"
+name = "Nested AND-OR"
+description = """
+Three-condition expression `(a && b) || c`. The first nested pattern:
+rustc lowers this to a CFG of two switchInts that share a common
+'evaluate c' terminal block, with no intermediate temporary. The
+decomposer must recover the full ITE structure from this flattened
+CFG (not just the immediate switchInt of the outer block).
+
+This is also the first pattern exercised against the masking engine
+with a non-trivial truth table. For this particular expression
+masking MC/DC and unique-cause MC/DC happen to produce the same
+independence pairs.
+"""
+
+source = "src.rs"
+function = "decide"
+signature = "fn decide(a: bool, b: bool, c: bool) -> bool"
+
+[decision]
+expr = "(a && b) || c"
+conditions = ["a", "b", "c"]
+short_circuit = true
+
+variant = "masking"
+
+# Truth table — 8 rows for 3 conditions.
+# 'evaluated' lists conditions that get evaluated under short-circuit
+# rules. `b` is masked when a is false (&& short-circuits); `c` is
+# masked when (a && b) is true (|| short-circuits).
+[[truth_table]]
+inputs    = { a = false, b = false, c = false }
+result    = false
+evaluated = ["a", "c"]
+[[truth_table]]
+inputs    = { a = false, b = false, c = true }
+result    = true
+evaluated = ["a", "c"]
+[[truth_table]]
+inputs    = { a = false, b = true, c = false }
+result    = false
+evaluated = ["a", "c"]
+[[truth_table]]
+inputs    = { a = false, b = true, c = true }
+result    = true
+evaluated = ["a", "c"]
+[[truth_table]]
+inputs    = { a = true, b = false, c = false }
+result    = false
+evaluated = ["a", "b", "c"]
+[[truth_table]]
+inputs    = { a = true, b = false, c = true }
+result    = true
+evaluated = ["a", "b", "c"]
+[[truth_table]]
+inputs    = { a = true, b = true, c = false }
+result    = true
+evaluated = ["a", "b"]
+[[truth_table]]
+inputs    = { a = true, b = true, c = true }
+result    = true
+evaluated = ["a", "b"]
+
+# Independence pairs (masking MC/DC).
+# Chosen to overlap maximally so the minimum_test_set below hits
+# the theoretical n+1 = 4-test minimum for 3 conditions.
+
+[[independence_pair]]
+condition     = "a"
+held_constant = ["b", "c"]
+test_1 = { a = false, b = true, c = false, result = false }
+test_2 = { a = true,  b = true, c = false, result = true }
+
+[[independence_pair]]
+condition     = "b"
+held_constant = ["a", "c"]
+test_1 = { a = true, b = false, c = false, result = false }
+test_2 = { a = true, b = true,  c = false, result = true }
+
+[[independence_pair]]
+condition     = "c"
+held_constant = ["a", "b"]
+test_1 = { a = true, b = false, c = false, result = false }
+test_2 = { a = true, b = false, c = true,  result = true }
+
+# Minimum test set sufficient for full MC/DC — 4 tests, the
+# theoretical n+1 minimum for n=3 conditions.
+[[minimum_test_set]]
+inputs = { a = false, b = true, c = false }
+result = false
+[[minimum_test_set]]
+inputs = { a = true, b = true, c = false }
+result = true
+[[minimum_test_set]]
+inputs = { a = true, b = false, c = false }
+result = false
+[[minimum_test_set]]
+inputs = { a = true, b = false, c = true }
+result = true

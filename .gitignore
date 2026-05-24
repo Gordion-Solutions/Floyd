@@ -1,0 +1,22 @@
+# Cargo build output
+/target/
+**/target/
+
+# Stray rustc artefacts at the repo root (e.g. from ad-hoc rustc
+# invocations during MIR scouting that default to the current dir).
+*.rlib
+*.rmeta
+*.profraw
+*.profdata
+
+# Backup files from cargo
+**/*.rs.bk
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

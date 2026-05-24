@@ -1,0 +1,103 @@
+# Floyd top-level workflow graph
+#
+# Each node is a pipeline stage / tool. Each edge is a typed data contract.
+# The `payload` of an edge must resolve to a type definition in
+# architecture/types/. Nodes with a `crate` value must correspond to a
+# Cargo workspace member.
+
+[meta]
+phase = 0
+schema_version = 1
+
+# ---------------------------------------------------------------------------
+# Nodes
+# ---------------------------------------------------------------------------
+
+[[node]]
+id = "driver"
+kind = "cli"
+crate = "cargo-floyd"
+purpose = "Cargo subcommand entry point (`cargo floyd ...`)."
+
+[[node]]
+id = "instrument"
+kind = "stage"
+purpose = "Invoke rustc with -Cinstrument-coverage -Zcoverage-options=branch,condition. Produce instrumented test binaries."
+
+[[node]]
+id = "runner"
+kind = "stage"
+purpose = "Execute instrumented test binary, collect raw profile counters (profraw)."
+
+[[node]]
+id = "mir-extractor"
+kind = "stage"
+purpose = "Pull MIR/HIR for instrumented crates so decision structure can be recovered."
+
+[[node]]
+id = "decomposer"
+kind = "stage"
+crate = "floyd"
+purpose = "Reduce boolean expressions, match, if-let, and match guards to per-decision condition trees."
+
+[[node]]
+id = "masking"
+kind = "stage"
+crate = "floyd"
+purpose = "Compute condition independence matrices and identify missing condition pairs. Two variants: masking MC/DC and unique-cause MC/DC."
+
+[[node]]
+id = "report"
+kind = "stage"
+purpose = "Render coverage report. Phase 0: HTML. Phase 1: also JSON / SARIF / LCOV / XML."
+
+[[node]]
+id = "corpus-v0"
+kind = "dataset"
+path = "corpus/v0"
+purpose = "Synthetic decision patterns with known MC/DC ground truth. Differential-validation substrate. See corpus/README.md."
+
+# ---------------------------------------------------------------------------
+# Edges (typed data contracts between stages)
+# ---------------------------------------------------------------------------
+
+[[edge]]
+from = "driver"
+to = "instrument"
+payload = "RustWorkspace"
+
+[[edge]]
+from = "instrument"
+to = "runner"
+payload = "InstrumentedArtifacts"
+
+[[edge]]
+from = "instrument"
+to = "mir-extractor"
+payload = "CrateMetadata"
+
+[[edge]]
+from = "runner"
+to = "masking"
+payload = "ProfRaw"
+
+[[edge]]
+from = "mir-extractor"
+to = "decomposer"
+payload = "Mir"
+
+[[edge]]
+from = "decomposer"
+to = "masking"
+payload = "DecisionTree"
+
+[[edge]]
+from = "masking"
+to = "report"
+payload = "IndependenceMatrix"
+
+[[edge]]
+from = "corpus-v0"
+to = "masking"
+payload = "GroundTruth"
+purpose = "Differential-validation harness — corpus expectations checked against masking output."

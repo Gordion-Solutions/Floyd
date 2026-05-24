@@ -1,0 +1,69 @@
+# Floyd corpus pattern.
+# Schema documented at corpus/README.md.
+
+schema_version = 1
+id = "002-simple-or"
+name = "Simple OR"
+description = """
+Two-condition OR with short-circuit evaluation. The mirror of
+001-simple-and: condition `b` is masked (not evaluated) when
+condition `a` is true, because `||` short-circuits.
+"""
+
+source = "src.rs"
+function = "decide"
+signature = "fn decide(a: bool, b: bool) -> bool"
+
+[decision]
+expr = "a || b"
+conditions = ["a", "b"]
+short_circuit = true
+
+variant = "masking"
+
+# Truth table.
+[[truth_table]]
+inputs    = { a = false, b = false }
+result    = false
+evaluated = ["a", "b"]
+
+[[truth_table]]
+inputs    = { a = false, b = true }
+result    = true
+evaluated = ["a", "b"]
+
+[[truth_table]]
+inputs    = { a = true, b = false }
+result    = true
+evaluated = ["a"]
+
+[[truth_table]]
+inputs    = { a = true, b = true }
+result    = true
+evaluated = ["a"]
+
+# Independence pairs (masking MC/DC).
+[[independence_pair]]
+condition     = "a"
+held_constant = ["b"]
+test_1 = { a = false, b = false, result = false }
+test_2 = { a = true,  b = false, result = true }
+
+[[independence_pair]]
+condition     = "b"
+held_constant = ["a"]
+test_1 = { a = false, b = false, result = false }
+test_2 = { a = false, b = true,  result = true }
+
+# Minimum test set sufficient for full MC/DC.
+[[minimum_test_set]]
+inputs = { a = false, b = false }
+result = false
+
+[[minimum_test_set]]
+inputs = { a = true, b = false }
+result = true
+
+[[minimum_test_set]]
+inputs = { a = false, b = true }
+result = true

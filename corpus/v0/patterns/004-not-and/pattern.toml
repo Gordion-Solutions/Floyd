@@ -1,0 +1,75 @@
+# Floyd corpus pattern.
+# Schema documented at corpus/README.md.
+
+schema_version = 1
+id = "004-not-and"
+name = "Negated AND"
+description = """
+Negated AND: `!a && b`. Validates that the decomposer handles logical
+negation correctly. rustc folds the unary `!` into the switchInt
+arms: the emitted MIR is identical in shape to `a && b` with the
+arms swapped, so the existing CFG walker produces a correct ITE
+without needing any Not-specific support — the negation is absorbed
+naturally by the ITE representation.
+
+Decompose produces `Ite { a, false, b }` — read as
+'if a then false else b', which is `!a && b`.
+"""
+
+source = "src.rs"
+function = "decide"
+signature = "fn decide(a: bool, b: bool) -> bool"
+
+[decision]
+expr = "!a && b"
+conditions = ["a", "b"]
+short_circuit = true
+
+variant = "masking"
+
+# Truth table. `b` is masked when `a` is true (`!a` is false, short-circuit AND).
+[[truth_table]]
+inputs    = { a = false, b = false }
+result    = false
+evaluated = ["a", "b"]
+
+[[truth_table]]
+inputs    = { a = false, b = true }
+result    = true
+evaluated = ["a", "b"]
+
+[[truth_table]]
+inputs    = { a = true, b = false }
+result    = false
+evaluated = ["a"]
+
+[[truth_table]]
+inputs    = { a = true, b = true }
+result    = false
+evaluated = ["a"]
+
+# Independence pairs (masking MC/DC).
+[[independence_pair]]
+condition     = "a"
+held_constant = ["b"]
+test_1 = { a = false, b = true, result = true }
+test_2 = { a = true,  b = true, result = false }
+
+[[independence_pair]]
+condition     = "b"
+held_constant = ["a"]
+test_1 = { a = false, b = false, result = false }
+test_2 = { a = false, b = true,  result = true }
+
+# Minimum test set: union of the independence pair inputs (3 tests).
+[[minimum_test_set]]
+inputs = { a = false, b = false }
+result = false
+
+[[minimum_test_set]]
+inputs = { a = false, b = true }
+result = true
+
+[[minimum_test_set]]
+inputs = { a = true, b = true }
+result = false

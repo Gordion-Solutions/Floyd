@@ -1,0 +1,86 @@
+# Floyd corpus pattern.
+# Schema documented at corpus/README.md.
+
+schema_version = 1
+id = "001-simple-and"
+name = "Simple AND"
+description = """
+Two-condition AND with short-circuit evaluation. The canonical first
+pattern: condition `b` is masked (not evaluated) when condition `a`
+is false, because `&&` short-circuits.
+"""
+
+# Source file (relative to this pattern.toml).
+source = "src.rs"
+# Rust path of the function under analysis within src.rs.
+function = "decide"
+# Informational; for human review.
+signature = "fn decide(a: bool, b: bool) -> bool"
+
+# The boolean decision and its atomic conditions.
+[decision]
+expr = "a && b"
+conditions = ["a", "b"]
+short_circuit = true
+
+# MC/DC variant under which the expected pairs below are computed.
+#   "masking"       masking MC/DC (CAST-10 default; modern qualified tools)
+#   "unique-cause"  strict unique-cause MC/DC
+variant = "masking"
+
+# Full truth table.
+# `inputs`    — the values assigned to each condition
+# `result`    — the decision outcome under those inputs
+# `evaluated` — which conditions were actually evaluated (rest are
+#               short-circuited)
+[[truth_table]]
+inputs    = { a = false, b = false }
+result    = false
+evaluated = ["a"]
+
+[[truth_table]]
+inputs    = { a = false, b = true }
+result    = false
+evaluated = ["a"]
+
+[[truth_table]]
+inputs    = { a = true, b = false }
+result    = false
+evaluated = ["a", "b"]
+
+[[truth_table]]
+inputs    = { a = true, b = true }
+result    = true
+evaluated = ["a", "b"]
+
+# MC/DC independence pairs.
+#
+# Each pair demonstrates that flipping the named condition (with all
+# others held constant under the masking variant) changes the
+# decision outcome. To achieve MC/DC for this decision, the test
+# suite must hit at least the union of all independence pair inputs.
+[[independence_pair]]
+condition     = "a"
+held_constant = ["b"]
+test_1 = { a = false, b = true, result = false }
+test_2 = { a = true,  b = true, result = true }
+
+[[independence_pair]]
+condition     = "b"
+held_constant = ["a"]
+test_1 = { a = true, b = false, result = false }
+test_2 = { a = true, b = true,  result = true }
+
+# Minimum test set sufficient for full MC/DC.
+# (Union of the independence pair inputs above.)
+[[minimum_test_set]]
+inputs = { a = false, b = true }
+result = false
+
+[[minimum_test_set]]
+inputs = { a = true, b = false }
+result = false
+
+[[minimum_test_set]]
+inputs = { a = true, b = true }
+result = true

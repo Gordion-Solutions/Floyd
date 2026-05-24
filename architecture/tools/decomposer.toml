@@ -1,0 +1,79 @@
+# Sub-graph for the `decomposer` stage of workflow.toml.
+#
+# This is the Phase 0 hardness: turning Rust's logical decisions
+# (boolean expressions with short-circuit, `if let`, `match`, match
+# guards, `?`) into per-decision condition trees that the masking engine
+# can reason over.
+#
+# Each `[[fn]]` block declares a function the implementation must provide.
+# Each `[[call]]` block declares an intra-tool call edge.
+# CI compares this against the syn-extracted call graph of the
+# implementation crate — drift fails the build.
+
+[meta]
+tool = "decomposer"
+crate = "floyd"
+
+# ---------------------------------------------------------------------------
+# Functions
+# ---------------------------------------------------------------------------
+
+[[fn]]
+id = "decompose"
+role = "entry"
+visibility = "pub"
+sig = "fn decompose(mir: &Mir) -> DecisionTree"
+notes = "Entry point. Pinned by workflow.toml's `mir-extractor -> decomposer` edge payload."
+
+[[fn]]
+id = "handle_boolean"
+sig = "fn handle_boolean(expr: &BoolExpr) -> Node"
+handles = ["&&", "||", "!"]
+notes = "Short-circuit evaluation makes this the source of most masking subtleties."
+
+[[fn]]
+id = "handle_if_let"
+sig = "fn handle_if_let(expr: &IfLet) -> Node"
+
+[[fn]]
+id = "handle_match"
+sig = "fn handle_match(expr: &Match) -> Node"
+notes = "Partial support only in Phase 0. Full pattern-matching MC/DC is a Phase 2 deliverable — it's an acknowledged open problem in the field."
+
+[[fn]]
+id = "handle_match_guard"
+sig = "fn handle_match_guard(guard: &Guard) -> Node"
+
+[[fn]]
+id = "handle_try"
+sig = "fn handle_try(expr: &Try) -> Node"
+handles = ["?"]
+
+# ---------------------------------------------------------------------------
+# Intra-tool call edges
+# ---------------------------------------------------------------------------
+
+[[call]]
+from = "decompose"
+to = "handle_boolean"
+
+[[call]]
+from = "decompose"
+to = "handle_if_let"
+
+[[call]]
+from = "decompose"
+to = "handle_match"
+
+[[call]]
+from = "decompose"
+to = "handle_try"
+
+[[call]]
+from = "handle_match"
+to = "handle_match_guard"
+
+[[call]]
+from = "handle_boolean"
+to = "handle_boolean"
+notes = "Recursive: nested && / || / ! decomposition."

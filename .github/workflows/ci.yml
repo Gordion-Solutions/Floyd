@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+
+  docs:
+    name: docs (warning-as-error)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps
+
+  arch-check:
+    # Phase 0: validate that architecture TOML files parse.
+    # Phase 1: extend to diff against syn-extracted call graphs of each
+    # crate. Drift between architecture/tools/*.toml and the real code
+    # will fail the build here.
+    name: architecture graph validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate workflow + sub-graph TOMLs parse
+        run: |
+          set -euo pipefail
+          for f in architecture/workflow.toml architecture/tools/*.toml; do
+            [ -f "$f" ] || continue
+            python3 -c "import tomllib; tomllib.load(open('$f', 'rb'))"
+            echo "  OK $f"
+          done
+      - name: Sanity-check workflow edges reference declared nodes
+        run: |
+          python3 <<'PY'
+          import tomllib, pathlib, sys
+          wf = tomllib.load(open('architecture/workflow.toml', 'rb'))
+          nodes = {n['id'] for n in wf.get('node', [])}
+          errs = []
+          for e in wf.get('edge', []):
+              for end in ('from', 'to'):
+                  if e[end] not in nodes:
+                      errs.append(f"edge {e['from']}->{e['to']} references unknown node '{e[end]}'")
+          if errs:
+              for x in errs: print('  ERR:', x)
+              sys.exit(1)
+          print(f"  OK: all {len(wf.get('edge', []))} edges reference declared nodes")
+          PY
+
+  corpus-check:
+    # Phase 0: validate each pattern.toml parses and its declared
+    # truth table is internally consistent (full coverage of the
+    # condition combinations, independence pairs reference real rows).
+    # Phase 1+: extend to run patterns through the Floyd engine and
+    # diff the output against the expected MC/DC analysis.
+    name: corpus pattern validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: pattern.toml schema + truth-table consistency
+        run: |
+          python3 <<'PY'
+          import tomllib, pathlib, sys
+          errs = []
+          patterns = sorted(pathlib.Path('corpus').rglob('pattern.toml'))
+          if not patterns:
+              print('  (no patterns yet)')
+              sys.exit(0)
+          for p in patterns:
+              d = tomllib.load(open(p, 'rb'))
+              tag = f"{p}"
+              if d.get('schema_version') != 1:
+                  errs.append(f"{tag}: schema_version != 1"); continue
+              decision = d.get('decision', {})
+              conds = decision.get('conditions', [])
+              if not conds:
+                  errs.append(f"{tag}: no conditions declared"); continue
+              # Truth table must cover every 2^n combination.
+              expected = 2 ** len(conds)
+              rows = d.get('truth_table', [])
+              if len(rows) != expected:
+                  errs.append(f"{tag}: truth_table has {len(rows)} rows, expected {expected} for {len(conds)} conditions")
+              # Each independence pair must point at two truth-table rows.
+              row_keys = {tuple(sorted(r['inputs'].items())): r['result'] for r in rows}
+              for pair in d.get('independence_pair', []):
+                  for k in ('test_1', 'test_2'):
+                      t = pair[k]
+                      inputs = {c: t[c] for c in conds}
+                      key = tuple(sorted(inputs.items()))
+                      if key not in row_keys:
+                          errs.append(f"{tag}: pair {pair['condition']}.{k} inputs not in truth_table")
+                      elif row_keys[key] != t['result']:
+                          errs.append(f"{tag}: pair {pair['condition']}.{k} result conflicts with truth_table")
+              print(f"  OK {tag}")
+          if errs:
+              for e in errs: print('  ERR:', e)
+              sys.exit(1)
+          PY
+      - name: Each src.rs compiles as a library
+        run: |
+          set -euo pipefail
+          failed=0
+          for src in $(find corpus -name src.rs); do
+            if rustc --crate-type lib --edition 2021 --emit=metadata -o /tmp/floyd-corpus-check.rmeta "$src" 2>&1 | tee /tmp/rustc.log; then
+              echo "  OK $src"
+            else
+              echo "  ERR $src"; failed=1
+            fi
+          done
+          exit $failed
