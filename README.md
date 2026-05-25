@@ -69,6 +69,7 @@ the ground-truth analyses Floyd's output is checked against (see
 | **Enum `match` without binding** | `match state { State::Idle => ..., State::Running => ... }` — condition names use the rustc discriminant index (e.g. `state == State::variant_0`); use `if let` with a binding to get source variant names instead |
 | Boolean derived from a `let`-bound expression | `let fast = speed > 50; fast && brake` |
 | JSON output | `cargo floyd test --format=json` |
+| **JUnit XML output** | `cargo floyd test --format=junit` — one `<testcase>` per condition (pass = exercised, failure = unexercised); rendered natively by Jenkins, GitLab CI, GitHub Actions, Bazel/Buck2, etc. |
 
 ### What doesn't (yet)
 

@@ -13,7 +13,10 @@
 //!   and report which conditions the observed tests exercise under
 //!   masking MC/DC.
 //!
-//! Both modes support `--format=text` (default) or `--format=json`.
+//! Both modes support `--format=text` (default) and `--format=json`.
+//! Runtime mode additionally supports `--format=junit`, emitting one
+//! JUnit `<testcase>` per condition for CIs that render JUnit XML
+//! natively (Jenkins, GitLab CI, GitHub Actions, Bazel/Buck2, etc.).
 
 use floyd::correlate;
 use floyd::decision;
@@ -31,6 +34,7 @@ use std::process::ExitCode;
 enum Format {
     Text,
     Json,
+    Junit,
 }
 
 fn main() -> ExitCode {
@@ -49,11 +53,10 @@ fn main() -> ExitCode {
     let mut i = 0;
     while i < args.len() {
         if let Some(rest) = args[i].strip_prefix("--format=") {
-            format = match rest {
-                "json" => Format::Json,
-                "text" => Format::Text,
-                other => {
-                    eprintln!("cargo-floyd: unknown --format value: {other}");
+            format = match parse_format(rest) {
+                Ok(f) => f,
+                Err(msg) => {
+                    eprintln!("cargo-floyd: {msg}");
                     return ExitCode::from(2);
                 }
             };
@@ -62,12 +65,13 @@ fn main() -> ExitCode {
             args.remove(i);
             let value = args.get(i).copied();
             format = match value {
-                Some("json") => Format::Json,
-                Some("text") => Format::Text,
-                Some(other) => {
-                    eprintln!("cargo-floyd: unknown --format value: {other}");
-                    return ExitCode::from(2);
-                }
+                Some(v) => match parse_format(v) {
+                    Ok(f) => f,
+                    Err(msg) => {
+                        eprintln!("cargo-floyd: {msg}");
+                        return ExitCode::from(2);
+                    }
+                },
                 None => {
                     eprintln!("cargo-floyd: --format requires a value");
                     return ExitCode::from(2);
@@ -197,6 +201,14 @@ fn run_static_mode(source: &Path, workdir: &Path, format: Format) -> ExitCode {
                 return ExitCode::from(1);
             }
         },
+        Format::Junit => {
+            eprintln!(
+                "cargo-floyd: --format=junit is only meaningful in runtime mode \
+                 (use `cargo floyd test`). Static analysis has no test verdicts \
+                 to render."
+            );
+            return ExitCode::from(2);
+        }
     }
     ExitCode::SUCCESS
 }
@@ -336,6 +348,9 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
                 }
             }
         }
+        Format::Junit => {
+            print_runtime_junit(&manifest.display().to_string(), &analysis);
+        }
     }
     ExitCode::SUCCESS
 }
@@ -454,15 +469,29 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
                 }
             }
         }
+        Format::Junit => {
+            print_runtime_junit(&source.display().to_string(), &analysis);
+        }
     }
     ExitCode::SUCCESS
+}
+
+fn parse_format(s: &str) -> Result<Format, String> {
+    match s {
+        "text" => Ok(Format::Text),
+        "json" => Ok(Format::Json),
+        "junit" => Ok(Format::Junit),
+        other => Err(format!(
+            "unknown --format value: {other} (expected text, json, or junit)"
+        )),
+    }
 }
 
 fn print_usage() {
     eprintln!("cargo-floyd  MC/DC coverage analysis for Rust");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("    cargo floyd test [--format=text|json] [<path>]");
+    eprintln!("    cargo floyd test [--format=text|json|junit] [<path>]");
     eprintln!("        Runtime MC/DC analysis: builds the project as a test");
     eprintln!("        crate with coverage instrumentation, runs each #[test]");
     eprintln!("        function individually, and reports which conditions the");
@@ -472,9 +501,16 @@ fn print_usage() {
     eprintln!("        Pass an explicit Cargo.toml, a directory, or a single .rs");
     eprintln!("        file to override.");
     eprintln!();
+    eprintln!("        --format=junit emits a JUnit XML report (one testcase");
+    eprintln!("        per condition; pass=exercised, failure=unexercised) for");
+    eprintln!("        CIs that render JUnit natively (Jenkins, GitLab CI,");
+    eprintln!("        GitHub Actions, Bazel/Buck2, etc.).");
+    eprintln!();
     eprintln!("    cargo floyd [--format=text|json] <path/to/source.rs>");
     eprintln!("        Static MC/DC analysis: prints the recovered truth table");
     eprintln!("        and per-condition independence pairs for one source file.");
+    eprintln!("        --format=junit is not valid in static mode (no test");
+    eprintln!("        verdicts to render).");
     eprintln!();
     eprintln!("Requires nightly Rust + the llvm-tools-preview component:");
     eprintln!("    rustup component add llvm-tools-preview --toolchain nightly");
@@ -655,5 +691,111 @@ fn bool_glyph(v: bool) -> &'static str {
         "T"
     } else {
         "F"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JUnit XML rendering
+// ---------------------------------------------------------------------------
+
+/// Emit a JUnit XML report for a runtime analysis. One
+/// `<testsuite>` per analysis context (typically one per
+/// invocation today), one `<testcase>` per recovered condition.
+/// Exercised conditions pass (empty body); unexercised conditions
+/// emit a `<failure>` with the required independence-pair inputs
+/// in the message.
+///
+/// The format is the de-facto JUnit XML that Jenkins, GitLab CI,
+/// GitHub Actions, Bazel/Buck2, and the other CIs the automotive
+/// industry already deploys render natively.
+fn print_runtime_junit(source: &str, analysis: &RuntimeAnalysis) {
+    let conditions = &analysis.matrix.conditions;
+    let total = conditions.len();
+    let failures = conditions
+        .iter()
+        .filter(|c| {
+            matches!(
+                analysis.condition_status.get(c.as_str()),
+                Some(ConditionStatus::Unexercised) | None
+            )
+        })
+        .count();
+
+    println!(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    println!(r#"<testsuites name="floyd" tests="{total}" failures="{failures}">"#);
+    println!(
+        r#"  <testsuite name="{}" tests="{total}" failures="{failures}">"#,
+        xml_escape(source)
+    );
+    for cond in conditions {
+        let case_name = xml_escape(cond);
+        match analysis.condition_status.get(cond.as_str()) {
+            Some(ConditionStatus::Exercised(_)) => {
+                println!(r#"    <testcase name="{case_name}" classname="floyd.mcdc"/>"#);
+            }
+            Some(ConditionStatus::Unexercised) | None => {
+                let required = analysis
+                    .matrix
+                    .independence_pairs
+                    .get(cond.as_str())
+                    .and_then(|pairs| pairs.first())
+                    .map(|p| {
+                        let t1 = format_inputs(conditions, &p.test_1);
+                        let t2 = format_inputs(conditions, &p.test_2);
+                        format!(
+                            "needs a test exercising ({t1}) -> {} or ({t2}) -> {}",
+                            bool_glyph(p.test_1.result),
+                            bool_glyph(p.test_2.result),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "no valid independence pair available for this condition".to_string()
+                    });
+                println!(r#"    <testcase name="{case_name}" classname="floyd.mcdc">"#);
+                println!(
+                    r#"      <failure message="{}" type="UnexercisedCondition"/>"#,
+                    xml_escape(&required)
+                );
+                println!(r#"    </testcase>"#);
+            }
+        }
+    }
+    println!(r#"  </testsuite>"#);
+    println!(r#"</testsuites>"#);
+}
+
+/// Escape the five XML special characters so condition names like
+/// `speed > 50` survive intact in attribute and text positions.
+/// The `&` replacement runs first so the subsequent escapes don't
+/// double-escape the ampersands they introduce.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xml_escape_handles_all_five_specials() {
+        assert_eq!(xml_escape("a < b"), "a &lt; b");
+        assert_eq!(xml_escape("a > b"), "a &gt; b");
+        assert_eq!(xml_escape(r#"q="x""#), "q=&quot;x&quot;");
+        assert_eq!(xml_escape("don't"), "don&apos;t");
+        // Ampersand must run first so `&lt;` doesn't become `&amp;lt;`.
+        assert_eq!(xml_escape("a < b & c"), "a &lt; b &amp; c");
+    }
+
+    #[test]
+    fn parse_format_accepts_three_values() {
+        assert!(matches!(parse_format("text"), Ok(Format::Text)));
+        assert!(matches!(parse_format("json"), Ok(Format::Json)));
+        assert!(matches!(parse_format("junit"), Ok(Format::Junit)));
+        assert!(parse_format("xml").is_err());
+        assert!(parse_format("").is_err());
     }
 }
