@@ -28,4 +28,5 @@ ADR-NNNN-short-title.md
 |----|----------|-------|
 | 0001 | Accepted | [External MC/DC engine, automotive-first focus](0001-external-engine-automotive-first.md) |
 | 0002 | Accepted | [Phase 1 runtime pipeline](0002-runtime-pipeline.md) (scouting resolved 2026-05-23) |
-| 0003 | Accepted | [Open-source vs commercial scope boundary](0003-open-source-vs-commercial-scope.md) |
+| 0003 | Superseded by ADR-0004 | [Open-source vs commercial scope boundary](0003-open-source-vs-commercial-scope.md) |
+| 0004 | Accepted | [Engine-correctness scope is open-source; reporting and packaging are commercial](0004-engine-correctness-oss-boundary.md) |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Accepted |
+| Status | Superseded by [ADR-0004](0004-engine-correctness-oss-boundary.md) (2026-05-25) |
 | Date | 2026-05-23 |
 | Supersedes | — |
 

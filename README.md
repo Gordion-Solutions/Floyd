@@ -50,30 +50,45 @@ which decisions the test suite exercises under masking MC/DC.
 
 Floyd recovers logical decisions from rustc MIR and analyses them
 against the [masking MC/DC variant][cast-10] (the modern qualified
-default). The recovered Phase 0 decision shapes are:
+default). The engine is correct on what it claims to recover — and
+when it doesn't recognise a decision, it returns *no decision*
+rather than wrong output. The [`corpus/`](corpus/) directory pins
+the ground-truth analyses Floyd's output is checked against (see
+"Qualification stance" below).
 
-| Shape | Status |
-|-------|--------|
-| `a && b`, `a \|\| b`, `!a`, arbitrary nesting | ✅ |
-| `if let Some(x) = opt { ... } else { ... }` (with binding) | ✅ |
-| `let x = opt?; <expression using x>` (skip-through) | ✅ |
-| `match n { 0 => ..., 1 => ..., _ => ... }` on integer scrutinees | ✅ |
-| `match m { Variant => ... }` on enum scrutinees (no binding) | ❌ declined |
-| Match guards (`match n { 0 if c => ... }`) | ❌ declined |
-| Multi-decision functions | ❌ first decision only |
-| Pattern destructuring beyond a single bound value | ❌ |
-| Async desugaring, macro expansion provenance | ❌ |
+### What works
 
-"Declined" means the engine returns *no decision* rather than wrong
-output. The pattern shapes the engine doesn't yet recover stay
-visible to the test harness — they just don't contribute to the MC/DC
-report. Engineers wanting MC/DC on an enum variant should use
-`if let` with a binding so the dedicated `if let` handler can
-recover the variant name.
+| Shape | Example |
+|-------|---------|
+| Boolean expressions over named bool values | `a && b`, `a \|\| b`, `!a`, arbitrary nesting |
+| `if let` with a binding | `if let Some(x) = opt { x && b } else { false }` |
+| `?` operator (skip-through to the success path) | `let x = opt?; x && b` |
+| Literal `match` on integer scrutinees | `match n { 0 => ..., 1 => ..., _ => ... }` |
+| Bool `match` | `match b { true => ..., false => ... }` |
+| Boolean derived from a `let`-bound expression | `let fast = speed > 50; fast && brake` |
+| JSON output | `cargo floyd test --format=json` |
 
-The engine is correct on what it claims to recover. The
-[`corpus/`](corpus/) directory holds the ground-truth analyses
-Floyd's output is checked against — see "Qualification stance" below.
+### What doesn't (yet)
+
+The current v0.1.0 line targets pure boolean-variable decisions.
+Several shapes that appear regularly in real safety code are
+declined; the v0.2.0 line (engine-correctness milestone — see
+[ADR-0004](architecture/decisions/0004-engine-correctness-oss-boundary.md))
+closes the biggest gaps. The current declines:
+
+| Shape | Workaround / status |
+|-------|---------------------|
+| **Inline comparisons in a decision**, e.g. `if speed > 50 && brake { ... }` | Bind the comparison first: `let fast = speed > 50; if fast && brake { ... }`. Then the decision recovers normally. Native inline-comparison recovery is queued for v0.2.0. |
+| **Multiple decisions in one function** | The engine reports the decision rooted at the function's entry block only. Subsequent decisions are silently dropped. Multi-decision support is queued for v0.2.0. |
+| **Enum `match` without a binding**, e.g. `match state { Idle => ..., Running => ... }` | Workaround for binding enums: use `if let Variant(x) = ...`. Variant-only enums currently have no workaround; native recovery is queued for v0.2.0. |
+| Match guards (`match n { 0 if c => ... }`) | Not in MVP scope. |
+| Pattern destructuring beyond a single bound value (`if let Some((a, b)) = ...`) | Not in MVP scope. |
+| `async` desugaring, macro-expansion provenance | Not in MVP scope. |
+
+If your real code mostly looks like the first two rows of *what
+doesn't*, the honest read is that Floyd is at "credible evaluation
+prototype" rather than "drop-in tool." The v0.2.0 line is the
+milestone where that changes.
 
 [cast-10]: https://www.faa.gov/aircraft/air_cert/design_approvals/air_software/cast/cast_papers (CAST-10 — Modified Condition/Decision Coverage)
 
