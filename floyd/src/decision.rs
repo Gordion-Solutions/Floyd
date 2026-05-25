@@ -713,9 +713,21 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
                     name: compare_condition_name(*op, lhs, rhs, f),
                 });
             }
+            MirStatement::AssignCaptureRead { dst, holds_ref, .. }
+                if !holds_ref && !feeds_switchint(*dst) =>
+            {
+                // By-value capture read: the propagation pass set
+                // debug_names[dst] to the captured variable's
+                // source-level name, so this dst is the terminal
+                // Condition leaf.
+                if let Some(name) = f.debug_names.get(dst) {
+                    return Some(Node::Condition { name: name.clone() });
+                }
+            }
             // Everything else (temporaries that feed a switchInt,
-            // downcasts, discriminants, unrecognised shapes) is
-            // informational for downstream decoders.
+            // downcasts, discriminants, capture-by-ref aliases,
+            // unrecognised shapes) is informational for downstream
+            // decoders.
             _ => {}
         }
     }

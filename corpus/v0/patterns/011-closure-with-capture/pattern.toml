@@ -1,0 +1,93 @@
+# Floyd corpus pattern.
+# Schema documented at corpus/README.md.
+
+schema_version = 1
+id = "011-closure-with-capture"
+name = "Closure with captured boolean"
+description = """
+A closure captures an outer boolean variable by reference and
+combines it with the closure's parameter via `&&`. In MIR the
+closure body becomes its own function (`outer::{closure#0}`); the
+captured `b` appears as:
+
+  debug b => (*((*_1).0: &bool));
+
+and is read inside the body as:
+
+  _4 = no_retag copy ((*_1).0: &bool);  // alias the reference
+  _3 = copy (*_4);                      // dereference for the value
+
+The capture-propagation pass that runs after each function is
+parsed identifies the alias and the deref, and folds the captured
+variable's source-level name into the body's `debug_names`. Once
+that's done, the existing decomposer recovers `x && b` exactly as
+it would for a bool argument; the captured-vs-argument distinction
+is invisible at the MC/DC layer.
+
+The recovered decision is identical to a two-condition AND
+(pattern 001-simple-and) with the conditions renamed to `x` (the
+closure's parameter) and `b` (the captured variable).
+
+The outer function `outer(a, b)` produces no decision of its own —
+it just calls the closure — so the analysis here is of the
+closure body. Floyd's `--format=text` renders only the first
+recovered decision; `cargo floyd` on this file shows the closure's
+analysis.
+"""
+
+source = "src.rs"
+function = "outer::{closure#0}"
+signature = "fn outer::{closure#0}(_1: &{closure}, x: bool) -> bool"
+
+[decision]
+expr = "x && b"
+conditions = ["x", "b"]
+short_circuit = true
+
+variant = "masking"
+
+# Truth table — 4 rows. `b` is masked when `x` is false
+# (&&-short-circuits).
+[[truth_table]]
+inputs    = { x = false, b = false }
+result    = false
+evaluated = ["x"]
+
+[[truth_table]]
+inputs    = { x = false, b = true }
+result    = false
+evaluated = ["x"]
+
+[[truth_table]]
+inputs    = { x = true, b = false }
+result    = false
+evaluated = ["x", "b"]
+
+[[truth_table]]
+inputs    = { x = true, b = true }
+result    = true
+evaluated = ["x", "b"]
+
+[[independence_pair]]
+condition     = "x"
+held_constant = ["b"]
+test_1 = { x = false, b = true, result = false }
+test_2 = { x = true,  b = true, result = true }
+
+[[independence_pair]]
+condition     = "b"
+held_constant = ["x"]
+test_1 = { x = true, b = false, result = false }
+test_2 = { x = true, b = true,  result = true }
+
+[[minimum_test_set]]
+inputs = { x = false, b = true }
+result = false
+
+[[minimum_test_set]]
+inputs = { x = true, b = false }
+result = false
+
+[[minimum_test_set]]
+inputs = { x = true, b = true }
+result = true

@@ -31,3 +31,4 @@ in the field — Phase 0 only commits to the simple cases.
 | [008-inline-comparison](patterns/008-inline-comparison/) | `speed > 50 && brake` | Inline-comparison + `&&`; engine recognises the comparison and synthesizes the condition name `speed > 50` |
 | [009-enum-match-no-binding](patterns/009-enum-match-no-binding/) | `match mode { Mode::On => ..., Mode::Off => ... }` | Enum dispatch with no bindings; engine synthesizes `mode == Mode::variant_0` from the discriminant index |
 | [010-match-with-downstream-and](patterns/010-match-with-downstream-and/) | `let lit = match n { 0 => true, _ => false }; lit && b` | Match producing an intermediate consumed by `&&`; the intermediate-propagation fold lets the engine recover the combined decision |
+| [011-closure-with-capture](patterns/011-closure-with-capture/) | `let f = \|x: bool\| x && b; f(a)` | Closure capturing an outer boolean; capture-name propagation folds the captured variable into the closure body's debug names |

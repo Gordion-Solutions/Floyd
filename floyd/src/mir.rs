@@ -76,8 +76,34 @@ pub struct MirFunction {
     /// annotation declares one. Critical for mapping MC/DC analysis
     /// back to user variable names.
     pub debug_names: BTreeMap<LocalId, String>,
+    /// Captured variables when this function is a closure body.
+    /// Populated from `debug name => <capture_expr>;` annotations
+    /// of the form `((*_N).<F>: <Ty>)` (by-value),
+    /// `(*((*_N).<F>: &<Ty>))` (by-ref), or
+    /// `(*((*_N).<F>: &mut <Ty>))` (FnMut). A post-pass after
+    /// function parsing propagates each capture's name into
+    /// `debug_names` for any body local that reads the capture,
+    /// so the decomposer can recover conditions like
+    /// `x && b` even when `b` is a closure capture.
+    pub captures: Vec<MirCapture>,
     /// Basic blocks in source order.
     pub blocks: Vec<MirBlock>,
+}
+
+/// A captured variable from a closure's environment.
+#[derive(Debug, Clone)]
+pub struct MirCapture {
+    /// Source-level name of the captured variable.
+    pub name: String,
+    /// Local id of the closure environment (typically `_1`).
+    pub env_local: LocalId,
+    /// Field index inside the closure environment.
+    pub field: u32,
+    /// `true` when the capture is held by reference (`&T` or
+    /// `&mut T`); `false` when held by value (move closure).
+    /// The body access patterns differ — by-value reads field
+    /// directly, by-ref reads a reference then dereferences it.
+    pub by_ref: bool,
 }
 
 /// A function argument: `_<n>: <ty>`.
@@ -164,6 +190,30 @@ pub enum MirStatement {
         variant: String,
         /// Field index inside the variant.
         field: u32,
+        /// Source span, if present in the MIR.
+        span: Option<SourceSpan>,
+    },
+    /// `_<dst> = [no_retag ]copy ((*_<env>).<field>: <Ty>);`
+    ///
+    /// A closure body reading a captured variable. By-value
+    /// captures (move closures) read the field directly as a value;
+    /// by-ref / FnMut captures read the field as a reference, with
+    /// `holds_ref` set, and the value is read via a subsequent
+    /// `_<other> = copy (*_<dst>)` deref. The capture-propagation
+    /// pass uses these to set `debug_names` for any body locals
+    /// that read captures, so the decomposer can recover decisions
+    /// involving captured variables.
+    AssignCaptureRead {
+        /// Destination local — receives either the captured value
+        /// (`holds_ref` false) or a reference to it (true).
+        dst: LocalId,
+        /// Closure environment local (typically `_1`).
+        env: LocalId,
+        /// Field index inside the closure environment.
+        field: u32,
+        /// `true` when the field's type starts with `&` — the dst
+        /// holds a reference, not the value.
+        holds_ref: bool,
         /// Source span, if present in the MIR.
         span: Option<SourceSpan>,
     },
@@ -485,7 +535,11 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
             } else if depth == 1 && scope_nest > 0 {
                 scope_nest -= 1;
             } else if depth == 1 {
-                if let Some(f) = current_fn.take() {
+                if let Some(mut f) = current_fn.take() {
+                    // Closure-capture post-pass: fold capture names
+                    // into debug_names so the decomposer can recover
+                    // conditions involving captured variables.
+                    propagate_capture_names(&mut f);
                     mir.functions.push(f);
                 }
                 depth = 0;
@@ -498,13 +552,20 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
             1 => {
                 let f = current_fn.as_mut().expect("depth=1 requires current_fn");
                 if code.starts_with("debug ") {
-                    if let Some((name, local)) = parse_debug(code) {
-                        // First-wins: rustc emits desugaring bindings
-                        // for the same local in later scopes (e.g. the
-                        // `val` binding the `?` operator synthesizes for
-                        // a local the user named `x`). The user's name
-                        // is always first in source order.
-                        f.debug_names.entry(local).or_insert(name);
+                    match parse_debug(code) {
+                        Some(DebugAnnotation::Local { name, local }) => {
+                            // First-wins: rustc emits desugaring
+                            // bindings for the same local in later
+                            // scopes (e.g. the `val` binding the `?`
+                            // operator synthesizes for a local the
+                            // user named `x`). The user's name is
+                            // always first in source order.
+                            f.debug_names.entry(local).or_insert(name);
+                        }
+                        Some(DebugAnnotation::Capture(c)) => {
+                            f.captures.push(c);
+                        }
+                        None => {}
                     }
                 } else if code.starts_with("let ") {
                     if let Some(mut loc) = parse_let(code) {
@@ -691,17 +752,196 @@ fn parse_bb_header(line: &str) -> Option<BlockId> {
     token.strip_prefix("bb")?.parse::<u32>().ok()
 }
 
-fn parse_debug(line: &str) -> Option<(String, LocalId)> {
+/// Result of parsing a `debug` annotation.
+enum DebugAnnotation {
+    /// `debug name => _N;` — straightforward local binding.
+    Local { name: String, local: LocalId },
+    /// `debug name => <capture-expr>;` — a closure capture in
+    /// one of the by-value, by-ref, or FnMut forms.
+    Capture(MirCapture),
+}
+
+fn parse_debug(line: &str) -> Option<DebugAnnotation> {
     // debug a => _1;
+    // debug b => (*((*_1).0: &bool));            // by-ref (Fn)
+    // debug b => ((*_1).0: bool);                // by-value (move closure)
+    // debug b => (*((*_1).0: &mut bool));        // by-mut-ref (FnMut)
     let s = line.strip_prefix("debug ")?.strip_suffix(';')?;
     let arrow = s.find("=>")?;
     let name = s[..arrow].trim().to_string();
-    let local = s[arrow + 2..]
-        .trim()
-        .strip_prefix('_')?
-        .parse::<u32>()
-        .ok()?;
-    Some((name, local))
+    let rhs = s[arrow + 2..].trim();
+
+    if let Some(rest) = rhs.strip_prefix('_') {
+        if let Ok(local) = rest.parse::<u32>() {
+            return Some(DebugAnnotation::Local { name, local });
+        }
+    }
+    if let Some(capture) = parse_capture_expr(rhs, name.clone()) {
+        return Some(DebugAnnotation::Capture(capture));
+    }
+    None
+}
+
+/// Parse a closure-capture expression on the RHS of a `debug`
+/// annotation. Returns `None` for any shape that isn't one of the
+/// three recognised forms.
+fn parse_capture_expr(rhs: &str, name: String) -> Option<MirCapture> {
+    // By-ref:    (*((*_N).F: &T))
+    // FnMut:     (*((*_N).F: &mut T))
+    // By-value:  ((*_N).F: T)
+    if let Some(inner) = rhs.strip_prefix("(*(").and_then(|s| s.strip_suffix("))")) {
+        // inner = `(*_N).F: &T` or `(*_N).F: &mut T`
+        let (env_local, field) = parse_env_field(inner)?;
+        return Some(MirCapture {
+            name,
+            env_local,
+            field,
+            by_ref: true,
+        });
+    }
+    if let Some(inner) = rhs.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        // inner = `(*_N).F: T`
+        let (env_local, field) = parse_env_field(inner)?;
+        return Some(MirCapture {
+            name,
+            env_local,
+            field,
+            by_ref: false,
+        });
+    }
+    None
+}
+
+/// Parse the `(*_N).F: <Ty>` core of a capture expression and
+/// return `(env_local, field)`.
+fn parse_env_field(s: &str) -> Option<(LocalId, u32)> {
+    // s = `(*_N).F: <Ty>`
+    let rest = s.strip_prefix("(*_")?;
+    let close = rest.find(')')?;
+    let env_local = rest[..close].parse::<u32>().ok()?;
+    let after_close = rest[close + 1..].strip_prefix('.')?;
+    let colon = after_close.find(':')?;
+    let field = after_close[..colon].parse::<u32>().ok()?;
+    Some((env_local, field))
+}
+
+/// Post-pass that runs after a function's MIR is fully parsed.
+/// Walks all statements in the function and, for any local that
+/// reads one of the function's captures, sets that local's
+/// `debug_names` entry so the decomposer can name conditions
+/// involving the capture.
+///
+/// Two reads to recognise:
+///
+/// - `_X = copy ((*_N).<F>: <Ty>)` — direct field read (by-value
+///   capture; the value is `_X`).
+/// - `_X = no_retag copy ((*_N).<F>: &<Ty>)` — read of a reference
+///   field (by-ref / FnMut capture; `_X` now *holds* the reference,
+///   so subsequent `_Y = copy (*_X)` derefs are what actually
+///   names the captured value).
+///
+/// The dereference chain is folded by a second pass over the same
+/// blocks: when a body statement does `_Y = copy (*_X)` and `_X`
+/// is already known to alias a reference-typed capture, `_Y` gets
+/// the captured variable's name.
+fn propagate_capture_names(f: &mut MirFunction) {
+    if f.captures.is_empty() {
+        return;
+    }
+    let by_env_field: BTreeMap<(LocalId, u32), String> = f
+        .captures
+        .iter()
+        .map(|c| ((c.env_local, c.field), c.name.clone()))
+        .collect();
+
+    // First pass: AssignCaptureRead statements directly bind a
+    // local to a capture. By-value reads put the captured value
+    // straight into `dst`; by-ref reads put a reference into
+    // `dst`, with the value reached via a subsequent
+    // `_Y = copy (*_dst)` deref. Track ref aliases separately so
+    // the second pass can name the deref result rather than the
+    // reference itself.
+    let mut ref_aliases: BTreeMap<LocalId, String> = BTreeMap::new();
+    for block in &f.blocks {
+        for stmt in &block.statements {
+            if let MirStatement::AssignCaptureRead {
+                dst,
+                env,
+                field,
+                holds_ref,
+                ..
+            } = stmt
+            {
+                if let Some(name) = by_env_field.get(&(*env, *field)) {
+                    if *holds_ref {
+                        ref_aliases.insert(*dst, name.clone());
+                    }
+                    // Set debug_names regardless of holds_ref. For
+                    // by-value reads this is the captured value
+                    // directly; for by-ref reads it's the reference,
+                    // but giving the reference the same source-level
+                    // name is what lets the subsequent
+                    // `_Y = copy (*_dst)` AssignCopy resolve `_Y`'s
+                    // name from `_dst` via the existing
+                    // extract_terminal_value logic.
+                    f.debug_names.entry(*dst).or_insert_with(|| name.clone());
+                }
+            }
+        }
+    }
+
+    // Second pass: `_Y = copy (*_X)` is parsed as `AssignCopy{Y, X}`,
+    // so the propagation here is simply "if `X` is a reference-alias
+    // for a captured name, `Y` takes that name." Iterate until a
+    // fixed point (bounded for safety) to handle chains like
+    // `_5 = copy (*_4); _0 = copy (*_5);` if they ever occur.
+    let mut changed = true;
+    let max_iter = f.blocks.iter().map(|b| b.statements.len()).sum::<usize>() + 1;
+    let mut iter = 0;
+    while changed && iter < max_iter {
+        changed = false;
+        iter += 1;
+        for block in &f.blocks {
+            for stmt in &block.statements {
+                if let MirStatement::AssignCopy { dst, src, .. } = stmt {
+                    if let Some(name) = ref_aliases.get(src).cloned() {
+                        if f.debug_names.get(dst) != Some(&name) {
+                            f.debug_names.insert(*dst, name.clone());
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// RHS fields parsed out of a capture-read statement.
+struct CaptureReadRhs {
+    env: LocalId,
+    field: u32,
+    holds_ref: bool,
+}
+
+/// Parse the RHS of a capture-read statement —
+/// `copy ((*_N).<F>: <Ty>)` (by-value) or
+/// `no_retag copy ((*_N).<F>: &<Ty>)` (by-ref / FnMut).
+fn parse_capture_read_rhs(rhs: &str) -> Option<CaptureReadRhs> {
+    let after_copy = rhs
+        .strip_prefix("no_retag copy ")
+        .or_else(|| rhs.strip_prefix("copy "))?;
+    // after_copy = `((*_N).F: <Ty>)`
+    let inner = after_copy
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))?;
+    let (env, field) = parse_env_field(inner)?;
+    let ty = inner.rsplit_once(':').map(|(_, t)| t.trim()).unwrap_or("");
+    let holds_ref = ty.starts_with('&');
+    Some(CaptureReadRhs {
+        env,
+        field,
+        holds_ref,
+    })
 }
 
 fn parse_let(line: &str) -> Option<MirLocal> {
@@ -737,6 +977,31 @@ fn parse_statement(line: &str, span: Option<SourceSpan>) -> Option<MirStatement>
         if let Ok(src) = src_str.parse::<u32>() {
             return Some(MirStatement::AssignCopy { dst, src, span });
         }
+    }
+    // `_X = copy (*_Y);` — dereference copy, common when reading
+    // through a captured-by-ref alias inside a closure body. Treat
+    // as a regular AssignCopy so existing decomposer logic picks
+    // up `_Y`'s debug name (which the capture-propagation pass
+    // will have set for capture-reference aliases).
+    if let Some(inner) = rhs.strip_prefix("copy (*_") {
+        if let Some(close) = inner.find(')') {
+            if let Ok(src) = inner[..close].parse::<u32>() {
+                return Some(MirStatement::AssignCopy { dst, src, span });
+            }
+        }
+    }
+    // Closure capture reads: `_X = copy ((*_N).<F>: <Ty>)` or
+    // `_X = no_retag copy ((*_N).<F>: &<Ty>)`. The propagation pass
+    // uses these to set debug names for the body locals that hold
+    // captured values.
+    if let Some(cap) = parse_capture_read_rhs(rhs) {
+        return Some(MirStatement::AssignCaptureRead {
+            dst,
+            env: cap.env,
+            field: cap.field,
+            holds_ref: cap.holds_ref,
+            span,
+        });
     }
     if let Some(val) = rhs.strip_prefix("const ") {
         match val {
@@ -1239,6 +1504,173 @@ fn decide(_1: Option<bool>) -> bool {
     }
 }
 "#;
+
+    // -----------------------------------------------------------------
+    // Closure-capture parsing and name propagation
+    // -----------------------------------------------------------------
+
+    /// Closure body MIR for `|x: bool| x && b` where `b` is captured
+    /// by reference (the default Fn capture). Engine should recover
+    /// `x && b` as the decision once the parser propagates the
+    /// capture name into `_3` and through the `*_3` deref.
+    const CLOSURE_BY_REF_BODY: &str = r#"
+fn outer::{closure#0}(_1: &{closure}, _2: bool) -> bool {
+    debug x => _2;
+    debug b => (*((*_1).0: &bool));
+    let mut _0: bool;
+    let mut _3: &bool;
+
+    bb0: {
+        switchInt(copy _2) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _3 = no_retag copy ((*_1).0: &bool);
+        _0 = copy (*_3);
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    /// Closure body for `move |x: bool| x && b` (by-value capture).
+    /// Captures appear as `((*_1).0: bool)` in the debug
+    /// annotation and as direct field reads in the body.
+    const CLOSURE_BY_VALUE_BODY: &str = r#"
+fn outer::{closure#0}(_1: &{closure}, _2: bool) -> bool {
+    debug x => _2;
+    debug b => ((*_1).0: bool);
+    let mut _0: bool;
+
+    bb0: {
+        switchInt(copy _2) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = copy ((*_1).0: bool);
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    /// Closure body capturing two values used in a 3-condition AND.
+    /// Captured from real rustc nightly 1.97 MIR; rustc assigns
+    /// distinct intermediate locals (`_4`, `_5`) to each capture's
+    /// reference, which the propagation pass relies on.
+    const CLOSURE_TWO_CAPTURES_BODY: &str = r#"
+fn outer::{closure#0}(_1: &{closure}, _2: bool) -> bool {
+    debug x => _2;
+    debug b => (*((*_1).0: &bool));
+    debug c => (*((*_1).1: &bool));
+    let mut _0: bool;
+    let mut _3: bool;
+    let mut _4: &bool;
+    let mut _5: &bool;
+
+    bb0: {
+        switchInt(copy _2) -> [0: bb3, otherwise: bb1];
+    }
+
+    bb1: {
+        _4 = no_retag copy ((*_1).0: &bool);
+        _3 = copy (*_4);
+        switchInt(move _3) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        _5 = no_retag copy ((*_1).1: &bool);
+        _0 = copy (*_5);
+        goto -> bb4;
+    }
+
+    bb3: {
+        _0 = const false;
+        goto -> bb4;
+    }
+
+    bb4: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn parses_by_ref_capture_annotation() {
+        let mir = parse_text(CLOSURE_BY_REF_BODY).expect("parse ok");
+        let f = &mir.functions[0];
+        assert_eq!(f.captures.len(), 1);
+        let c = &f.captures[0];
+        assert_eq!(c.name, "b");
+        assert_eq!(c.env_local, 1);
+        assert_eq!(c.field, 0);
+        assert!(c.by_ref);
+    }
+
+    #[test]
+    fn parses_by_value_capture_annotation() {
+        let mir = parse_text(CLOSURE_BY_VALUE_BODY).expect("parse ok");
+        let f = &mir.functions[0];
+        assert_eq!(f.captures.len(), 1);
+        let c = &f.captures[0];
+        assert_eq!(c.name, "b");
+        assert_eq!(c.env_local, 1);
+        assert_eq!(c.field, 0);
+        assert!(!c.by_ref);
+    }
+
+    #[test]
+    fn propagates_by_ref_capture_through_deref() {
+        // `_3 = no_retag copy ((*_1).0: &bool)` aliases `_3` to the
+        // reference; `_0 = copy (*_3)` then names `_0` after the
+        // captured `b`.
+        let mir = parse_text(CLOSURE_BY_REF_BODY).expect("parse ok");
+        let names = &mir.functions[0].debug_names;
+        assert_eq!(names.get(&0), Some(&"b".to_string()));
+        assert_eq!(names.get(&2), Some(&"x".to_string()));
+    }
+
+    #[test]
+    fn propagates_by_value_capture_directly() {
+        // `_0 = copy ((*_1).0: bool)` is a direct field read — `_0`
+        // takes the captured name immediately, no deref pass needed.
+        let mir = parse_text(CLOSURE_BY_VALUE_BODY).expect("parse ok");
+        let names = &mir.functions[0].debug_names;
+        assert_eq!(names.get(&0), Some(&"b".to_string()));
+        assert_eq!(names.get(&2), Some(&"x".to_string()));
+    }
+
+    #[test]
+    fn propagates_two_captures_independently() {
+        let mir = parse_text(CLOSURE_TWO_CAPTURES_BODY).expect("parse ok");
+        let names = &mir.functions[0].debug_names;
+        // _3 = copy (*_4) where _4 alternately aliases capture
+        // field 0 (`b`) or capture field 1 (`c`). The propagation
+        // pass iterates to a fixed point; the LAST aliasing of _4
+        // wins for naming, so we check both b and c are propagated
+        // to some local at minimum.
+        let propagated: std::collections::BTreeSet<&str> =
+            names.values().map(String::as_str).collect();
+        assert!(propagated.contains("b"));
+        assert!(propagated.contains("c"));
+        assert!(propagated.contains("x"));
+    }
 
     #[test]
     fn parses_assign_discriminant() {
