@@ -20,11 +20,16 @@
 //!
 //! ## Status
 //!
-//! v0.1.0 — first usable cut. The `cargo floyd test` workflow runs
-//! end-to-end on real cargo projects, recovering boolean decisions
-//! built from `&&`, `||`, `!`, `if let` with a binding, the `?`
-//! operator (skip-through), and literal integer `match`. The
-//! recovered pattern set is pinned by the `corpus/` directory; see
+//! v0.2.1. The `cargo floyd test` workflow runs end-to-end on real
+//! cargo projects, recovering boolean decisions built from `&&`,
+//! `||`, `!`, inline comparisons (`>`, `<`, `==`, `!=`, `>=`, `<=`),
+//! `if let` with a binding, the `?` operator (skip-through),
+//! literal integer `match`, enum `match` without bindings,
+//! match-into-`&&` intermediate-propagation, and closures
+//! capturing outer booleans (by-value and by-reference). JUnit XML
+//! output is available for CI integration via
+//! `cargo floyd test --format=junit`. The recovered pattern set is
+//! pinned by the `corpus/` directory; see
 //! [`corpus/v1/`](https://github.com/Gordion-Solutions/Floyd/tree/main/corpus/v1)
 //! for the safety-critical decision patterns the engine is
 //! validated against.

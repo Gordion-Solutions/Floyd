@@ -1,6 +1,6 @@
 [package]
 name = "floyd"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
 description = "Open-source MC/DC coverage engine for Rust, focused on automotive safety-critical code (ISO 26262, ASIL-D, TCL3)."
 license = "MIT OR Apache-2.0"
