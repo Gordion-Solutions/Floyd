@@ -41,7 +41,7 @@ notes = "MVP scope: patterns that bind a value (`if let Some(x) = opt`, `if let 
 id = "handle_match"
 sig = "fn handle_match(expr: &MatchExpr) -> Node"
 handles = ["match"]
-notes = "MVP scope: literal patterns on integer scrutinees. Each arm `v: bb_a` becomes one ITE with cond `<scrutinee> == <v>`; multi-arm matches nest right-leaning. Bool `match` continues to flow through `handle_boolean`. Enum-discriminant matches (`AssignDiscriminant` + `switchInt`) are declined — engineers wanting MC/DC on enum variants should use `if let` with a binding. Full pattern-matching MC/DC is a Phase 2 deliverable — it's an acknowledged open problem in the field."
+notes = "Handles literal patterns on integer scrutinees AND enum match without bindings. Each arm `v: bb_a` becomes one ITE with cond `<scrutinee> == <v>` (integer scrutinee) or `<scrutinee> == <Type>::variant_<v>` (enum scrutinee with simple type name); multi-arm matches nest right-leaning. Bool `match` continues to flow through `handle_boolean`. Source-level variant identifiers aren't recoverable from MIR text when no downcast is emitted; engineers wanting `state is Idle` rather than `state == State::variant_0` should add a binding (`if let Variant(_) = ...`), which routes through the `if let` handler. Full pattern-matching MC/DC (destructuring, guards, async, macros) is a Phase 2 deliverable — it's an acknowledged open problem in the field."
 
 [[fn]]
 id = "handle_match_guard"

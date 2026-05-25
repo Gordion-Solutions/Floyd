@@ -1,0 +1,72 @@
+# Floyd corpus pattern.
+# Schema documented at corpus/README.md.
+
+schema_version = 1
+id = "009-enum-match-no-binding"
+name = "Enum match without binding"
+description = """
+Canonical state-machine dispatch shape — a `match` on an enum
+scrutinee with no bindings in any arm. The MIR shape is:
+
+  bb0: {
+    _2 = discriminant(_1);
+    switchInt(move _2) -> [0: bb_a, 1: bb_b, otherwise: bb_unreachable];
+  }
+
+The if-let detector declines this shape because no arm contains
+an `AssignDowncast` (the structural signal it uses to distinguish
+the matched arm from the unmatched arm). The literal-match handler
+picks it up instead, naming conditions from the scrutinee's type
+plus rustc's variant index (`mode == Mode::variant_0`).
+
+The `variant_<N>` form names the discriminant index, not the
+source variant identifier — MIR text doesn't carry variant
+identifiers when no downcast is emitted. Engineers wanting
+source-level variant names should add a binding
+(`if let Variant(_) = ...`) which routes through the `if let`
+handler instead and produces names like `mode is On`.
+
+The decision recovered here is logically equivalent to the source
+function (i.e. `is_active(Mode::On) == true`,
+`is_active(Mode::Off) == false`); the synthetic condition name
+just labels the discriminant comparison rather than the source
+variant.
+"""
+
+source = "src.rs"
+function = "is_active"
+signature = "fn is_active(mode: Mode) -> bool"
+
+[decision]
+expr = "match mode { Mode::On => true, Mode::Off => false }"
+conditions = ["mode == Mode::variant_0"]
+short_circuit = false
+
+variant = "masking"
+
+# Single condition => 2^1 = 2 truth-table rows.
+[[truth_table]]
+inputs    = { "mode == Mode::variant_0" = false }
+result    = false
+evaluated = ["mode == Mode::variant_0"]
+
+[[truth_table]]
+inputs    = { "mode == Mode::variant_0" = true }
+result    = true
+evaluated = ["mode == Mode::variant_0"]
+
+# MC/DC independence pair: the single condition is its own pair.
+[[independence_pair]]
+condition     = "mode == Mode::variant_0"
+held_constant = []
+test_1 = { "mode == Mode::variant_0" = false, result = false }
+test_2 = { "mode == Mode::variant_0" = true,  result = true }
+
+# Minimum test set: two tests, one per truth-table row.
+[[minimum_test_set]]
+inputs = { "mode == Mode::variant_0" = false }
+result = false
+
+[[minimum_test_set]]
+inputs = { "mode == Mode::variant_0" = true }
+result = true

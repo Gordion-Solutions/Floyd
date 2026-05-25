@@ -351,6 +351,22 @@ fn local_type(f: &MirFunction, local: LocalId) -> Option<&str> {
 /// `Ite{n==0, A, Ite{n==1, B, C}}`. When the `otherwise` arm is
 /// unreachable (exhaustive match), the last explicit arm becomes
 /// the unconditional else.
+///
+/// Two naming styles, selected by structure:
+///
+/// - **Literal integer match**: when `switchInt` is on the discriminant
+///   local directly (no `AssignDiscriminant` setting it), the condition
+///   names use raw literal values — `n == 0`, `n == 1`.
+/// - **Enum match without binding**: when the discriminant local was
+///   set by `_D = discriminant(_S);` in this block, the names use the
+///   scrutinee local's debug name and (if the scrutinee's type is a
+///   simple identifier) the type — `state == SystemState::variant_0`.
+///   The `variant_<N>` form names the rustc discriminant index, not
+///   the source variant identifier, because MIR text doesn't carry
+///   variant identifiers when no downcast is emitted. Engineers
+///   wanting source-level variant names should add a binding
+///   (`if let Variant(_) = ...`) which routes through the `if let`
+///   handler instead.
 fn try_match_from_block(
     block: &MirBlock,
     f: &MirFunction,
@@ -358,21 +374,35 @@ fn try_match_from_block(
     targets: &[(u128, BlockId)],
     otherwise: BlockId,
 ) -> Option<Node> {
-    let is_enum_discriminant = block.statements.iter().any(|s| {
-        matches!(
-            s,
-            MirStatement::AssignDiscriminant { dst, .. } if *dst == discr
-        )
+    // Naming style: enum or literal-integer. An `AssignDiscriminant`
+    // setting `discr` in this block means we're branching on an enum
+    // tag; otherwise this is a plain integer `match`.
+    let enum_scrutinee = block.statements.iter().find_map(|s| match s {
+        MirStatement::AssignDiscriminant { dst, src, .. } if *dst == discr => Some(*src),
+        _ => None,
     });
-    if is_enum_discriminant {
-        return None;
-    }
-
-    let scrutinee_name = f
-        .debug_names
-        .get(&discr)
-        .cloned()
-        .unwrap_or_else(|| format!("_{discr}"));
+    let style = match enum_scrutinee {
+        Some(scrutinee) => {
+            let scrutinee_name = f
+                .debug_names
+                .get(&scrutinee)
+                .cloned()
+                .unwrap_or_else(|| format!("_{scrutinee}"));
+            let ty = local_type(f, scrutinee).map(str::to_string);
+            MatchNamingStyle::Enum {
+                scrutinee_name,
+                scrutinee_type: ty,
+            }
+        }
+        None => {
+            let scrutinee_name = f
+                .debug_names
+                .get(&discr)
+                .cloned()
+                .unwrap_or_else(|| format!("_{discr}"));
+            MatchNamingStyle::IntegerLiteral { scrutinee_name }
+        }
+    };
 
     // Reachable explicit arms, in declared order.
     let arms: Vec<(u128, BlockId)> = targets
@@ -393,7 +423,7 @@ fn try_match_from_block(
         let then_branch = build_decision_from_block(last_t, f)?;
         let else_branch = build_decision_from_block(otherwise, f)?;
         handle_match(&MatchExpr {
-            cond: format!("{scrutinee_name} == {last_v}"),
+            cond: style.cond_for_value(last_v),
             then_branch,
             else_branch,
         })
@@ -406,12 +436,51 @@ fn try_match_from_block(
     for (v, t) in iter.rev() {
         let then_branch = build_decision_from_block(t, f)?;
         tail = handle_match(&MatchExpr {
-            cond: format!("{scrutinee_name} == {v}"),
+            cond: style.cond_for_value(v),
             then_branch,
             else_branch: tail,
         });
     }
     Some(tail)
+}
+
+/// How `try_match_from_block` names its synthetic conditions.
+enum MatchNamingStyle {
+    IntegerLiteral {
+        scrutinee_name: String,
+    },
+    Enum {
+        scrutinee_name: String,
+        scrutinee_type: Option<String>,
+    },
+}
+
+impl MatchNamingStyle {
+    fn cond_for_value(&self, value: u128) -> String {
+        match self {
+            MatchNamingStyle::IntegerLiteral { scrutinee_name } => {
+                format!("{scrutinee_name} == {value}")
+            }
+            MatchNamingStyle::Enum {
+                scrutinee_name,
+                scrutinee_type,
+            } => match scrutinee_type {
+                Some(t) if is_simple_type_identifier(t) => {
+                    format!("{scrutinee_name} == {t}::variant_{value}")
+                }
+                _ => format!("{scrutinee_name} == variant_{value}"),
+            },
+        }
+    }
+}
+
+/// True if `s` is a single-segment type identifier — only ASCII
+/// letters, digits, and underscores. Generic / qualified / tuple /
+/// reference types fail this check and the namer falls back to a
+/// bare `variant_<N>` to avoid producing ugly conditions like
+/// `r == Result<bool, ()>::variant_0`.
+fn is_simple_type_identifier(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Recognise a `?` operator's MIR prefix rooted at `block_id`.
@@ -1013,9 +1082,10 @@ fn decide(_1: Three) -> bool {
 
     /// `rustc --emit=mir` output for
     /// `fn decide(opt: Option<bool>) -> bool { if let Some(_) = opt { true } else { false } }`.
-    /// No binding => no downcast => the decomposer cannot tell the
-    /// matched arm from the unmatched arm by structure alone, so it
-    /// declines (returns no decision) rather than guess.
+    /// No binding => no downcast => the `if let` detector can't tell
+    /// matched from unmatched by structure. The match handler picks
+    /// it up instead and names the condition by discriminant index
+    /// rather than variant name.
     const DECIDE_IF_LET_NO_BINDING_MIR: &str = r#"
 fn decide(_1: Option<bool>) -> bool {
     debug opt => _1;
@@ -1105,13 +1175,19 @@ fn decide(_1: Option<bool>) -> bool {
     }
 
     #[test]
-    fn decompose_declines_no_binding_if_let() {
+    fn decompose_recovers_no_binding_if_let_via_match_handler() {
         // if let Some(_) = opt { true } else { false }
-        // No downcast => the decomposer can't tell matched from
-        // unmatched by structure. It declines to guess.
+        // No downcast => the if-let detector declines, but the match
+        // handler recovers it as an enum-discriminant match. Option's
+        // type prints with generics so the namer drops the type
+        // prefix, leaving the variant index (Some = 1) bare.
         let mir = mir::parse_text(DECIDE_IF_LET_NO_BINDING_MIR).expect("MIR parses");
         let tree = decompose(&mir);
-        assert!(tree.decisions.is_empty());
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(
+            tree.decisions[0],
+            ite("opt == variant_1", const_(true), const_(false))
+        );
     }
 
     /// `rustc --emit=mir` output for
@@ -1386,9 +1462,9 @@ fn decide(_1: bool) -> bool {
 
     /// `rustc --emit=mir` output for
     /// `fn decide(m: Mode) -> bool { match m { Mode::On => true, Mode::Off => false } }`.
-    /// Enum match without binding — declined for MVP. The discriminant
-    /// is produced by an `AssignDiscriminant`, which both the if-let
-    /// detector and the literal-match handler use as a "skip me" signal.
+    /// 2-variant exhaustive enum match without binding. The
+    /// decomposer synthesizes condition names from the scrutinee's
+    /// type and rustc's discriminant index — `m == Mode::variant_0`.
     const DECIDE_MATCH_ENUM_NO_BINDING_MIR: &str = r#"
 fn decide(_1: Mode) -> bool {
     debug m => _1;
@@ -1462,13 +1538,169 @@ fn decide(_1: Mode) -> bool {
     }
 
     #[test]
-    fn decompose_declines_enum_match_without_binding() {
-        // MVP scope: enum-discriminant matches (no bindings) yield no
-        // decision. Engineers wanting MC/DC on an enum variant
-        // should use `if let` with a binding.
+    fn decompose_recovers_enum_match_without_binding() {
+        // 2-variant exhaustive: `match m { Mode::On => true, Mode::Off => false }`
+        //   <=>   if (m == Mode::variant_0) then true else false
         let mir = mir::parse_text(DECIDE_MATCH_ENUM_NO_BINDING_MIR).expect("MIR parses");
         let tree = decompose(&mir);
-        assert!(tree.decisions.is_empty());
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(
+            tree.decisions[0],
+            ite("m == Mode::variant_0", const_(true), const_(false))
+        );
+    }
+
+    /// 3-variant exhaustive enum match: all arms explicit, otherwise
+    /// is unreachable.
+    const DECIDE_MATCH_ENUM_THREE_EXHAUSTIVE_MIR: &str = r#"
+fn decide(_1: SystemState) -> bool {
+    debug state => _1;
+    let mut _0: bool;
+    let mut _2: isize;
+
+    bb0: {
+        _2 = discriminant(_1);
+        switchInt(move _2) -> [0: bb4, 1: bb3, 2: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        unreachable;
+    }
+
+    bb2: {
+        _0 = const true;
+        goto -> bb5;
+    }
+
+    bb3: {
+        _0 = const false;
+        goto -> bb5;
+    }
+
+    bb4: {
+        _0 = const false;
+        goto -> bb5;
+    }
+
+    bb5: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn decompose_recovers_enum_match_three_variant_exhaustive() {
+        // match state { Operational => false, Degraded => false, Fault => true }
+        //   <=> Ite{state == SystemState::variant_0, false,
+        //          Ite{state == SystemState::variant_1, false, true}}
+        let mir = mir::parse_text(DECIDE_MATCH_ENUM_THREE_EXHAUSTIVE_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(
+            tree.decisions[0],
+            ite(
+                "state == SystemState::variant_0",
+                const_(false),
+                ite(
+                    "state == SystemState::variant_1",
+                    const_(false),
+                    const_(true),
+                ),
+            )
+        );
+    }
+
+    /// Enum match with explicit variants + wildcard: otherwise is
+    /// reachable and represents the wildcard arm.
+    const DECIDE_MATCH_ENUM_WITH_WILDCARD_MIR: &str = r#"
+fn decide(_1: SystemState) -> bool {
+    debug state => _1;
+    let mut _0: bool;
+    let mut _2: isize;
+
+    bb0: {
+        _2 = discriminant(_1);
+        switchInt(move _2) -> [2: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = const false;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const true;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn decompose_recovers_enum_match_with_wildcard() {
+        // match state { Fault => true, _ => false }
+        //   <=> Ite{state == SystemState::variant_2, true, false}
+        let mir = mir::parse_text(DECIDE_MATCH_ENUM_WITH_WILDCARD_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(
+            tree.decisions[0],
+            ite(
+                "state == SystemState::variant_2",
+                const_(true),
+                const_(false)
+            )
+        );
+    }
+
+    /// Enum match where the scrutinee's type isn't a simple identifier
+    /// — falls back to bare `variant_<N>` naming.
+    const DECIDE_MATCH_ENUM_GENERIC_TYPE_MIR: &str = r#"
+fn decide(_1: Result<bool, ()>) -> bool {
+    debug r => _1;
+    let mut _0: bool;
+    let mut _2: isize;
+
+    bb0: {
+        _2 = discriminant(_1);
+        switchInt(move _2) -> [0: bb3, 1: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        unreachable;
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb4;
+    }
+
+    bb3: {
+        _0 = const true;
+        goto -> bb4;
+    }
+
+    bb4: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn decompose_falls_back_to_bare_variant_name_for_generic_types() {
+        // Result<bool, ()> isn't a simple identifier — the namer drops
+        // the type prefix to avoid producing ugly conditions like
+        // `r == Result<bool, ()>::variant_0`.
+        let mir = mir::parse_text(DECIDE_MATCH_ENUM_GENERIC_TYPE_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(
+            tree.decisions[0],
+            ite("r == variant_0", const_(true), const_(false))
+        );
     }
 
     /// `rustc --emit=mir` output for
