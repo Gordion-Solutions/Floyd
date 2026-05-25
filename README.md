@@ -93,6 +93,84 @@ today.
 
 [cast-10]: https://www.faa.gov/aircraft/air_cert/design_approvals/air_software/cast/cast_papers (CAST-10 — Modified Condition/Decision Coverage)
 
+## Using Floyd in CI
+
+Floyd's `--format=junit` emits JUnit XML, which every CI in
+regulated industries renders natively. The snippets below are
+copy-paste starting points; adapt to your project's existing
+toolchain conventions. They are documentation, not packaged
+integrations — anyone using them is doing the integration
+themselves.
+
+### GitHub Actions
+
+```yaml
+name: MC/DC coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  floyd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - run: cargo install cargo-floyd
+      - name: Run Floyd
+        run: cargo floyd test --format=junit > floyd-mcdc.xml
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: floyd-mcdc-report
+          path: floyd-mcdc.xml
+```
+
+### GitLab CI
+
+```yaml
+floyd-mcdc:
+  image: rustlang/rust:nightly
+  before_script:
+    - rustup component add llvm-tools-preview
+    - cargo install cargo-floyd
+  script:
+    - cargo floyd test --format=junit > floyd-mcdc.xml
+  artifacts:
+    when: always
+    reports:
+      junit: floyd-mcdc.xml
+```
+
+GitLab's native `reports: junit:` field surfaces the per-condition
+results directly in the merge-request UI; unexercised conditions
+appear alongside failing tests.
+
+### Jenkins and Buildkite
+
+Both ingest JUnit XML out of the box. In a Jenkins declarative
+pipeline, run `cargo floyd test --format=junit > floyd-mcdc.xml`
+in a stage and add `junit 'floyd-mcdc.xml'` in `post { always
+{ ... } }`. In Buildkite, run the same command and use the
+`junit-annotate` plugin (or call `buildkite-agent artifact
+upload floyd-mcdc.xml`).
+
+### Failing the build on unexercised conditions
+
+Floyd's exit code today reports the engine's own success, not
+whether every condition was exercised. To fail a CI run on
+incomplete MC/DC coverage, post-process the JUnit XML — any
+`<failure>` element with `type="UnexercisedCondition"` indicates
+a missing pair. The CI-native test-result steps (`reports: junit:`
+on GitLab, `junit '...'` on Jenkins, JUnit-aware actions on GitHub)
+all surface these as failing tests in their respective UIs.
+
 ## Why MC/DC, why this engine
 
 DO-178C, ISO 26262, and IEC 61508 require MC/DC analysis at the
