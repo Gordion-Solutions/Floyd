@@ -61,6 +61,7 @@ the ground-truth analyses Floyd's output is checked against (see
 | Shape | Example |
 |-------|---------|
 | Boolean expressions over named bool values | `a && b`, `a \|\| b`, `!a`, arbitrary nesting |
+| **Inline comparisons in a decision** | `if speed > 50 && brake { ... }`, `code == 1`, `value >= 0 && value <= 100` (Eq, Ne, Lt, Le, Gt, Ge) |
 | `if let` with a binding | `if let Some(x) = opt { x && b } else { false }` |
 | `?` operator (skip-through to the success path) | `let x = opt?; x && b` |
 | Literal `match` on integer scrutinees | `match n { 0 => ..., 1 => ..., _ => ... }` |
@@ -78,17 +79,17 @@ closes the biggest gaps. The current declines:
 
 | Shape | Workaround / status |
 |-------|---------------------|
-| **Inline comparisons in a decision**, e.g. `if speed > 50 && brake { ... }` | Bind the comparison first: `let fast = speed > 50; if fast && brake { ... }`. Then the decision recovers normally. Native inline-comparison recovery is queued for v0.2.0. |
 | **Multiple decisions in one function** | The engine reports the decision rooted at the function's entry block only. Subsequent decisions are silently dropped. Multi-decision support is queued for v0.2.0. |
 | **Enum `match` without a binding**, e.g. `match state { Idle => ..., Running => ... }` | Workaround for binding enums: use `if let Variant(x) = ...`. Variant-only enums currently have no workaround; native recovery is queued for v0.2.0. |
 | Match guards (`match n { 0 if c => ... }`) | Not in MVP scope. |
 | Pattern destructuring beyond a single bound value (`if let Some((a, b)) = ...`) | Not in MVP scope. |
 | `async` desugaring, macro-expansion provenance | Not in MVP scope. |
 
-If your real code mostly looks like the first two rows of *what
-doesn't*, the honest read is that Floyd is at "credible evaluation
-prototype" rather than "drop-in tool." The v0.2.0 line is the
-milestone where that changes.
+If your real code mostly looks like the first or third row of *what
+doesn't* (multi-decision functions or enum match without bindings),
+the honest read is that Floyd is at "credible evaluation prototype"
+rather than "drop-in tool" for that codebase. The v0.2.0 line is the
+milestone where that gap closes.
 
 [cast-10]: https://www.faa.gov/aircraft/air_cert/design_approvals/air_software/cast/cast_papers (CAST-10 — Modified Condition/Decision Coverage)
 

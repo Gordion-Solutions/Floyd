@@ -28,3 +28,4 @@ in the field — Phase 0 only commits to the simple cases.
 | [005-if-let-some](patterns/005-if-let-some/)     | `if let Some(x) = opt { x } else { false }` | `if let` with a binding; pattern-match becomes a synthetic condition |
 | [006-try-with-and](patterns/006-try-with-and/)   | `let x = opt?; Some(x && b)` | `?` operator skip-through: engine looks past `Try::branch` plumbing and recovers the inner `&&` |
 | [007-match-int-literal](patterns/007-match-int-literal/) | `match n { 0 => false, _ => true }` | Literal `match` on an integer; engine emits a single condition `n == 0` |
+| [008-inline-comparison](patterns/008-inline-comparison/) | `speed > 50 && brake` | Inline-comparison + `&&`; engine recognises the comparison and synthesizes the condition name `speed > 50` |

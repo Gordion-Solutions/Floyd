@@ -27,7 +27,9 @@
 //! handlers (`if let`, `match`, match guards, `?`) are stubs that
 //! graduate alongside their corpus patterns.
 
-use crate::mir::{BlockId, LocalId, MirBlock, MirFunction, MirStatement, MirTerminator};
+use crate::mir::{
+    BlockId, CompareOp, LocalId, MirBlock, MirFunction, MirStatement, MirTerminator, Operand,
+};
 use crate::Mir;
 
 /// A set of per-decision condition trees recovered from a single
@@ -289,7 +291,15 @@ fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node>
             // intent).
             let is_bool_discr = local_type(f, *discr) == Some("bool");
             if is_bool_discr && targets.len() == 1 && targets[0].0 == 0 {
-                let cond = f.debug_names.get(discr)?.clone();
+                // Cond name: prefer the discriminant's debug name. If
+                // none (the discriminant is a synthetic temporary —
+                // typical when the source is an inline comparison like
+                // `if speed > 50 { ... }`), synthesize one from a
+                // preceding `AssignBinaryCompare` setting that local.
+                let cond = match f.debug_names.get(discr) {
+                    Some(name) => name.clone(),
+                    None => synthesize_compare_name(block, *discr, f)?,
+                };
                 // `0` arm is the `else` branch (condition was false);
                 // `otherwise` is the `then` branch (condition was true).
                 let else_branch = build_decision_from_block(targets[0].1, f)?;
@@ -573,26 +583,90 @@ fn downcast_variant_for(b: &MirBlock, scrutinee: LocalId) -> Option<String> {
 /// the return value, in source order. The first match wins (Phase 0
 /// blocks have at most one such statement).
 fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
+    // An assignment is a terminal value only if its destination
+    // doesn't feed the block's terminator. Specifically, when the
+    // terminator is `switchInt(_N)`, any assignment to `_N` in this
+    // block is setup for that branch and must not preempt the
+    // terminator-side decoder — for example,
+    //   `_3 = Gt(copy _1, const 50_i32);`
+    //   `switchInt(move _3) -> [...]`
+    // sets up a bool temporary that the terminator branches on,
+    // and only the terminator side knows the right name to give the
+    // condition. Assignments to other locals (e.g. `_0 = copy _3`,
+    // `_6 = const false` inside a `?`-skip-through arm) are still
+    // recognised as terminal values.
+    let switchint_discr = match &block.terminator {
+        MirTerminator::SwitchInt { discr, .. } => Some(*discr),
+        _ => None,
+    };
+    let feeds_switchint = |dst: LocalId| switchint_discr == Some(dst);
+
     for stmt in &block.statements {
         match stmt {
-            MirStatement::AssignConstBool { value, .. } => {
+            MirStatement::AssignConstBool { dst, value, .. } if !feeds_switchint(*dst) => {
                 return Some(Node::Const { value: *value });
             }
-            MirStatement::AssignCopy { src, .. } => {
+            MirStatement::AssignCopy { dst, src, .. } if !feeds_switchint(*dst) => {
                 if let Some(name) = f.debug_names.get(src) {
                     return Some(Node::Condition { name: name.clone() });
                 }
             }
-            // Skipped: informational for the `if let` detector
-            // (`AssignDiscriminant` opens an if-let block;
-            // `AssignDowncast` precedes the use of a bound value) but
-            // they never *are* the block's return value.
-            MirStatement::AssignDiscriminant { .. }
-            | MirStatement::AssignDowncast { .. }
-            | MirStatement::Other { .. } => {}
+            MirStatement::AssignBinaryCompare {
+                dst, op, lhs, rhs, ..
+            } if !feeds_switchint(*dst) => {
+                return Some(Node::Condition {
+                    name: compare_condition_name(*op, lhs, rhs, f),
+                });
+            }
+            // Everything else (temporaries that feed a switchInt,
+            // downcasts, discriminants, unrecognised shapes) is
+            // informational for downstream decoders.
+            _ => {}
         }
     }
     None
+}
+
+/// Look for an `AssignBinaryCompare` in `block` that writes to
+/// `discr`, and synthesize a condition name from it. Returns `None`
+/// if no matching compare is found.
+///
+/// Used when a `switchInt` discriminates on a bool temporary with
+/// no debug name — the canonical shape rustc emits for inline
+/// comparisons like `if speed > 50 && brake`.
+fn synthesize_compare_name(block: &MirBlock, discr: LocalId, f: &MirFunction) -> Option<String> {
+    block.statements.iter().find_map(|s| match s {
+        MirStatement::AssignBinaryCompare {
+            dst, op, lhs, rhs, ..
+        } if *dst == discr => Some(compare_condition_name(*op, lhs, rhs, f)),
+        _ => None,
+    })
+}
+
+/// Synthesize a human-readable condition name for an inline
+/// comparison like `speed > 50` or `a < b`.
+///
+/// Locals render via their debug name (`speed`, `a`); unnamed
+/// locals fall back to `_<N>`. Constants render via their type-
+/// stripped form (so `50_i32` reads as `50`).
+fn compare_condition_name(op: CompareOp, lhs: &Operand, rhs: &Operand, f: &MirFunction) -> String {
+    format!(
+        "{} {} {}",
+        operand_display(lhs, f),
+        op.as_source_str(),
+        operand_display(rhs, f)
+    )
+}
+
+fn operand_display(op: &Operand, f: &MirFunction) -> String {
+    match op {
+        Operand::Copy(id) | Operand::Move(id) => f
+            .debug_names
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| format!("_{id}")),
+        Operand::Const(_) => op.const_display_value().to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1112,187 @@ fn decide(_1: Option<bool>) -> bool {
         let mir = mir::parse_text(DECIDE_IF_LET_NO_BINDING_MIR).expect("MIR parses");
         let tree = decompose(&mir);
         assert!(tree.decisions.is_empty());
+    }
+
+    /// `rustc --emit=mir` output for
+    /// `fn decide(speed: i32, brake: bool) -> bool { speed > 50 && brake }`.
+    /// The dominant inline-comparison + `&&` shape. `_3` is the
+    /// synthetic bool temporary holding the comparison result; it
+    /// has no debug name, so the decomposer must synthesize
+    /// `speed > 50` from the `Gt` statement preceding the
+    /// `switchInt`.
+    const DECIDE_INLINE_CMP_AND_MIR: &str = r#"
+fn decide(_1: i32, _2: bool) -> bool {
+    debug speed => _1;
+    debug brake => _2;
+    let mut _0: bool;
+    let mut _3: bool;
+
+    bb0: {
+        _3 = Gt(copy _1, const 50_i32);
+        switchInt(move _3) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = copy _2;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    /// `fn decide(code: u8) -> bool { code == 1 }` — the comparison
+    /// IS the function's return value. No switchInt at all.
+    const DECIDE_DIRECT_EQ_MIR: &str = r#"
+fn decide(_1: u8) -> bool {
+    debug code => _1;
+    let mut _0: bool;
+
+    bb0: {
+        _0 = Eq(copy _1, const 1_u8);
+        return;
+    }
+}
+"#;
+
+    /// `fn decide(state: u32, ovr: bool) -> bool { state != 0 || ovr }`
+    /// — Ne paired with `||`, exercising the OR arm shape.
+    const DECIDE_NE_OR_MIR: &str = r#"
+fn decide(_1: u32, _2: bool) -> bool {
+    debug state => _1;
+    debug ovr => _2;
+    let mut _0: bool;
+    let mut _3: bool;
+
+    bb0: {
+        _3 = Ne(copy _1, const 0_u32);
+        switchInt(move _3) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = const true;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = copy _2;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    /// `fn decide(value: i32) -> bool { value >= 0 && value <= 100 }`
+    /// — two comparisons composed with `&&`. The outer switchInt
+    /// branches on the Ge result; the matched arm has its own
+    /// inline-compare leaf (`value <= 100`).
+    const DECIDE_RANGE_MIR: &str = r#"
+fn decide(_1: i32) -> bool {
+    debug value => _1;
+    let mut _0: bool;
+    let mut _2: bool;
+
+    bb0: {
+        _2 = Ge(copy _1, const 0_i32);
+        switchInt(move _2) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = Le(copy _1, const 100_i32);
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    /// `fn decide(a: i32, b: i32) -> bool { a < b }` — comparison
+    /// between two named locals (no const operand).
+    const DECIDE_VAR_VAR_MIR: &str = r#"
+fn decide(_1: i32, _2: i32) -> bool {
+    debug a => _1;
+    debug b => _2;
+    let mut _0: bool;
+
+    bb0: {
+        _0 = Lt(copy _1, copy _2);
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn decompose_recovers_inline_comparison_with_and() {
+        // speed > 50 && brake
+        //   <=>   if (speed > 50) then brake else false
+        let mir = mir::parse_text(DECIDE_INLINE_CMP_AND_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(
+            tree.decisions[0],
+            ite("speed > 50", cond("brake"), const_(false))
+        );
+    }
+
+    #[test]
+    fn decompose_recovers_direct_comparison_as_condition() {
+        // code == 1 — the comparison is itself the function's value.
+        let mir = mir::parse_text(DECIDE_DIRECT_EQ_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(tree.decisions[0], cond("code == 1"));
+    }
+
+    #[test]
+    fn decompose_recovers_ne_paired_with_or() {
+        // state != 0 || ovr
+        //   <=>   if (state != 0) then true else ovr
+        let mir = mir::parse_text(DECIDE_NE_OR_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(
+            tree.decisions[0],
+            ite("state != 0", const_(true), cond("ovr"))
+        );
+    }
+
+    #[test]
+    fn decompose_recovers_two_comparisons_in_one_decision() {
+        // value >= 0 && value <= 100
+        let mir = mir::parse_text(DECIDE_RANGE_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(
+            tree.decisions[0],
+            ite("value >= 0", cond("value <= 100"), const_(false))
+        );
+    }
+
+    #[test]
+    fn decompose_recovers_variable_to_variable_comparison() {
+        // a < b — both operands are named locals.
+        let mir = mir::parse_text(DECIDE_VAR_VAR_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(tree.decisions[0], cond("a < b"));
     }
 
     /// `rustc --emit=mir` output for

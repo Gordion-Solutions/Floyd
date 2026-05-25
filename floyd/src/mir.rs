@@ -167,6 +167,27 @@ pub enum MirStatement {
         /// Source span, if present in the MIR.
         span: Option<SourceSpan>,
     },
+    /// `_<dst> = <CompareOp>(<lhs>, <rhs>);`
+    ///
+    /// A binary comparison assigned to a bool local. Emitted by
+    /// rustc for inline comparisons like `speed > 50`, `code == 1`,
+    /// `state != 0`. The decomposer uses this both as a terminal
+    /// leaf (when `dst` is the function's return value) and to
+    /// synthesize a human-readable condition name (e.g.
+    /// `speed > 50`) when a later `switchInt` branches on the
+    /// resulting bool temporary.
+    AssignBinaryCompare {
+        /// Destination local (always bool-typed).
+        dst: LocalId,
+        /// Comparison operator.
+        op: CompareOp,
+        /// Left-hand operand.
+        lhs: Operand,
+        /// Right-hand operand.
+        rhs: Operand,
+        /// Source span, if present in the MIR.
+        span: Option<SourceSpan>,
+    },
     /// A statement shape Phase 0 doesn't yet parse. Preserved verbatim.
     Other {
         /// Original text of the statement.
@@ -174,6 +195,86 @@ pub enum MirStatement {
         /// Source span, if present in the MIR.
         span: Option<SourceSpan>,
     },
+}
+
+/// Comparison operator recognised by the MIR parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    /// `==`
+    Eq,
+    /// `!=`
+    Ne,
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+}
+
+impl CompareOp {
+    /// The source-level spelling, used when synthesizing condition
+    /// names for inline comparisons.
+    pub fn as_source_str(self) -> &'static str {
+        match self {
+            CompareOp::Eq => "==",
+            CompareOp::Ne => "!=",
+            CompareOp::Lt => "<",
+            CompareOp::Le => "<=",
+            CompareOp::Gt => ">",
+            CompareOp::Ge => ">=",
+        }
+    }
+}
+
+/// An operand of a MIR rvalue. Comparison operands take this shape:
+/// either a copy/move of a local, or a constant literal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Operand {
+    /// `copy _<N>` — read a local without moving it.
+    Copy(LocalId),
+    /// `move _<N>` — read a local and consume it.
+    Move(LocalId),
+    /// `const <literal>` — a constant value, preserved as its MIR
+    /// textual form (e.g. `50_i32`, `0_u32`).
+    Const(String),
+}
+
+impl Operand {
+    /// For a `Const(...)` operand, return the literal value without
+    /// its trailing `_<type>` suffix (so `50_i32` renders as `50`).
+    /// Returns the operand text unchanged when no recognisable type
+    /// suffix is present. For non-const operands the caller is
+    /// expected to use [`Self::local_id`] to recover the underlying
+    /// local; this method returns an empty string in that case as a
+    /// safe fallback rather than panicking.
+    pub fn const_display_value(&self) -> &str {
+        match self {
+            Operand::Const(s) => match s.rfind('_') {
+                Some(i)
+                    if s[i + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic()) =>
+                {
+                    &s[..i]
+                }
+                _ => s.as_str(),
+            },
+            _ => "",
+        }
+    }
+
+    /// For a `Copy` or `Move` operand, return the [`LocalId`] of the
+    /// referenced local. Returns `None` for `Const`.
+    pub fn local_id(&self) -> Option<LocalId> {
+        match self {
+            Operand::Copy(id) | Operand::Move(id) => Some(*id),
+            Operand::Const(_) => None,
+        }
+    }
 }
 
 /// A block terminator.
@@ -672,7 +773,67 @@ fn parse_statement(line: &str, span: Option<SourceSpan>) -> Option<MirStatement>
             span,
         });
     }
+    if let Some(cmp) = parse_compare_rhs(rhs) {
+        return Some(MirStatement::AssignBinaryCompare {
+            dst,
+            op: cmp.op,
+            lhs: cmp.lhs,
+            rhs: cmp.rhs,
+            span,
+        });
+    }
     None
+}
+
+struct CompareRhs {
+    op: CompareOp,
+    lhs: Operand,
+    rhs: Operand,
+}
+
+/// Parse a comparison RHS of the form `<Op>(<operand>, <operand>)`
+/// where `<Op>` is one of `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`. Returns
+/// `None` if the shape doesn't match.
+fn parse_compare_rhs(rhs: &str) -> Option<CompareRhs> {
+    // Recognise the leading operator token. The order matters because
+    // `Le` is a prefix of `Lt` only when considered character-by-
+    // character — we match exact `Op(` to avoid ambiguity.
+    let (op, after_op) = if let Some(rest) = rhs.strip_prefix("Eq(") {
+        (CompareOp::Eq, rest)
+    } else if let Some(rest) = rhs.strip_prefix("Ne(") {
+        (CompareOp::Ne, rest)
+    } else if let Some(rest) = rhs.strip_prefix("Le(") {
+        (CompareOp::Le, rest)
+    } else if let Some(rest) = rhs.strip_prefix("Lt(") {
+        (CompareOp::Lt, rest)
+    } else if let Some(rest) = rhs.strip_prefix("Ge(") {
+        (CompareOp::Ge, rest)
+    } else if let Some(rest) = rhs.strip_prefix("Gt(") {
+        (CompareOp::Gt, rest)
+    } else {
+        return None;
+    };
+    let inner = after_op.strip_suffix(')')?;
+    let parts = split_top_level(inner, ',');
+    if parts.len() != 2 {
+        return None;
+    }
+    let lhs = parse_operand(parts[0].trim())?;
+    let rhs = parse_operand(parts[1].trim())?;
+    Some(CompareRhs { op, lhs, rhs })
+}
+
+/// Parse a single operand: `copy _<N>`, `move _<N>`, or
+/// `const <literal>`.
+fn parse_operand(s: &str) -> Option<Operand> {
+    if let Some(rest) = s.strip_prefix("copy _") {
+        rest.parse::<u32>().ok().map(Operand::Copy)
+    } else if let Some(rest) = s.strip_prefix("move _") {
+        rest.parse::<u32>().ok().map(Operand::Move)
+    } else {
+        s.strip_prefix("const ")
+            .map(|rest| Operand::Const(rest.to_string()))
+    }
 }
 
 struct CallTerminator {
@@ -1220,6 +1381,147 @@ fn decide(_1: Option<bool>) -> Option<bool> {
     }
 }
 "#;
+
+    // -----------------------------------------------------------------
+    // Comparison-operator shapes
+    // -----------------------------------------------------------------
+
+    const COMPARE_GT_AND_MIR: &str = r#"
+fn decide(_1: i32, _2: bool) -> bool {
+    debug speed => _1;
+    debug brake => _2;
+    let mut _0: bool;
+    let mut _3: bool;
+
+    bb0: {
+        _3 = Gt(copy _1, const 50_i32);
+        switchInt(move _3) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = copy _2;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn parses_assign_binary_compare_gt() {
+        let mir = parse_text(COMPARE_GT_AND_MIR).expect("parse ok");
+        let bb0 = mir.functions[0]
+            .blocks
+            .iter()
+            .find(|b| b.id == 0)
+            .expect("bb0");
+        match &bb0.statements[0] {
+            MirStatement::AssignBinaryCompare {
+                dst, op, lhs, rhs, ..
+            } => {
+                assert_eq!(*dst, 3);
+                assert_eq!(*op, CompareOp::Gt);
+                assert_eq!(lhs, &Operand::Copy(1));
+                assert_eq!(rhs, &Operand::Const("50_i32".to_string()));
+            }
+            other => panic!("expected AssignBinaryCompare, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compare_op_as_source_str_covers_all_six() {
+        assert_eq!(CompareOp::Eq.as_source_str(), "==");
+        assert_eq!(CompareOp::Ne.as_source_str(), "!=");
+        assert_eq!(CompareOp::Lt.as_source_str(), "<");
+        assert_eq!(CompareOp::Le.as_source_str(), "<=");
+        assert_eq!(CompareOp::Gt.as_source_str(), ">");
+        assert_eq!(CompareOp::Ge.as_source_str(), ">=");
+    }
+
+    #[test]
+    fn parses_compare_with_two_var_operands() {
+        let src = r#"
+fn decide(_1: i32, _2: i32) -> bool {
+    debug a => _1;
+    debug b => _2;
+    let mut _0: bool;
+
+    bb0: {
+        _0 = Lt(copy _1, copy _2);
+        return;
+    }
+}
+"#;
+        let mir = parse_text(src).expect("parse ok");
+        let bb0 = &mir.functions[0].blocks[0];
+        match &bb0.statements[0] {
+            MirStatement::AssignBinaryCompare {
+                dst, op, lhs, rhs, ..
+            } => {
+                assert_eq!(*dst, 0);
+                assert_eq!(*op, CompareOp::Lt);
+                assert_eq!(lhs, &Operand::Copy(1));
+                assert_eq!(rhs, &Operand::Copy(2));
+            }
+            other => panic!("expected AssignBinaryCompare, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_all_six_compare_ops() {
+        // Each op as a one-statement bb to confirm prefix matching.
+        for (op_str, expected_op) in [
+            ("Eq", CompareOp::Eq),
+            ("Ne", CompareOp::Ne),
+            ("Lt", CompareOp::Lt),
+            ("Le", CompareOp::Le),
+            ("Gt", CompareOp::Gt),
+            ("Ge", CompareOp::Ge),
+        ] {
+            let src = format!(
+                "fn f(_1: i32) -> bool {{
+    let mut _0: bool;
+    bb0: {{
+        _0 = {op_str}(copy _1, const 0_i32);
+        return;
+    }}
+}}\n"
+            );
+            let mir = parse_text(&src).expect("parse ok");
+            match &mir.functions[0].blocks[0].statements[0] {
+                MirStatement::AssignBinaryCompare { op, .. } => assert_eq!(*op, expected_op),
+                other => panic!("op {op_str}: expected AssignBinaryCompare, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn operand_const_display_strips_type_suffix() {
+        assert_eq!(
+            Operand::Const("50_i32".to_string()).const_display_value(),
+            "50"
+        );
+        assert_eq!(
+            Operand::Const("0_u32".to_string()).const_display_value(),
+            "0"
+        );
+        assert_eq!(
+            Operand::Const("1_u8".to_string()).const_display_value(),
+            "1"
+        );
+        // No type suffix (e.g. a bare literal) — return as-is.
+        assert_eq!(
+            Operand::Const("true".to_string()).const_display_value(),
+            "true"
+        );
+    }
 
     #[test]
     fn debug_name_first_wins_when_local_aliased() {
