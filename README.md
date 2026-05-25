@@ -80,15 +80,15 @@ closes the biggest gaps. The current declines:
 
 | Shape | Workaround / status |
 |-------|---------------------|
-| **Multiple decisions in one function** | The engine reports the decision rooted at the function's entry block only. Subsequent decisions are silently dropped. Multi-decision support is queued for v0.2.0. |
+| **Functions composing multiple decisions into a non-bool output** | A bool-returning function with several decisions (`if ... { ... } let r = ...`, `match ... && b`, dispatch with arm-internal decisions, early return + post-return) recovers correctly. A function that *composes* multiple decisions into a tuple, array, or other non-bool output — e.g. `fn dual(a, b, c) -> (bool, bool) { (a && b, a || c) }` — recovers only the first decision; the others are silently dropped. |
 | Match guards (`match n { 0 if c => ... }`) | Not in MVP scope. |
 | Pattern destructuring beyond a single bound value (`if let Some((a, b)) = ...`) | Not in MVP scope. |
 | `async` desugaring, macro-expansion provenance | Not in MVP scope. |
 
-If your real code mostly looks like the first row of *what doesn't*
-(multi-decision functions), the honest read is that Floyd is at
-"credible evaluation prototype" rather than "drop-in tool" for that
-codebase. The remaining v0.2.0 line items close that gap.
+Most bool-returning safety-critical Rust functions recover
+correctly. If your code returns boolean tuples or arrays composed
+of multiple separate decisions, only the first one comes through
+today.
 
 [cast-10]: https://www.faa.gov/aircraft/air_cert/design_approvals/air_software/cast/cast_papers (CAST-10 — Modified Condition/Decision Coverage)
 

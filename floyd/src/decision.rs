@@ -270,6 +270,17 @@ fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node>
         return Some(value);
     }
 
+    // Intermediate-propagation: when this block writes a constant to
+    // a local and then `goto`s a successor that `switchInt`s on that
+    // local, the constant determines which arm we'd take. Fold the
+    // assignment into the chosen arm's decomposition. Closes the
+    // `match n { ... } && b` shape, where the match writes an
+    // intermediate `_3 = const true/false` per arm and the `&&`
+    // downstream branches on it.
+    if let Some(node) = try_fold_into_successor_switchint(block, f) {
+        return Some(node);
+    }
+
     // `if let` shape: a `discriminant(...)` assignment followed by a
     // multi-arm switchInt with one matched arm (identified by a
     // downcast statement) and one unmatched arm.
@@ -653,22 +664,37 @@ fn downcast_variant_for(b: &MirBlock, scrutinee: LocalId) -> Option<String> {
 /// blocks have at most one such statement).
 fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
     // An assignment is a terminal value only if its destination
-    // doesn't feed the block's terminator. Specifically, when the
-    // terminator is `switchInt(_N)`, any assignment to `_N` in this
-    // block is setup for that branch and must not preempt the
-    // terminator-side decoder — for example,
-    //   `_3 = Gt(copy _1, const 50_i32);`
-    //   `switchInt(move _3) -> [...]`
-    // sets up a bool temporary that the terminator branches on,
-    // and only the terminator side knows the right name to give the
-    // condition. Assignments to other locals (e.g. `_0 = copy _3`,
-    // `_6 = const false` inside a `?`-skip-through arm) are still
-    // recognised as terminal values.
-    let switchint_discr = match &block.terminator {
+    // doesn't feed a `switchInt` — either this block's own terminator
+    // or the immediately-following block's terminator reached via a
+    // `goto`. The downstream case closes the `match n { ... } && b`
+    // shape, where a per-arm block sets an intermediate `_3 = const
+    // true/false` and `goto`s a successor that `switchInt(_3)` for
+    // the `&&`. Without the downstream check, the per-arm assignment
+    // would short-circuit as a terminal value, hiding the `&&` from
+    // the decomposer.
+    let in_block_switchint = match &block.terminator {
         MirTerminator::SwitchInt { discr, .. } => Some(*discr),
         _ => None,
     };
-    let feeds_switchint = |dst: LocalId| switchint_discr == Some(dst);
+    let downstream_switchint = match &block.terminator {
+        MirTerminator::Goto { target, .. } => {
+            f.blocks
+                .iter()
+                .find(|b| b.id == *target)
+                .and_then(|succ| match &succ.terminator {
+                    // Resolve through any `_X = copy _Y` aliases in the
+                    // succ block — the effective discriminant is the
+                    // local our caller wrote to, not the fresh temporary.
+                    MirTerminator::SwitchInt { discr, .. } => {
+                        Some(resolve_switchint_discr_alias(*discr, succ))
+                    }
+                    _ => None,
+                })
+        }
+        _ => None,
+    };
+    let feeds_switchint =
+        |dst: LocalId| in_block_switchint == Some(dst) || downstream_switchint == Some(dst);
 
     for stmt in &block.statements {
         match stmt {
@@ -694,6 +720,82 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
         }
     }
     None
+}
+
+/// Fold a `<intermediate> = ...; goto <succ>` block into the arm of
+/// the successor's `switchInt(<intermediate>)` that the constant
+/// assignment selects.
+///
+/// Closes the `match n { 0 => true, _ => false } && b` shape — and
+/// any analogous "compute an intermediate bool, then branch on it"
+/// pattern — by letting decomposition continue past the intermediate
+/// rather than terminating at it. Returns `None` for any block whose
+/// terminator isn't `goto`, whose successor doesn't `switchInt` on
+/// the local the block writes, or whose write isn't a constant.
+///
+/// Non-constant writes (e.g. `_3 = copy _N`) would need value
+/// substitution beyond what this MVP attempts; they fall through to
+/// the next decoder.
+fn try_fold_into_successor_switchint(block: &MirBlock, f: &MirFunction) -> Option<Node> {
+    let MirTerminator::Goto { target, .. } = &block.terminator else {
+        return None;
+    };
+    let succ = f.blocks.iter().find(|b| b.id == *target)?;
+    let (succ_discr, succ_targets, succ_otherwise) = match &succ.terminator {
+        MirTerminator::SwitchInt {
+            discr,
+            targets,
+            otherwise,
+            ..
+        } => (*discr, targets, *otherwise),
+        _ => return None,
+    };
+    // Resolve through any `_X = copy _Y` aliases in the succ block.
+    // For `match n { ... } && b` the succ block typically looks like
+    //   `_4 = copy _3; switchInt(move _4) -> [...]`
+    // and the effective discriminant is `_3` (the intermediate the
+    // caller's `_3 = const ...` writes to), not the freshly-copied
+    // `_4`.
+    let effective_discr = resolve_switchint_discr_alias(succ_discr, succ);
+    for stmt in &block.statements {
+        if let MirStatement::AssignConstBool { dst, value, .. } = stmt {
+            if *dst != effective_discr {
+                continue;
+            }
+            let arm_value: u128 = if *value { 1 } else { 0 };
+            let arm_target = succ_targets
+                .iter()
+                .find(|(v, _)| *v == arm_value)
+                .map(|(_, t)| *t)
+                .unwrap_or(succ_otherwise);
+            return build_decision_from_block(arm_target, f);
+        }
+    }
+    None
+}
+
+/// Follow `_X = copy _Y` aliases backwards from `local` within
+/// `block`. Used by [`try_fold_into_successor_switchint`] when the
+/// successor block copies a local into a fresh temporary before
+/// `switchInt`-ing on it.
+///
+/// Iterates with a step cap to defend against pathological cycles
+/// the MIR grammar shouldn't admit but that a malformed input
+/// might.
+fn resolve_switchint_discr_alias(local: LocalId, block: &MirBlock) -> LocalId {
+    let mut current = local;
+    let max_iter = block.statements.len() + 1;
+    for _ in 0..max_iter {
+        let next = block.statements.iter().rev().find_map(|s| match s {
+            MirStatement::AssignCopy { dst, src, .. } if *dst == current => Some(*src),
+            _ => None,
+        });
+        match next {
+            Some(src) if src != current => current = src,
+            _ => return current,
+        }
+    }
+    current
 }
 
 /// Look for an `AssignBinaryCompare` in `block` that writes to
@@ -1369,6 +1471,79 @@ fn decide(_1: i32, _2: i32) -> bool {
         let tree = decompose(&mir);
         assert_eq!(tree.decisions.len(), 1);
         assert_eq!(tree.decisions[0], cond("a < b"));
+    }
+
+    /// `rustc --emit=mir` output for
+    /// `fn classify(n: i32, b: bool) -> bool {
+    ///     let lit = match n { 0 => true, _ => false };
+    ///     lit && b
+    /// }`.
+    /// Two decisions in source — the match produces an intermediate
+    /// `lit`, then `lit && b` branches on it. The intermediate is
+    /// realised in MIR as `_3 = const true/false; goto bb3; ...; _4 =
+    /// copy _3; switchInt(move _4)`. Before the fold helper landed,
+    /// the engine stopped at the per-arm `_3 = const ...` and missed
+    /// the `&& b` downstream.
+    const DECIDE_MULTI_DECISION_MATCH_AND_MIR: &str = r#"
+fn classify(_1: i32, _2: bool) -> bool {
+    debug n => _1;
+    debug b => _2;
+    let mut _0: bool;
+    let _3: bool;
+    let mut _4: bool;
+    scope 1 {
+        debug lit => _3;
+    }
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _3 = const false;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _3 = const true;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _4 = copy _3;
+        switchInt(move _4) -> [0: bb5, otherwise: bb4];
+    }
+
+    bb4: {
+        _0 = copy _2;
+        goto -> bb6;
+    }
+
+    bb5: {
+        _0 = const false;
+        goto -> bb6;
+    }
+
+    bb6: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn decompose_folds_match_intermediate_into_downstream_and() {
+        // (n == 0) && b
+        //   <=>   if (n == 0) then b else false
+        // The match produces an intermediate `lit`; the `&&` then
+        // branches on `lit`. The fold helper propagates the const
+        // arms (`_3 = const true` and `_3 = const false`) into the
+        // downstream `switchInt(_4)` (aliased from `_3` via the
+        // `_4 = copy _3` in bb3), letting the engine recover the
+        // full decision.
+        let mir = mir::parse_text(DECIDE_MULTI_DECISION_MATCH_AND_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(tree.decisions[0], ite("n == 0", cond("b"), const_(false)));
     }
 
     /// `rustc --emit=mir` output for

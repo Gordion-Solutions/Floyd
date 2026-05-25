@@ -1,0 +1,83 @@
+# Floyd corpus pattern.
+# Schema documented at corpus/README.md.
+
+schema_version = 1
+id = "010-match-with-downstream-and"
+name = "Match producing intermediate consumed by AND"
+description = """
+A `match` writes a boolean intermediate (`lit`), then a downstream
+`&&` branches on that intermediate. In MIR each match arm is a
+separate block that writes `_3 = const true/false; goto succ`,
+and the succ block does `_4 = copy _3; switchInt(move _4)` for
+the `&&`.
+
+Before the intermediate-propagation fold landed, the engine
+treated the per-arm `_3 = const true/false` as a terminal value
+(because the per-arm block's own terminator wasn't a `switchInt`
+on `_3`) and returned `Ite{n == 0, true, false}` — the value of
+`lit` — losing the `&& b` downstream. With the fold, the engine
+recognises that the per-arm assignment flows into the succ
+block's `switchInt` (via the `_4 = copy _3` alias) and folds
+through, recovering the full `(n == 0) && b` decision.
+
+The decision is structurally identical to a two-condition AND
+(pattern 001-simple-and) with the first condition's name being
+the synthesized literal-match name `n == 0`.
+"""
+
+source = "src.rs"
+function = "classify"
+signature = "fn classify(n: i32, b: bool) -> bool"
+
+[decision]
+expr = "(n == 0) && b"
+conditions = ["n == 0", "b"]
+short_circuit = true
+
+variant = "masking"
+
+# Truth table — 4 rows. `b` is masked when `n == 0` is false
+# (because the `&&` short-circuits).
+[[truth_table]]
+inputs    = { "n == 0" = false, b = false }
+result    = false
+evaluated = ["n == 0"]
+
+[[truth_table]]
+inputs    = { "n == 0" = false, b = true }
+result    = false
+evaluated = ["n == 0"]
+
+[[truth_table]]
+inputs    = { "n == 0" = true, b = false }
+result    = false
+evaluated = ["n == 0", "b"]
+
+[[truth_table]]
+inputs    = { "n == 0" = true, b = true }
+result    = true
+evaluated = ["n == 0", "b"]
+
+[[independence_pair]]
+condition     = "n == 0"
+held_constant = ["b"]
+test_1 = { "n == 0" = false, b = true, result = false }
+test_2 = { "n == 0" = true,  b = true, result = true }
+
+[[independence_pair]]
+condition     = "b"
+held_constant = ["n == 0"]
+test_1 = { "n == 0" = true, b = false, result = false }
+test_2 = { "n == 0" = true, b = true,  result = true }
+
+[[minimum_test_set]]
+inputs = { "n == 0" = false, b = true }
+result = false
+
+[[minimum_test_set]]
+inputs = { "n == 0" = true, b = false }
+result = false
+
+[[minimum_test_set]]
+inputs = { "n == 0" = true, b = true }
+result = true
