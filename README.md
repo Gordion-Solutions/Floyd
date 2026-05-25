@@ -82,15 +82,17 @@ closes the biggest gaps. The current declines:
 
 | Shape | Workaround / status |
 |-------|---------------------|
-| **Functions composing multiple decisions into a non-bool output** | A bool-returning function with several decisions (`if ... { ... } let r = ...`, `match ... && b`, dispatch with arm-internal decisions, early return + post-return) recovers correctly. A function that *composes* multiple decisions into a tuple, array, or other non-bool output — e.g. `fn dual(a, b, c) -> (bool, bool) { (a && b, a || c) }` — recovers only the first decision; the others are silently dropped. |
+| **Functions composing multiple decisions into a non-bool output**, e.g. `fn dual(a, b, c) -> (bool, bool) { (a && b, a || c) }` | The OSS engine recovers only the first decision; the others are silently dropped. Per ADR-0004 this shape falls under the commercial closed-source pattern-matching extensions category — bool-returning multi-decision functions (with `match ... && b`, dispatch with arm-internal decisions, early return + post-return) recover correctly in OSS; the structural rework needed to recover tuple / array / struct compositions sits in the commercial tier. |
 | Match guards (`match n { 0 if c => ... }`) | Not in MVP scope. |
 | Pattern destructuring beyond a single bound value (`if let Some((a, b)) = ...`) | Not in MVP scope. |
 | `async` desugaring, macro-expansion provenance | Not in MVP scope. |
+| FnMut closures with internal mutation | The Fn / move-closure capture forms recover; closures that mutate captured state internally (`b = b && x`) produce a different MIR shape that's not yet handled. |
 
 Most bool-returning safety-critical Rust functions recover
-correctly. If your code returns boolean tuples or arrays composed
-of multiple separate decisions, only the first one comes through
-today.
+correctly. The remaining gaps in the "what doesn't" table are
+either explicit Phase 2 deliverables or items that sit in the
+commercial tier per ADR-0004 — the OSS engine's surface is the
+v0.2.x line as listed in "what works" above.
 
 [cast-10]: https://www.faa.gov/aircraft/air_cert/design_approvals/air_software/cast/cast_papers (CAST-10 — Modified Condition/Decision Coverage)
 
@@ -238,10 +240,10 @@ conditions.
 
 ## Contributing
 
-Issues and PRs are welcome — see [architecture/](architecture/) for
-the design source of truth before proposing larger changes. New
-corpus patterns are the highest-value contribution: open a PR
-adding a directory under `corpus/v<N>/patterns/` with
-`pattern.toml` (analysis) + `src.rs` (the function under test).
-The schema is documented in
-[`corpus/README.md`](corpus/README.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to add corpus
+patterns, file bug reports, and propose engine changes. The
+short version: corpus patterns are the highest-value drop-in
+contribution; architectural changes that alter Floyd's internal
+data model need a design issue first per
+[ADR-0004](architecture/decisions/0004-engine-correctness-oss-boundary.md)'s
+OSS/commercial scope boundary.
