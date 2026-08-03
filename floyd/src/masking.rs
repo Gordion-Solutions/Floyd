@@ -220,9 +220,337 @@ pub fn analyze_with_variant(tree: &DecisionTree, variant: Variant) -> Independen
     matrix
 }
 
+/// A smallest set of test vectors that demonstrates MC/DC for every
+/// condition of one decision, with the pair chosen for each condition.
+///
+/// Produced by [`minimum_test_set`].
+///
+/// The corpus pins the contract this type implements.
+/// `corpus/v0/patterns/003-nested-and-or/pattern.toml` records both the
+/// target — *"the theoretical n+1 minimum for n=3 conditions"* — and the
+/// mechanism that reaches it: independence pairs *"chosen to overlap
+/// maximally"*. Overlap is the whole difficulty. A condition typically has
+/// several valid pairs, and picking each condition's pair in isolation
+/// yields a test set that is valid but larger than necessary, because
+/// endpoints that could have been shared are not.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct MinimumTestSet {
+    /// The chosen test vectors, in truth-table order.
+    pub tests: Vec<TruthTableRow>,
+    /// The independence pair selected for each condition. Every endpoint
+    /// of every selected pair appears in [`Self::tests`].
+    ///
+    /// Conditions with no valid pair are absent: they cannot be
+    /// demonstrated at all, so no choice of tests covers them.
+    pub chosen_pairs: BTreeMap<String, IndependencePair>,
+    /// Whether minimality was *proven*, either by exhausting the
+    /// selection space or by reaching the `n + 1` floor below which no
+    /// valid set exists. False means [`Self::tests`] is the smallest set
+    /// found within [`SEARCH_BUDGET`] and is a sound upper bound only.
+    pub proven_minimal: bool,
+}
+
+/// Ceiling on branch-and-bound nodes explored by [`minimum_test_set`].
+///
+/// Selecting one pair per condition is a set-cover-shaped search, so the
+/// worst case is exponential in the condition count. The budget keeps the
+/// analysis bounded on a pathological decision; exceeding it is reported
+/// through [`MinimumTestSet::proven_minimal`] rather than by silently
+/// returning a number that looks proven. Pruning against the incumbent does
+/// most of the work — every corpus pattern, and every three-condition
+/// function, finishes well inside the ceiling.
+pub const SEARCH_BUDGET: usize = 1 << 20;
+
+/// Compute a minimum-cardinality MC/DC test set for an analysed decision.
+///
+/// Every condition that has at least one valid independence pair
+/// contributes exactly one pair, and the result is the smallest union of
+/// those pairs' endpoints. Search order puts the most constrained
+/// conditions first and prunes any branch that has already matched the
+/// incumbent, so the common case terminates at the `n + 1` floor without
+/// enumerating the space.
+///
+/// Determinism: pairs are considered in [`analyze_with_variant`] order and
+/// ties are broken by first discovery, so a given matrix always yields the
+/// same set. Qualification evidence that changed between runs would be
+/// worthless.
+pub fn minimum_test_set(matrix: &IndependenceMatrix) -> MinimumTestSet {
+    minimum_test_set_within(matrix, SEARCH_BUDGET)
+}
+
+/// Compute a minimum MC/DC test set under an explicit node ceiling.
+///
+/// Exposed so the ceiling is reachable in a test. A mechanism that only
+/// ever runs with a budget nothing can exhaust is a mechanism nobody has
+/// checked, and the whole point of [`MinimumTestSet::proven_minimal`] is
+/// to be trustworthy in the case that does exhaust it.
+pub fn minimum_test_set_within(matrix: &IndependenceMatrix, budget: usize) -> MinimumTestSet {
+    let choices = condition_choices(matrix);
+    let mut state = SearchState {
+        floor: absolute_floor(&choices),
+        budget: Budget::new(budget),
+        current: Selection::default(),
+        best: None,
+    };
+    explore(&choices, 0, &mut state);
+
+    // `explore` records a selection as soon as one branch reaches full depth,
+    // so `None` means the ceiling stopped it before any complete selection —
+    // including a ceiling of zero. The default claims nothing.
+    let Some(selection) = &state.best else {
+        return MinimumTestSet::default();
+    };
+    let proven_minimal = !state.budget.exhausted || selection.rows.len() <= state.floor;
+    assemble(matrix, &choices, selection, proven_minimal)
+}
+
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
+
+/// The size below which no valid test set can exist, used to stop the
+/// search once it provably cannot improve.
+///
+/// Two, not `n + 1`. The `n + 1` figure that
+/// `corpus/v0/patterns/003-nested-and-or/pattern.toml` calls "the
+/// theoretical n+1 minimum" is Chilenski's result for *singular* Boolean
+/// expressions — those in which every condition appears exactly once. Every
+/// v0 pattern is singular, so the two bounds coincide across the whole
+/// corpus, which is what makes `n + 1` look like a law.
+///
+/// It is not one under masking MC/DC. Masking only requires the other
+/// conditions to be *masked* in both rows of a pair, not held constant, so a
+/// single pair of rows can be a valid independence pair for several
+/// conditions at once, and one shared pair then demonstrates all of them.
+/// The three-condition function with truth table `0x2b` needs just two
+/// tests. Using `n + 1` as the floor made the search stop at four and return
+/// a non-minimal set for exactly that shape.
+fn absolute_floor(choices: &[ConditionChoices]) -> usize {
+    if choices.is_empty() {
+        return 0;
+    }
+    2
+}
+
+/// Candidate pairs for one condition, reduced to truth-table row indices.
+///
+/// Indices rather than [`TruthTableRow`] clones because the search's inner
+/// loop is set membership: two conditions "share" a test exactly when they
+/// name the same row.
+struct ConditionChoices {
+    condition: String,
+    /// Each entry is `(index into the condition's pair list, the pair's
+    /// two truth-table row indices)`.
+    pairs: Vec<(usize, [usize; 2])>,
+}
+
+/// One pair chosen per [`ConditionChoices`] entry, with the union of every
+/// chosen endpoint.
+#[derive(Default, Clone)]
+struct Selection {
+    chosen: Vec<usize>,
+    rows: BTreeSet<usize>,
+}
+
+/// Reduce a matrix to the per-condition search space, most constrained
+/// first.
+///
+/// Ordering is a search heuristic only, not a semantic choice: a condition
+/// with one valid pair forces its endpoints, so taking it first lets later
+/// conditions reuse those rows and lets the bound prune earlier. Ties keep
+/// the matrix's own sorted-by-name order for determinism.
+fn condition_choices(matrix: &IndependenceMatrix) -> Vec<ConditionChoices> {
+    let mut choices: Vec<ConditionChoices> = matrix
+        .independence_pairs
+        .iter()
+        .filter(|(_, pairs)| !pairs.is_empty())
+        .map(|(condition, pairs)| ConditionChoices {
+            condition: condition.clone(),
+            pairs: indexed_endpoints(&matrix.truth_table, pairs),
+        })
+        .filter(|entry| !entry.pairs.is_empty())
+        .collect();
+    choices.sort_by_key(|entry| entry.pairs.len());
+    choices
+}
+
+/// Map each pair to the truth-table indices of its two endpoints.
+///
+/// A pair whose endpoint is not a row of this truth table is dropped
+/// rather than guessed at: it cannot be part of a test set drawn from the
+/// table, and inventing an index would corrupt the sharing arithmetic.
+fn indexed_endpoints(
+    truth_table: &[TruthTableRow],
+    pairs: &[IndependencePair],
+) -> Vec<(usize, [usize; 2])> {
+    pairs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pair)| {
+            let first = row_position(truth_table, &pair.test_1)?;
+            let second = row_position(truth_table, &pair.test_2)?;
+            Some((index, [first, second]))
+        })
+        .collect()
+}
+
+/// Locate a row in the truth table by its condition assignment.
+///
+/// The assignment is the row's identity: [`enumerate_truth_table`] emits
+/// one row per assignment, so a match is unique.
+fn row_position(truth_table: &[TruthTableRow], row: &TruthTableRow) -> Option<usize> {
+    truth_table.iter().position(|r| r.inputs == row.inputs)
+}
+
+/// Bounded node counter for the branch-and-bound search.
+///
+/// Remembers that it ran out rather than only reporting what is left, so
+/// the caller can distinguish "searched the space" from "stopped early"
+/// after the fact.
+struct Budget {
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl Budget {
+    fn new(limit: usize) -> Self {
+        Budget {
+            remaining: limit,
+            exhausted: false,
+        }
+    }
+
+    /// Consume one node, or record exhaustion and refuse.
+    fn consume(&mut self) -> bool {
+        if self.remaining == 0 {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
+/// Mutable state threaded through the branch-and-bound recursion.
+struct SearchState {
+    floor: usize,
+    budget: Budget,
+    current: Selection,
+    best: Option<Selection>,
+}
+
+impl SearchState {
+    /// True when the running selection has already matched the incumbent,
+    /// so no completion of it can beat one.
+    fn cannot_beat_incumbent(&self) -> bool {
+        self.best
+            .as_ref()
+            .is_some_and(|incumbent| self.current.rows.len() >= incumbent.rows.len())
+    }
+
+    /// True once the incumbent has reached the `n + 1` floor, below which
+    /// no valid selection exists — so searching on cannot improve it.
+    fn reached_floor(&self) -> bool {
+        self.best
+            .as_ref()
+            .is_some_and(|found| found.rows.len() <= self.floor)
+    }
+
+    /// Accept the running selection as the new incumbent if it is smaller.
+    ///
+    /// The test is repeated here even though [`Self::cannot_beat_incumbent`]
+    /// already pruned this branch on entry, because that prune is an
+    /// *optimisation*: disable it and an unconditional assignment here would
+    /// let a later, larger selection overwrite a smaller one, and the
+    /// function would quietly stop returning minima. Minimality is this
+    /// type's invariant, so it is enforced where the value is stored.
+    fn record(&mut self) {
+        if self.cannot_beat_incumbent() {
+            return;
+        }
+        self.best = Some(self.current.clone());
+    }
+}
+
+/// Branch and bound over one pair per condition, keeping the selection
+/// whose endpoint union is smallest.
+fn explore(choices: &[ConditionChoices], depth: usize, state: &mut SearchState) {
+    if !state.budget.consume() || state.cannot_beat_incumbent() {
+        return;
+    }
+    let Some(entry) = choices.get(depth) else {
+        state.record();
+        return;
+    };
+    for (pair_index, endpoints) in &entry.pairs {
+        try_pair(choices, depth, (*pair_index, endpoints), state);
+        if state.reached_floor() {
+            return;
+        }
+    }
+}
+
+/// Take one pair at `depth`, recurse, then undo the selection.
+fn try_pair(
+    choices: &[ConditionChoices],
+    depth: usize,
+    pair: (usize, &[usize; 2]),
+    state: &mut SearchState,
+) {
+    let (pair_index, endpoints) = pair;
+    let added = extend_rows(&mut state.current, endpoints);
+    state.current.chosen.push(pair_index);
+    explore(choices, depth + 1, state);
+    state.current.chosen.pop();
+    for row in &added {
+        state.current.rows.remove(row);
+    }
+}
+
+/// Add a pair's endpoints to the running selection, returning only those
+/// the selection did not already contain.
+///
+/// The caller removes exactly this list on backtrack. Removing both
+/// endpoints unconditionally would discard a row another condition still
+/// depends on, which is the sharing the search exists to find.
+fn extend_rows(current: &mut Selection, endpoints: &[usize; 2]) -> Vec<usize> {
+    let added: Vec<usize> = endpoints
+        .iter()
+        .copied()
+        .filter(|row| !current.rows.contains(row))
+        .collect();
+    current.rows.extend(added.iter().copied());
+    added
+}
+
+/// Rebuild a [`MinimumTestSet`] from the winning selection.
+fn assemble(
+    matrix: &IndependenceMatrix,
+    choices: &[ConditionChoices],
+    selection: &Selection,
+    proven_minimal: bool,
+) -> MinimumTestSet {
+    let mut chosen_pairs = BTreeMap::new();
+    for (entry, pair_index) in choices.iter().zip(&selection.chosen) {
+        if let Some(pair) = matrix
+            .independence_pairs
+            .get(&entry.condition)
+            .and_then(|pairs| pairs.get(*pair_index))
+        {
+            chosen_pairs.insert(entry.condition.clone(), pair.clone());
+        }
+    }
+    let tests = selection
+        .rows
+        .iter()
+        .filter_map(|row| matrix.truth_table.get(*row).cloned())
+        .collect();
+    MinimumTestSet {
+        tests,
+        chosen_pairs,
+        proven_minimal,
+    }
+}
 
 /// Collect the set of atomic condition names referenced in a [`Node`],
 /// returned in deterministic sorted order.
@@ -710,6 +1038,240 @@ mod tests {
                 r.condition_status[c]
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Minimum test set
+    // -----------------------------------------------------------------------
+
+    /// Re-check a candidate test set with the runtime checker, so the
+    /// oracle is [`analyze_with_runtime`] rather than this module's own
+    /// arithmetic. A set that does not exercise every condition is not a
+    /// test set at all, however small it is.
+    fn exercises_every_condition(tree: &DecisionTree, set: &MinimumTestSet) -> bool {
+        let observations: Vec<ConditionObservation> = set
+            .tests
+            .iter()
+            .map(|row| ConditionObservation {
+                test_name: None,
+                inputs: row.inputs.clone(),
+                result: row.result,
+            })
+            .collect();
+        let analysis = analyze_with_runtime(tree, &observations, Variant::Masking);
+        analysis
+            .matrix
+            .conditions
+            .iter()
+            .all(|c| matches!(analysis.condition_status[c], ConditionStatus::Exercised(_)))
+    }
+
+    #[test]
+    fn and_minimum_test_set_matches_corpus_001() {
+        let tree = and_tree();
+        let set = minimum_test_set(&analyze(&tree));
+        // Corpus 001 declares a 3-test minimum set: n + 1 for n = 2.
+        assert_eq!(set.tests.len(), 3, "set={:?}", set.tests);
+        assert!(set.proven_minimal);
+        assert!(exercises_every_condition(&tree, &set));
+    }
+
+    #[test]
+    fn or_minimum_test_set_matches_corpus_002() {
+        let tree = or_tree();
+        let set = minimum_test_set(&analyze(&tree));
+        assert_eq!(set.tests.len(), 3, "set={:?}", set.tests);
+        assert!(set.proven_minimal);
+        assert!(exercises_every_condition(&tree, &set));
+    }
+
+    #[test]
+    fn nested_minimum_test_set_matches_corpus_003() {
+        let tree = nested_tree();
+        let set = minimum_test_set(&analyze(&tree));
+        // `corpus/v0/patterns/003-nested-and-or/pattern.toml` pins four
+        // vectors, "the theoretical n+1 minimum for n=3 conditions".
+        assert_eq!(set.tests.len(), 4, "set={:?}", set.tests);
+        assert!(set.proven_minimal);
+        assert!(exercises_every_condition(&tree, &set));
+    }
+
+    #[test]
+    fn minimum_test_set_shares_endpoints_instead_of_taking_each_first_pair() {
+        // The defect this pins: selecting every condition's first valid
+        // pair independently is valid but not minimal. On corpus 003 it
+        // yields five vectors, because `c`'s first pair — (F,F,F)/(F,F,T) —
+        // shares no endpoint with `a`'s or `b`'s, while (T,F,F)/(T,F,T)
+        // reuses the vector `b` already needs.
+        let matrix = analyze(&nested_tree());
+        let independent: BTreeSet<&BTreeMap<String, bool>> = matrix
+            .independence_pairs
+            .values()
+            .flat_map(|pairs| pairs.first())
+            .flat_map(|p| [&p.test_1.inputs, &p.test_2.inputs])
+            .collect();
+        let set = minimum_test_set(&matrix);
+        assert_eq!(independent.len(), 5, "first-pair union should be 5");
+        assert!(
+            set.tests.len() < independent.len(),
+            "minimum {} should beat first-pair union {}",
+            set.tests.len(),
+            independent.len()
+        );
+    }
+
+    #[test]
+    fn minimum_test_set_reports_a_pair_for_every_covered_condition() {
+        for tree in [and_tree(), or_tree(), nested_tree()] {
+            let matrix = analyze(&tree);
+            let set = minimum_test_set(&matrix);
+            for cond in &matrix.conditions {
+                let pair = &set.chosen_pairs[cond];
+                for row in [&pair.test_1, &pair.test_2] {
+                    assert!(
+                        set.tests.iter().any(|t| t.inputs == row.inputs),
+                        "{cond}: chosen endpoint {:?} absent from the test set",
+                        row.inputs
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_exhausted_budget_reports_an_upper_bound_instead_of_claiming_a_minimum() {
+        // Sweep ceilings from "cannot finish one selection" upward. Some
+        // ceiling in this range stops the search after it has a complete
+        // selection but before it can rule out a smaller one; that is the
+        // state `proven_minimal = false` exists to describe, and it is
+        // unreachable at the production ceiling.
+        let tree = nested_tree();
+        let matrix = analyze(&tree);
+        let unproven: Vec<MinimumTestSet> = (1..64)
+            .map(|ceiling| minimum_test_set_within(&matrix, ceiling))
+            .filter(|set| !set.proven_minimal && !set.tests.is_empty())
+            .collect();
+        assert!(
+            !unproven.is_empty(),
+            "no ceiling in 1..64 produced an unproven non-empty set"
+        );
+        let proven = minimum_test_set(&matrix).tests.len();
+        for set in &unproven {
+            // An unproven set is still a *valid* set: `best` is only ever
+            // recorded at full depth, so every condition has a chosen pair.
+            // It is an upper bound, so never smaller than the real minimum.
+            assert!(set.tests.len() >= proven);
+            assert!(exercises_every_condition(&tree, set));
+        }
+    }
+
+    #[test]
+    fn a_zero_budget_returns_nothing_and_claims_nothing() {
+        let set = minimum_test_set_within(&analyze(&nested_tree()), 0);
+        assert!(set.tests.is_empty());
+        assert!(!set.proven_minimal, "an unsearched space is not proven");
+    }
+
+    #[test]
+    fn the_production_budget_proves_every_corpus_pattern() {
+        // Pins the claim in `SEARCH_BUDGET`'s own documentation: the floor
+        // terminates these searches, the ceiling never does.
+        for tree in [and_tree(), or_tree(), nested_tree()] {
+            assert!(minimum_test_set(&analyze(&tree)).proven_minimal);
+        }
+    }
+
+    /// Build the decision computing the boolean function whose truth table
+    /// is the bits of `mask`, as a complete `Ite` tree over `a`, `b`, `c`.
+    ///
+    /// Bit `i` of `mask` is the result for the assignment encoding `i` the
+    /// same way [`enumerate_truth_table`] does: `a` is bit 0, `b` bit 1,
+    /// `c` bit 2. Sweeping `mask` over `0..256` therefore sweeps every
+    /// three-condition boolean function.
+    fn function_of_three(mask: u32) -> DecisionTree {
+        let leaf = |a: u32, b: u32, c: u32| const_(mask >> (a | (b << 1) | (c << 2)) & 1 == 1);
+        let branch_on_c = |a: u32, b: u32| ite("c", leaf(a, b, 1), leaf(a, b, 0));
+        let branch_on_b = |a: u32| ite("b", branch_on_c(a, 1), branch_on_c(a, 0));
+        DecisionTree {
+            decisions: vec![ite("a", branch_on_b(1), branch_on_b(0))],
+        }
+    }
+
+    /// Smallest test set found by exhaustive enumeration of row subsets.
+    ///
+    /// Deliberately the dumbest correct algorithm: it shares no code with
+    /// [`minimum_test_set`]'s branch and bound, so agreement between the two
+    /// is evidence rather than a tautology. Only viable because a decision
+    /// with `n` conditions has `2^n` rows, hence `2^(2^n)` subsets.
+    fn brute_force_minimum(matrix: &IndependenceMatrix) -> Option<usize> {
+        let rows = matrix.truth_table.len();
+        let covered: Vec<&Vec<IndependencePair>> = matrix
+            .independence_pairs
+            .values()
+            .filter(|pairs| !pairs.is_empty())
+            .collect();
+        (0..(1u32 << rows))
+            .filter(|subset| {
+                covered.iter().all(|pairs| {
+                    pairs.iter().any(|pair| {
+                        [&pair.test_1, &pair.test_2].iter().all(|row| {
+                            row_position(&matrix.truth_table, row)
+                                .is_some_and(|index| subset >> index & 1 == 1)
+                        })
+                    })
+                })
+            })
+            .map(|subset| subset.count_ones() as usize)
+            .min()
+    }
+
+    #[test]
+    fn branch_and_bound_agrees_with_brute_force_on_every_three_condition_function() {
+        // 256 functions, each cross-checked against an independent
+        // exhaustive search. Catches any pruning or early-exit rule that is
+        // sound on the corpus shapes but wrong in general.
+        let mut checked = 0;
+        for mask in 0..256u32 {
+            let tree = function_of_three(mask);
+            let matrix = analyze(&tree);
+            let set = minimum_test_set(&matrix);
+            let Some(expected) = brute_force_minimum(&matrix) else {
+                continue;
+            };
+            assert!(set.proven_minimal, "mask {mask:#04x}: not proven");
+            assert_eq!(
+                set.tests.len(),
+                expected,
+                "mask {mask:#04x}: branch and bound gave {}, brute force {expected}",
+                set.tests.len()
+            );
+            // Only meaningful when every condition is demonstrable at all.
+            // A constant function (mask 0x00, 0xff) still reports three
+            // conditions, because the `Ite` tree branches on them, yet no
+            // pair exists for any of them — there is nothing to exercise.
+            let all_demonstrable = matrix
+                .conditions
+                .iter()
+                .all(|c| !matrix.independence_pairs[c].is_empty());
+            if all_demonstrable {
+                assert!(exercises_every_condition(&tree, &set), "mask {mask:#04x}");
+            }
+            checked += 1;
+        }
+        assert!(checked > 200, "only {checked} functions were checkable");
+    }
+
+    #[test]
+    fn a_decision_with_no_conditions_yields_an_empty_proven_set() {
+        let tree = DecisionTree {
+            decisions: vec![const_(true)],
+        };
+        let set = minimum_test_set(&analyze(&tree));
+        assert!(set.tests.is_empty());
+        assert!(set.chosen_pairs.is_empty());
+        // Vacuously minimal: there is no condition to demonstrate, so no
+        // test can shrink the set further.
+        assert!(set.proven_minimal);
     }
 
     // -----------------------------------------------------------------------
