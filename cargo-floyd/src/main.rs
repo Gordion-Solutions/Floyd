@@ -540,28 +540,35 @@ fn print_static_report(
     }
     println!();
 
+    // One selection drives both sections. Reporting each condition's first
+    // valid pair here and sizing the test set from a separate computation
+    // let the two disagree: on corpus 003 the pairs printed were not the
+    // pairs counted, and the count came out 5 against the pattern's pinned
+    // minimum of 4.
+    let minimum = floyd::masking::minimum_test_set(matrix);
+
     println!("Independence pairs ({:?} variant):", matrix.variant);
     for cond in &matrix.conditions {
-        if let Some(pairs) = matrix.independence_pairs.get(cond) {
-            if let Some(p) = pairs.first() {
-                print_pair(cond, &matrix.conditions, p);
-            } else {
-                println!("  {cond}: no valid independence pair found");
-            }
+        match minimum.chosen_pairs.get(cond) {
+            Some(pair) => print_pair(cond, &matrix.conditions, pair),
+            None => println!("  {cond}: no valid independence pair found"),
         }
     }
     println!();
 
-    let min_set: std::collections::BTreeSet<&_> = matrix
-        .independence_pairs
-        .values()
-        .flat_map(|pairs| pairs.first())
-        .flat_map(|p| vec![&p.test_1.inputs, &p.test_2.inputs])
-        .collect();
-    println!(
-        "Minimum test set (one valid choice): {} test(s)",
-        min_set.len()
-    );
+    let label = if minimum.proven_minimal {
+        "Minimum test set"
+    } else {
+        "Smallest test set found (search budget exhausted; upper bound)"
+    };
+    println!("{label}: {} test(s)", minimum.tests.len());
+    for row in &minimum.tests {
+        println!(
+            "  ({}) -> {}",
+            format_inputs(&matrix.conditions, row),
+            bool_glyph(row.result)
+        );
+    }
 }
 
 fn print_runtime_report(
