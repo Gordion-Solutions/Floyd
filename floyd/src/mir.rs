@@ -1073,10 +1073,13 @@ fn parse_compare_rhs(rhs: &str) -> Option<CompareRhs> {
         (CompareOp::Lt, rest)
     } else if let Some(rest) = rhs.strip_prefix("Ge(") {
         (CompareOp::Ge, rest)
-    } else if let Some(rest) = rhs.strip_prefix("Gt(") {
-        (CompareOp::Gt, rest)
     } else {
-        return None;
+        // `?` rather than a trailing `else { return None }`: clippy's
+        // `question_mark` lint rejects the explicit form, and the job runs
+        // `-D warnings` against unpinned stable, so the older spelling
+        // started failing CI when the lint tightened.
+        let rest = rhs.strip_prefix("Gt(")?;
+        (CompareOp::Gt, rest)
     };
     let inner = after_op.strip_suffix(')')?;
     let parts = split_top_level(inner, ',');
