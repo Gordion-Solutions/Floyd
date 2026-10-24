@@ -1,10 +1,11 @@
 [package]
 name = "floyd"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Open-source MC/DC coverage engine for Rust, focused on automotive safety-critical code (ISO 26262, ASIL-D, TCL3)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Gordion-Solutions/Floyd"
+homepage = "https://gordionsolutions.co.uk/software/#floyd"
 readme = "README.md"
 keywords = ["mcdc", "coverage", "safety", "iso26262", "testing"]
 categories = ["development-tools::testing"]

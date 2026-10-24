@@ -8,6 +8,8 @@ Floyd is an open-source MC/DC (Modified Condition/Decision Coverage)
 engine for Rust, focused on automotive safety-critical code
 (ISO 26262, ASIL-D, TCL3).
 
+Project page: <https://gordionsolutions.co.uk/software/#floyd>
+
 ```
 $ cargo floyd test
 floyd  runtime MC/DC analysis of Cargo.toml
@@ -209,6 +211,17 @@ for the architectural commitment (external engine, no rustc fork,
 automotive-first scope) and
 [ADR-0002](architecture/decisions/0002-runtime-pipeline.md) for the
 runtime pipeline design.
+
+## Floyd Enterprise
+
+The open-source engine is complete as a coverage tool. Floyd
+Enterprise, from Gordion Solutions, is what a safety team needs to
+put it into an ISO 26262 evidence package: a tool qualification kit
+for ISO 26262-8 clause 11, delivered per Floyd release against named
+Rust toolchain versions; extended recovery for the decision shapes
+the open-source engine declines; assessor-facing reports; and
+support with a qualified update channel. Details and enquiries:
+<https://gordionsolutions.co.uk/software/#floyd-enterprise>
 
 ## Layout
 
