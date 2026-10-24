@@ -23,7 +23,7 @@ use crate::DecisionTree;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Which MC/DC variant to compute.
-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, serde::Serialize)]
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Variant {
     /// Masking MC/DC (CAST-10 default).
@@ -34,7 +34,7 @@ pub enum Variant {
 }
 
 /// One row of an enumerated truth table.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TruthTableRow {
     /// Assignment of each condition to its boolean value.
     pub inputs: BTreeMap<String, bool>,
@@ -44,7 +44,7 @@ pub struct TruthTableRow {
 
 /// A pair of truth-table rows that together demonstrate that a single
 /// condition independently affects the decision outcome.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IndependencePair {
     /// First test case.
     pub test_1: TruthTableRow,
@@ -57,7 +57,7 @@ pub struct IndependencePair {
 /// Carries the truth table and per-condition independence pairs for
 /// one decision. Phase 0 analyses one decision per call; multi-decision
 /// support arrives with multi-decision corpus patterns.
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndependenceMatrix {
     /// Which variant the analysis was computed under.
     pub variant: Variant,
@@ -83,7 +83,7 @@ pub fn analyze(tree: &DecisionTree) -> IndependenceMatrix {
 /// to [`analyze_with_runtime`]; how they are obtained — per-test
 /// `profraw` parsing, instrumented harness, manually constructed for
 /// integration tests — is the caller's responsibility.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConditionObservation {
     /// Optional test identifier, preserved for diagnostic output.
     pub test_name: Option<String>,
@@ -100,7 +100,7 @@ pub struct ConditionObservation {
 
 /// Whether the test suite as observed demonstrates MC/DC independence
 /// for one condition.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ConditionStatus {
     /// At least one valid independence pair had both required input
     /// assignments observed. MC/DC for this condition is demonstrated.
@@ -118,7 +118,7 @@ pub enum ConditionStatus {
 /// test runs and which did not.
 ///
 /// Produced by [`analyze_with_runtime`].
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeAnalysis {
     /// The static analysis (truth table + all valid pairs).
     pub matrix: IndependenceMatrix,
@@ -731,5 +731,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn runtime_analysis_json_round_trip() {
+        // The public types derive Deserialize alongside Serialize so
+        // downstream tools (reporters, dashboards, qualification kits)
+        // can parse the engine's JSON output back into live types.
+        // Build a non-trivial analysis, serialize it, deserialize it,
+        // and check the recovered value equals the original.
+        let tree = and_tree();
+        let obs = vec![
+            ConditionObservation {
+                test_name: Some("t_ff".to_string()),
+                inputs: [("a".to_string(), false)].into_iter().collect(),
+                result: false,
+            },
+            ConditionObservation {
+                test_name: Some("t_tf".to_string()),
+                inputs: [("a".to_string(), true), ("b".to_string(), false)]
+                    .into_iter()
+                    .collect(),
+                result: false,
+            },
+            ConditionObservation {
+                test_name: Some("t_tt".to_string()),
+                inputs: [("a".to_string(), true), ("b".to_string(), true)]
+                    .into_iter()
+                    .collect(),
+                result: true,
+            },
+        ];
+
+        let analysis = analyze_with_runtime(&tree, &obs, Variant::Masking);
+        let json = serde_json::to_string(&analysis).expect("serialize");
+        let round: RuntimeAnalysis = serde_json::from_str(&json).expect("deserialize");
+
+        // Compare via re-serialisation. RuntimeAnalysis itself has no
+        // PartialEq (it carries ConditionStatus, which does not), so
+        // round-trip equality is checked structurally through the
+        // canonical JSON representation.
+        let json2 = serde_json::to_string(&round).expect("re-serialize");
+        assert_eq!(json, json2, "deserialize-then-serialize must be identity");
+    }
+
+    #[test]
+    fn variant_json_round_trip_kebab_case() {
+        // Variant uses rename_all = "kebab-case" on serialize; the
+        // deserialize path must accept the same spelling.
+        let v: Variant = serde_json::from_str("\"masking\"").unwrap();
+        assert_eq!(v, Variant::Masking);
+        let v: Variant = serde_json::from_str("\"unique-cause\"").unwrap();
+        assert_eq!(v, Variant::UniqueCause);
     }
 }
