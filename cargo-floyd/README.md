@@ -25,3 +25,4 @@ rustup component add llvm-tools-preview --toolchain nightly
 
 See the [main repository README](https://github.com/Gordion-Solutions/Floyd)
 for the full feature matrix, qualification stance, and ADRs.
+Project page: <https://gordionsolutions.co.uk/software/#floyd>.

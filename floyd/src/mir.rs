@@ -1073,10 +1073,9 @@ fn parse_compare_rhs(rhs: &str) -> Option<CompareRhs> {
         (CompareOp::Lt, rest)
     } else if let Some(rest) = rhs.strip_prefix("Ge(") {
         (CompareOp::Ge, rest)
-    } else if let Some(rest) = rhs.strip_prefix("Gt(") {
-        (CompareOp::Gt, rest)
     } else {
-        return None;
+        let rest = rhs.strip_prefix("Gt(")?;
+        (CompareOp::Gt, rest)
     };
     let inner = after_op.strip_suffix(')')?;
     let parts = split_top_level(inner, ',');
