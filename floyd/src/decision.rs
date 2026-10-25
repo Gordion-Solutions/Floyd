@@ -163,13 +163,23 @@ pub fn evaluate_partial(
 pub fn decompose(mir: &Mir) -> DecisionTree {
     let mut tree = DecisionTree::default();
     for f in &mir.functions {
-        if let Some(entry) = f.blocks.first() {
-            if let Some(node) = build_decision_from_block(entry.id, f) {
-                tree.decisions.push(node);
-            }
+        if let Some(node) = decompose_function(f) {
+            tree.decisions.push(node);
         }
     }
     tree
+}
+
+/// Decompose a single MIR function into one [`Node`], if the engine
+/// recognises its control-flow shape.
+///
+/// Callers that need to associate a decision with the function it
+/// came from (for provenance reporting, per-function analysis, etc.)
+/// can iterate `mir.functions` and call this per function, keeping
+/// the `&MirFunction` reference alive alongside the resulting node.
+pub fn decompose_function(f: &MirFunction) -> Option<Node> {
+    let entry = f.blocks.first()?;
+    build_decision_from_block(entry.id, f)
 }
 
 // Boolean handler: wrap a recognised BoolExpr into a Node::Ite.

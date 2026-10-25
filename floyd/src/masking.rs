@@ -113,6 +113,30 @@ pub enum ConditionStatus {
     Unexercised,
 }
 
+/// Where a decision came from in source.
+///
+/// Attached optionally to [`RuntimeAnalysis`] so downstream reports
+/// (HTML, SARIF, LCOV, qualification kits) can cite the function
+/// name, source file, and line number a decision lives at — without
+/// reconstructing it from the surrounding build context.
+///
+/// Every field is optional. Callers populate what they know; the
+/// engine itself populates nothing (provenance is a reporting
+/// concern, not an analysis concern).
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DecisionProvenance {
+    /// Source file path, as rustc reports it (usually relative to
+    /// the crate root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+    /// Rust-level function name the decision lives in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function_name: Option<String>,
+    /// 1-based line number where the decision starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+}
+
 /// Static MC/DC analysis combined with runtime evidence: which
 /// conditions had their independence demonstrated by the observed
 /// test runs and which did not.
@@ -124,6 +148,13 @@ pub struct RuntimeAnalysis {
     pub matrix: IndependenceMatrix,
     /// Per-condition status under the observed tests.
     pub condition_status: BTreeMap<String, ConditionStatus>,
+    /// Optional source-location metadata — populated by callers that
+    /// know where the decision came from (e.g. the `cargo floyd`
+    /// driver attaches it after decomposition). Older JSON reports
+    /// without this field deserialize correctly thanks to
+    /// `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<DecisionProvenance>,
 }
 
 /// Combine static MC/DC analysis with observed test runs.
@@ -153,6 +184,7 @@ pub fn analyze_with_runtime(
     RuntimeAnalysis {
         matrix,
         condition_status,
+        provenance: None,
     }
 }
 
@@ -783,5 +815,59 @@ mod tests {
         assert_eq!(v, Variant::Masking);
         let v: Variant = serde_json::from_str("\"unique-cause\"").unwrap();
         assert_eq!(v, Variant::UniqueCause);
+    }
+
+    #[test]
+    fn provenance_round_trips_when_present() {
+        let analysis = RuntimeAnalysis {
+            matrix: IndependenceMatrix::default(),
+            condition_status: BTreeMap::new(),
+            provenance: Some(DecisionProvenance {
+                function_name: Some("allow_actuation".to_string()),
+                source_file: Some("src/lib.rs".to_string()),
+                line: Some(42),
+            }),
+        };
+        let json = serde_json::to_string(&analysis).expect("serialize");
+        assert!(json.contains("\"provenance\""));
+        assert!(json.contains("\"allow_actuation\""));
+        assert!(json.contains("\"src/lib.rs\""));
+        assert!(json.contains("42"));
+        let round: RuntimeAnalysis = serde_json::from_str(&json).expect("deserialize");
+        let p = round.provenance.expect("provenance preserved");
+        assert_eq!(p.function_name.as_deref(), Some("allow_actuation"));
+        assert_eq!(p.source_file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(p.line, Some(42));
+    }
+
+    #[test]
+    fn provenance_omitted_when_none() {
+        let analysis = RuntimeAnalysis {
+            matrix: IndependenceMatrix::default(),
+            condition_status: BTreeMap::new(),
+            provenance: None,
+        };
+        let json = serde_json::to_string(&analysis).expect("serialize");
+        assert!(
+            !json.contains("provenance"),
+            "None provenance must not appear in JSON (skip_serializing_if)"
+        );
+    }
+
+    #[test]
+    fn old_json_without_provenance_still_deserializes() {
+        // Backwards compatibility: a report from floyd 0.2.3 (no
+        // provenance field) must still parse into the new shape.
+        let old = r#"{
+            "matrix": {
+                "variant": "masking",
+                "conditions": [],
+                "truth_table": [],
+                "independence_pairs": {}
+            },
+            "condition_status": {}
+        }"#;
+        let parsed: RuntimeAnalysis = serde_json::from_str(old).expect("parse 0.2.3 shape");
+        assert!(parsed.provenance.is_none());
     }
 }

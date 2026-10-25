@@ -241,6 +241,7 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
     let mut all_tests = Vec::new();
     let mut all_observations = Vec::new();
     let mut chosen_tree: Option<floyd::DecisionTree> = None;
+    let mut chosen_provenance: Option<floyd::DecisionProvenance> = None;
 
     for (art_idx, artifact) in build.test_artifacts.iter().enumerate() {
         let mir_text = match std::fs::read_to_string(&artifact.mir_path) {
@@ -257,9 +258,16 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
         }
         // Phase 1 first cut: take the first non-empty decision tree as
         // THE decision under analysis. Multi-decision aggregation lands
-        // in a future release.
+        // in a future release. Record provenance (function name +
+        // source span) of the first function that contributed a
+        // recognised decision.
         if chosen_tree.is_none() {
             chosen_tree = Some(tree.clone());
+            chosen_provenance = mir
+                .functions
+                .iter()
+                .find(|f| decision::decompose_function(f).is_some())
+                .map(correlate::provenance_for);
         }
 
         let tests = match runner::list_tests(&artifact.binary_path) {
@@ -313,7 +321,8 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
             return ExitCode::from(1);
         }
     };
-    let analysis = masking::analyze_with_runtime(&tree, &all_observations, Variant::Masking);
+    let mut analysis = masking::analyze_with_runtime(&tree, &all_observations, Variant::Masking);
+    analysis.provenance = chosen_provenance;
 
     match format {
         Format::Text => {
@@ -442,8 +451,14 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
         }
     }
 
-    // 6. Combined static + runtime analysis.
-    let analysis = masking::analyze_with_runtime(&tree, &observations, Variant::Masking);
+    // 6. Combined static + runtime analysis, with provenance of the
+    //    first function that produced a recognised decision.
+    let mut analysis = masking::analyze_with_runtime(&tree, &observations, Variant::Masking);
+    analysis.provenance = mir
+        .functions
+        .iter()
+        .find(|f| decision::decompose_function(f).is_some())
+        .map(correlate::provenance_for);
 
     match format {
         Format::Text => print_runtime_report(source, &tests, &observations, &analysis),

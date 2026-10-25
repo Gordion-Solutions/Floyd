@@ -172,6 +172,24 @@ fn spans_match(a: &SourceSpan, b: &SourceSpan) -> bool {
     a.file == b.file || a.file.ends_with(&b.file) || b.file.ends_with(&a.file)
 }
 
+/// Build a [`crate::masking::DecisionProvenance`] for a MIR function
+/// — the function name, source file, and start line that identify
+/// the decision for reports and qualification artefacts.
+///
+/// Source file and line are taken from the earliest condition span
+/// in the function's MIR, which the engine already collects for
+/// coverage correlation. The function name comes from
+/// [`MirFunction::name`] verbatim.
+pub fn provenance_for(f: &MirFunction) -> crate::masking::DecisionProvenance {
+    let spans = collect_condition_spans(f);
+    let earliest = spans.values().min_by_key(|s| (s.start_line, s.start_col));
+    crate::masking::DecisionProvenance {
+        function_name: Some(f.name.clone()),
+        source_file: earliest.map(|s| s.file.clone()),
+        line: earliest.map(|s| s.start_line),
+    }
+}
+
 fn collect_condition_spans(f: &MirFunction) -> BTreeMap<String, SourceSpan> {
     let mut spans = BTreeMap::new();
     for block in &f.blocks {
