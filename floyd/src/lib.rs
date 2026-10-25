@@ -20,7 +20,7 @@
 //!
 //! ## Status
 //!
-//! v0.2.1. The `cargo floyd test` workflow runs end-to-end on real
+//! v0.2.3. The `cargo floyd test` workflow runs end-to-end on real
 //! cargo projects, recovering boolean decisions built from `&&`,
 //! `||`, `!`, inline comparisons (`>`, `<`, `==`, `!=`, `>=`, `<=`),
 //! `if let` with a binding, the `?` operator (skip-through),
@@ -28,8 +28,12 @@
 //! match-into-`&&` intermediate-propagation, and closures
 //! capturing outer booleans (by-value and by-reference). JUnit XML
 //! output is available for CI integration via
-//! `cargo floyd test --format=junit`. The recovered pattern set is
-//! pinned by the `corpus/` directory; see
+//! `cargo floyd test --format=junit`. Public result types
+//! ([`IndependenceMatrix`], [`RuntimeAnalysis`], [`ConditionStatus`]
+//! et al.) derive both `serde::Serialize` and `serde::Deserialize`,
+//! so downstream reporters, dashboards, and qualification tools can
+//! round-trip the engine's JSON output into live Rust values. The
+//! recovered pattern set is pinned by the `corpus/` directory; see
 //! [`corpus/v1/`](https://github.com/Gordion-Solutions/Floyd/tree/main/corpus/v1)
 //! for the safety-critical decision patterns the engine is
 //! validated against.
