@@ -177,9 +177,35 @@ pub fn decompose(mir: &Mir) -> DecisionTree {
 /// came from (for provenance reporting, per-function analysis, etc.)
 /// can iterate `mir.functions` and call this per function, keeping
 /// the `&MirFunction` reference alive alongside the resulting node.
+///
+/// Only the function's entry block is considered. For functions that
+/// compose multiple decisions into a non-bool output (tuple returns,
+/// struct returns, array returns), use [`decompose_from_block`] with
+/// each candidate entry block to recover the remaining decisions —
+/// typically a job for a downstream multi-decision pass rather than
+/// the engine itself.
 pub fn decompose_function(f: &MirFunction) -> Option<Node> {
     let entry = f.blocks.first()?;
-    build_decision_from_block(entry.id, f)
+    decompose_from_block(f, entry.id)
+}
+
+/// Decompose a function starting from a specific basic block.
+///
+/// Equivalent to [`decompose_function`] when `block_id` is the
+/// function's entry block. Different `block_id` values let callers
+/// explore alternate decision paths through the same function — the
+/// building block for recovering tuple-returning or struct-returning
+/// functions where each returned element is produced by its own
+/// decision rooted at its own basic block.
+///
+/// Returns `None` when the shape rooted at `block_id` is not
+/// recognised as a decision by any decomposer handler, or when
+/// `block_id` does not identify a block in `f`.
+pub fn decompose_from_block(f: &MirFunction, block_id: BlockId) -> Option<Node> {
+    if !f.blocks.iter().any(|b| b.id == block_id) {
+        return None;
+    }
+    build_decision_from_block(block_id, f)
 }
 
 // Boolean handler: wrap a recognised BoolExpr into a Node::Ite.
@@ -2036,5 +2062,30 @@ fn decide(_1: Option<bool>, _2: bool) -> Option<bool> {
             tree.decisions[0],
             ite("a", ite("b", const_(true), cond("c")), cond("c"),)
         );
+    }
+
+    #[test]
+    fn decompose_from_block_at_entry_matches_decompose_function() {
+        // Calling decompose_from_block with the function's entry
+        // block id must produce exactly the same node as
+        // decompose_function (the latter is a thin wrapper).
+        let mir = mir::parse_text(DECIDE_AND_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        let entry_id = f.blocks.first().expect("has entry block").id;
+        let via_wrapper = decompose_function(f);
+        let via_direct = decompose_from_block(f, entry_id);
+        assert!(via_wrapper.is_some());
+        assert_eq!(via_wrapper, via_direct);
+    }
+
+    #[test]
+    fn decompose_from_block_with_unknown_id_returns_none() {
+        // A block id that doesn't identify any block in the function
+        // must return None rather than panicking or scanning a
+        // bogus block.
+        let mir = mir::parse_text(DECIDE_AND_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        let max_id = f.blocks.iter().map(|b| b.id).max().unwrap_or(0);
+        assert!(decompose_from_block(f, max_id + 999).is_none());
     }
 }
