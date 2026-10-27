@@ -1,0 +1,22 @@
+# Floyd mutation-testing configuration.
+# Phase 1.5 of the floyd-enterprise ROADMAP.
+#
+# Mutation testing runs in a nightly scheduled CI job (see
+# .github/workflows/mutants.yml). The per-module kill-rate
+# thresholds below gate releases: a drop below threshold on
+# masking.rs or decision.rs fails the mutation workflow.
+#
+# Equivalent / infeasible mutations go in `exclude_re` with a
+# justification; genuine test-suite gaps are closed by adding a
+# targeted unit test.
+
+# Test timeout multiplier: how many times the baseline test
+# duration a single mutant run may take before being considered
+# a timeout. Default is 5; Floyd's test suite is fast enough
+# that 3x is tight.
+timeout_multiplier = 3.0
+
+# Minimum test time (seconds) to use as the lower bound on the
+# auto-set timeout — prevents a zero-second baseline from
+# producing silly timeout values.
+minimum_test_timeout = 20
