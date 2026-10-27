@@ -1,0 +1,55 @@
+name: integration
+
+# Phase 1.2 of the floyd-enterprise ROADMAP.
+#
+# End-to-end integration tests exercise the full Floyd pipeline:
+# compile a fixture with -Cinstrument-coverage, run each test in a
+# separate process, parse .profraw via llvm-profdata + llvm-cov,
+# compute masking MC/DC, assert the output.
+#
+# These tests are tagged #[ignore] in the main `cargo test` run
+# because the toolchain prerequisites (nightly rustc +
+# llvm-tools-preview) aren't universally available on dev machines.
+# This workflow pins them in CI so they are exercised on a
+# predictable cadence rather than drifting unchecked.
+#
+# Cadence:
+#   - nightly at 02:00 UTC
+#   - on every push of a release tag (v*) so the pipeline is proven
+#     against the exact code being published to crates.io
+#   - manual via workflow_dispatch for ad-hoc runs
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  end-to-end:
+    name: end-to-end pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain + llvm-tools-preview
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify llvm-profdata is on the toolchain
+        run: rustup which --toolchain nightly llvm-profdata
+
+      - name: Run ignored integration tests
+        run: cargo test --test end_to_end_001 -- --ignored --nocapture
