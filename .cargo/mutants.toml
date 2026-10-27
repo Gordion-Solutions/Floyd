@@ -10,20 +10,26 @@
 # justification; genuine test-suite gaps are closed by adding a
 # targeted unit test.
 
-# Timeout per mutant. 60s is generous for Floyd's test suite but
-# protects against infinite loops in a mutated test.
-timeout = 60
-
-# Don't shuffle: deterministic ordering makes CI output
-# comparable between runs for diff review.
-shuffle = false
-
 # Test timeout multiplier: how many times the baseline test
 # duration a single mutant run may take before being considered
 # a timeout. Default is 5; Floyd's test suite is fast enough
 # that 3x is tight.
-test_timeout_multiplier = 3
+timeout_multiplier = 3.0
 
-# Minimum test time to use for the baseline (prevents
-# zero-second baseline producing silly timeout values).
+# Minimum test time (seconds) to use as the lower bound on the
+# auto-set timeout — prevents a zero-second baseline from
+# producing silly timeout values.
 minimum_test_timeout = 20
+
+# Equivalent mutations — behaviour-preserving changes a sound test
+# suite literally cannot detect. Document each with a rationale so
+# a reviewer can confirm the equivalence before accepting it.
+exclude_re = [
+    # masking.rs find_pairs: for i in 0..N, inner loop (i + 1)..N
+    # vs (i * 1)..N. The latter adds one extra iteration j==i for
+    # every i, but the immediately-following `c_i == c_j` check
+    # unconditionally continues the loop (row_j equals row_i, so
+    # the condition value is identical). Output pairs are bit-
+    # identical.
+    "replace \\+ with \\* in find_pairs",
+]
