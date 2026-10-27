@@ -1,0 +1,83 @@
+name: mutants
+
+# Phase 1.5 of the floyd-enterprise ROADMAP.
+#
+# Scheduled nightly mutation-testing run over the four
+# correctness-critical modules in floyd. Runs per-module so each
+# can succeed / fail independently and partial progress is visible
+# in the CI dashboard.
+#
+# The nightly cadence (rather than per-PR) is because the full
+# baseline across all four modules takes ~30 minutes — too slow
+# for every PR, but comfortable as a nightly check.
+#
+# Also triggerable manually via workflow_dispatch for ad-hoc runs
+# when working on test-coverage improvements.
+
+on:
+  schedule:
+    # 03:00 UTC every day (quiet hours for most contributors)
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      # Trigger on changes to the critical modules or the config,
+      # so a PR touching correctness-critical code gets a quick
+      # mutation check before merge.
+      - 'floyd/src/masking.rs'
+      - 'floyd/src/decision.rs'
+      - 'floyd/src/correlate.rs'
+      - 'floyd/src/mir.rs'
+      - '.cargo/mutants.toml'
+      - '.github/workflows/mutants.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants:
+    name: ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - module: masking
+            file: floyd/src/masking.rs
+            # Phase 1.5 baseline: 34 caught, 4 missed, 4 unviable = 89.5%
+            # Target: 95%. Follow-up PR closes the 4 known gaps.
+          - module: decision
+            file: floyd/src/decision.rs
+            # Baseline TBD on first run; target 90%.
+          - module: correlate
+            file: floyd/src/correlate.rs
+            # Baseline TBD on first run; target 85%.
+          - module: mir
+            file: floyd/src/mir.rs
+            # Baseline TBD on first run; target 80%.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Run mutants on ${{ matrix.module }}
+        run: cargo mutants --package floyd --file "${{ matrix.file }}"
+
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-${{ matrix.module }}
+          path: mutants.out/
+          retention-days: 14
