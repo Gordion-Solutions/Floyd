@@ -870,4 +870,95 @@ mod tests {
         let parsed: RuntimeAnalysis = serde_json::from_str(old).expect("parse 0.2.3 shape");
         assert!(parsed.provenance.is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 1.5 mutation-gap closures (masking.rs).
+    //
+    // Mutation testing on 2026-10-27 identified the following
+    // surviving mutants on masking.rs:
+    //
+    //   L236 — delete `variant` field from IndependenceMatrix
+    //          constructor in analyze_with_variant.
+    //   L394 — replace is_masked_in -> bool with false.
+    //   L400 — replace == with != in is_masked_in.
+    //
+    // (L329 — replace + with * in find_pairs — is marked as an
+    // equivalent mutation in `.cargo/mutants.toml`; see rationale
+    // there. (i + 1) and (i * 1) produce identical pairs because the
+    // extra j==i iteration is always filtered by the c_i == c_j
+    // check immediately below.)
+    //
+    // The tests below exercise behaviour each mutation would
+    // observably change; running cargo-mutants on masking.rs after
+    // this PR must show 0 missed (down from 4).
+    // -----------------------------------------------------------------------
+
+    /// `a && (b || c)`.
+    ///
+    /// Deliberately chosen because its truth table has
+    /// masking-independence pairs for condition `a` that unique-
+    /// cause rejects — the test the next two assertions depend on.
+    fn and_or_tree() -> DecisionTree {
+        DecisionTree {
+            decisions: vec![ite(
+                "a",
+                ite("b", const_(true), cond("c")),
+                const_(false),
+            )],
+        }
+    }
+
+    #[test]
+    fn analyze_preserves_variant_on_matrix() {
+        // Kills the L236 mutant (delete `variant` field) by checking
+        // the matrix carries the variant the caller requested.
+        let masking_matrix = analyze_with_variant(&and_tree(), Variant::Masking);
+        assert_eq!(masking_matrix.variant, Variant::Masking);
+
+        let uc_matrix = analyze_with_variant(&and_tree(), Variant::UniqueCause);
+        assert_eq!(uc_matrix.variant, Variant::UniqueCause);
+
+        // Also verify the empty-tree early-return path preserves it.
+        let empty_matrix = analyze_with_variant(&DecisionTree::default(), Variant::UniqueCause);
+        assert_eq!(empty_matrix.variant, Variant::UniqueCause);
+    }
+
+    #[test]
+    fn masking_admits_independence_pairs_that_unique_cause_rejects() {
+        // Kills two mutants simultaneously:
+        //
+        //   L394 — `is_masked_in -> bool` replaced with false. If
+        //          is_masked_in always returned false, masking would
+        //          collapse to strictly-equal-other-conditions, i.e.
+        //          become unique-cause. The counts below would
+        //          converge.
+        //
+        //   L400 — `==` replaced with `!=` in the result-equality
+        //          check inside is_masked_in. That inverts which
+        //          conditions are reported masked, which perturbs
+        //          the masking-pair count for 'a' away from the
+        //          expected value.
+        //
+        // For `a && (b || c)`, the unique-cause set for 'a' is
+        // exactly the three pairs with b and c held constant:
+        //
+        //   (F,F,T) <-> (T,F,T)
+        //   (F,T,F) <-> (T,T,F)
+        //   (F,T,T) <-> (T,T,T)
+        //
+        // The masking set includes those three *and* at least
+        // (F,F,T) <-> (T,T,T) with b masked in both rows. So the
+        // masking count is strictly greater than the unique-cause
+        // count for `a`.
+        let tree = and_or_tree();
+        let masking = analyze_with_variant(&tree, Variant::Masking);
+        let unique_cause = analyze_with_variant(&tree, Variant::UniqueCause);
+
+        let m_count = masking.independence_pairs["a"].len();
+        let uc_count = unique_cause.independence_pairs["a"].len();
+        assert!(
+            m_count > uc_count,
+            "expected masking (`{m_count}`) to admit more pairs for `a` than unique-cause (`{uc_count}`)"
+        );
+    }
 }
