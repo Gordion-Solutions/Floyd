@@ -375,4 +375,244 @@ fn decide(_1: bool, _2: bool) -> bool {
         assert_eq!(map.functions.len(), 1);
         assert!(map.functions[0].conditions.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 1.5 mutation-gap closures (correlate.rs).
+    //
+    // Baseline on 2026-10-27 reported 13 surviving mutants = 40.9%
+    // kill rate (target 85%). Gaps clustered in:
+    //
+    //   observation_from_coverage:
+    //     L133 — function -> None
+    //     L137 — `> 0` on true_count mutated to ==/</>=
+    //     L139 — `> 0` on false_count mutated to ==/</>=
+    //
+    //   spans_match:
+    //     L172 — `==` on coord tuple -> !=
+    //     L172 — both `||` mutated to &&
+    //
+    //   provenance_for:
+    //     L184 — function -> Default::default()
+    //
+    //   find_matching_function:
+    //     L248 L249 — `||`s in match-strategy chain mutated to &&
+    //
+    // Tests below exercise each gap by directly invoking the private
+    // functions (same-module access) with crafted inputs.
+    // -----------------------------------------------------------------------
+
+    use crate::decision;
+
+    /// Mutate `COVERAGE_JSON` so condition `a`'s branch has the given
+    /// true/false counts. Preserves everything else.
+    fn coverage_with_a_counts(true_count: u64, false_count: u64) -> String {
+        let needle = "[2, 5, 2, 6, 1, 1, 0, 0, 4]";
+        let replacement = format!("[2, 5, 2, 6, {true_count}, {false_count}, 0, 0, 4]");
+        COVERAGE_JSON.replace(needle, &replacement)
+    }
+
+    #[test]
+    fn observation_from_coverage_returns_some_for_valid_input() {
+        // Kills L133 — observation_from_coverage -> None.
+        let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
+        let cov = profile::parse(COVERAGE_JSON).expect("coverage parses");
+        let tree = decision::decompose(&mir);
+        let obs = observation_from_coverage(Some("t".to_string()), &mir, &cov, &tree);
+        assert!(
+            obs.is_some(),
+            "observation_from_coverage must return Some for valid input"
+        );
+        let obs = obs.unwrap();
+        assert_eq!(obs.test_name.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn observation_sets_condition_true_when_only_true_count_positive() {
+        // Kills L137 (> 0 on true_count mutated to ==/</>=).
+        //   `== 0` or `< 0` would skip the branch, leaving `a` out of inputs
+        //     (or falling through to the false branch).
+        //   `>= 0` is always true, which would set `a=true` even for 0 counts
+        //     — same observable result on true=1, but see the next test.
+        let cov = profile::parse(&coverage_with_a_counts(1, 0)).expect("coverage parses");
+        let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
+        let tree = decision::decompose(&mir);
+        let obs = observation_from_coverage(Some("t".to_string()), &mir, &cov, &tree).unwrap();
+        assert_eq!(obs.inputs.get("a"), Some(&true));
+    }
+
+    #[test]
+    fn observation_sets_condition_false_when_only_false_count_positive() {
+        // Kills L139 (> 0 on false_count mutated to ==/</>=).
+        // Must also fail true_count branch (= 0 so > 0 is false), and
+        // succeed false branch (= 1 so > 0 is true).
+        let cov = profile::parse(&coverage_with_a_counts(0, 1)).expect("coverage parses");
+        let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
+        let tree = decision::decompose(&mir);
+        let obs = observation_from_coverage(Some("t".to_string()), &mir, &cov, &tree).unwrap();
+        assert_eq!(obs.inputs.get("a"), Some(&false));
+    }
+
+    #[test]
+    fn observation_omits_condition_when_both_counts_are_zero() {
+        // Kills the `>= 0` variant of L137/L139 — would wrongly insert
+        // a=true even when nothing was observed. Original behaviour:
+        // short-circuited condition is omitted entirely.
+        let cov = profile::parse(&coverage_with_a_counts(0, 0)).expect("coverage parses");
+        let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
+        let tree = decision::decompose(&mir);
+        // If observation_from_coverage returns Some, 'a' must not be
+        // in inputs. (If it returns None because evaluate_partial
+        // can't proceed without a value for 'a', the invariant still
+        // holds vacuously.)
+        if let Some(obs) = observation_from_coverage(Some("t".to_string()), &mir, &cov, &tree) {
+            assert!(
+                !obs.inputs.contains_key("a"),
+                "both-zero branch must not insert the condition"
+            );
+        }
+    }
+
+    #[test]
+    fn spans_match_requires_identical_coordinates() {
+        // Kills L172 col 12 (== -> !=) on the coord-tuple equality
+        // guard. Different line/col must return false.
+        let base = SourceSpan {
+            file: "x".to_string(),
+            start_line: 1,
+            start_col: 5,
+            end_line: 1,
+            end_col: 6,
+        };
+        let same = base.clone();
+        let diff_line = SourceSpan {
+            start_line: 2,
+            ..base.clone()
+        };
+        let diff_col = SourceSpan {
+            start_col: 10,
+            ..base.clone()
+        };
+        assert!(spans_match(&base, &same));
+        assert!(!spans_match(&base, &diff_line));
+        assert!(!spans_match(&base, &diff_col));
+    }
+
+    #[test]
+    fn spans_match_accepts_absolute_vs_relative_paths_both_directions() {
+        // Kills BOTH L172 `||` -> `&&` mutations:
+        //   first  || (col 22): forces (a==b && a.ends_with(b)) || b.ends_with(a).
+        //   second || (col 51): forces a==b || (a.ends_with(b) && b.ends_with(a)).
+        //
+        // The absolute/relative suffix match (which the engine
+        // relies on because MIR emits relative paths and llvm-cov
+        // emits absolute) exercises BOTH suffix branches. Test both
+        // directions so each `||` mutation is caught.
+        let abs = SourceSpan {
+            file: "/abs/project/src/lib.rs".to_string(),
+            start_line: 1,
+            start_col: 1,
+            end_line: 1,
+            end_col: 2,
+        };
+        let rel = SourceSpan {
+            file: "src/lib.rs".to_string(),
+            ..abs.clone()
+        };
+        // abs.file.ends_with(rel.file) = true; rel.file.ends_with(abs.file) = false.
+        assert!(spans_match(&abs, &rel), "abs vs rel must match");
+        // Flipped: rel.file.ends_with(abs.file) = false; abs.file.ends_with(rel.file) = true.
+        assert!(spans_match(&rel, &abs), "rel vs abs must match");
+
+        // Unrelated path must not match even with equal coords.
+        let other = SourceSpan {
+            file: "other/path.rs".to_string(),
+            ..abs.clone()
+        };
+        assert!(!spans_match(&abs, &other));
+    }
+
+    #[test]
+    fn provenance_for_populates_non_default_fields() {
+        // Kills L184 (provenance_for -> Default::default() which
+        // leaves every field None). Asserts the real impl returns
+        // populated values.
+        let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        let prov = provenance_for(f);
+        assert_eq!(prov.function_name.as_deref(), Some("decide"));
+        assert!(
+            prov.source_file.is_some(),
+            "source_file must be populated from span data"
+        );
+        assert!(prov.line.is_some(), "line must be populated from span data");
+    }
+
+    /// Build a minimal in-memory `CoverageReport` with one named
+    /// function entry (no branches). Enough to exercise the
+    /// matching strategies in `find_matching_function`.
+    fn coverage_with_name(fn_name: &str) -> crate::profile::CoverageReport {
+        crate::profile::CoverageReport {
+            functions: vec![crate::profile::FunctionCoverage {
+                name: fn_name.to_string(),
+                count: 0,
+                filenames: vec![],
+                branches: vec![],
+            }],
+        }
+    }
+
+    #[test]
+    fn find_matching_function_matches_each_strategy_independently() {
+        // Kills L248 and L249 `||` -> `&&` by exercising inputs
+        // specifically chosen so that each `||` can be observed in
+        // isolation.
+        //
+        // The match chain is:
+        //   A = trimmed == mir_name
+        //   B = trimmed.ends_with("::mir_name")
+        //   C = trimmed.rsplit("::").next() == Some(mir_name)
+        //
+        // When mir_name contains no "::", C=T implies A OR B, so
+        // the three predicates aren't independent and either `||`
+        // mutation collapses to a provably-equivalent expression on
+        // such inputs. To force independence, we use mir_name values
+        // that themselves contain "::".
+        //
+        //   Kill L248 (second `||` -> `&&`): A=T, B=F, C=F.
+        //     mir_name = "a::b", cov.name = "a::b".
+        //     Original: T||F||F = T. Mutated: (T&&F)||F = F.
+        //
+        //   Kill L249 (third `||` -> `&&`): A=F, B=T, C=F.
+        //     mir_name = "a::b", cov.name = "foo::a::b".
+        //     Original: F||T||F = T. Mutated: F||(T&&F) = F.
+
+        // Baseline cases: common Floyd shapes must match.
+        let cov1 = coverage_with_name("plain_function");
+        assert!(find_matching_function("plain_function", &cov1).is_some());
+
+        let cov2 = coverage_with_name("some_crate::module::target");
+        assert!(find_matching_function("target", &cov2).is_some());
+
+        // L248-killer: mir_name = "a::b", cov.name = "a::b".
+        // Exact match (A), but B and C both false because mir_name
+        // itself contains "::".
+        let cov3 = coverage_with_name("a::b");
+        assert!(
+            find_matching_function("a::b", &cov3).is_some(),
+            "exact-match must work even when mir_name contains '::'"
+        );
+
+        // L249-killer: mir_name = "a::b", cov.name = "foo::a::b".
+        // B true (ends with "::a::b"), A false, C false (last
+        // segment is "b" not "a::b").
+        let cov4 = coverage_with_name("foo::a::b");
+        assert!(
+            find_matching_function("a::b", &cov4).is_some(),
+            "`::`-suffix match must work for a qualified mir_name"
+        );
+
+        // Negative control: nothing matches.
+        let cov5 = coverage_with_name("unrelated");
+        assert!(find_matching_function("target", &cov5).is_none());
+    }
 }

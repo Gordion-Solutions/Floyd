@@ -10,20 +10,13 @@
 # justification; genuine test-suite gaps are closed by adding a
 # targeted unit test.
 
-# Timeout per mutant. 60s is generous for Floyd's test suite but
-# protects against infinite loops in a mutated test.
-timeout = 60
-
-# Don't shuffle: deterministic ordering makes CI output
-# comparable between runs for diff review.
-shuffle = false
-
 # Test timeout multiplier: how many times the baseline test
 # duration a single mutant run may take before being considered
 # a timeout. Default is 5; Floyd's test suite is fast enough
 # that 3x is tight.
-test_timeout_multiplier = 3
+timeout_multiplier = 3.0
 
-# Minimum test time to use for the baseline (prevents
-# zero-second baseline producing silly timeout values).
+# Minimum test time (seconds) to use as the lower bound on the
+# auto-set timeout — prevents a zero-second baseline from
+# producing silly timeout values.
 minimum_test_timeout = 20
