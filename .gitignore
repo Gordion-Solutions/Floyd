@@ -12,6 +12,10 @@
 # Backup files from cargo
 **/*.rs.bk
 
+# cargo-mutants output (ephemeral per-run artefacts)
+mutants.out/
+mutants.out.old/
+
 # OS
 .DS_Store
 Thumbs.db

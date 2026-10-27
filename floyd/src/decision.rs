@@ -2088,4 +2088,83 @@ fn decide(_1: Option<bool>, _2: bool) -> Option<bool> {
         let max_id = f.blocks.iter().map(|b| b.id).max().unwrap_or(0);
         assert!(decompose_from_block(f, max_id + 999).is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 1.5 mutation-gap closures (decision.rs).
+    //
+    // Baseline on 2026-10-27 reported 21 surviving mutants out of
+    // 122 viable = 82.8% kill rate (target 90%). Gaps clustered in:
+    //
+    //   evaluate_partial (3 gaps at L135)
+    //   extract_terminal_value (4 gaps at L740 L753)
+    //   resolve_switchint_discr_alias (3 gaps at L835 L838 L842)
+    //   try_match_from_block (1 gap at L428)
+    //   try_match_try_prefix (4 gaps at L556 L565 L571 L575)
+    //   try_if_let_from_block (3 gaps at L630 L640 L656)
+    //   downcast_variant_for (1 gap at L689)
+    //   synthesize_compare_name (1 gap at L860)
+    //
+    // The low-hanging fruit for an API-level test is evaluate_partial
+    // (public, no MIR crafting needed). The guards buried in private
+    // decomposition helpers mostly fire only on specific MIR shapes;
+    // they are better closed by widening the corpus with new patterns
+    // (Phase 6.3 in the ROADMAP) than by writing white-box unit tests
+    // against the private signatures. Four tests here close the
+    // evaluate_partial gaps; the remaining decomposer-internal guards
+    // are tracked as follow-up and will be driven down by added
+    // corpus patterns.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn evaluate_partial_bare_condition_returns_input_value() {
+        // Kills part of L135 (-> Some(false)): bare condition with
+        // input=true must return Some(true).
+        let node = cond("x");
+        let mut inputs = std::collections::BTreeMap::new();
+        inputs.insert("x".to_string(), true);
+        assert_eq!(evaluate_partial(&node, &inputs), Some(true));
+        inputs.insert("x".to_string(), false);
+        assert_eq!(evaluate_partial(&node, &inputs), Some(false));
+    }
+
+    #[test]
+    fn evaluate_partial_constant_returns_its_value() {
+        // Kills part of L135 (-> Some(true) or Some(false)): const
+        // leaves must honour their stored value.
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(evaluate_partial(&const_(true), &empty), Some(true));
+        assert_eq!(evaluate_partial(&const_(false), &empty), Some(false));
+    }
+
+    #[test]
+    fn evaluate_partial_returns_none_when_cond_unobserved() {
+        // Kills part of L135 (-> Some(true)/Some(false)): an Ite
+        // whose cond is not in inputs must return None.
+        let node = ite("x", cond("y"), cond("z"));
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(evaluate_partial(&node, &empty), None);
+    }
+
+    #[test]
+    fn evaluate_partial_evaluates_and_tree_with_short_circuit() {
+        // Kills L135 (-> None, -> Some(true), -> Some(false)) via
+        // multiple observable outcomes:
+        //   a=T, b=T  -> T
+        //   a=T, b=F  -> F
+        //   a=F       -> F  (b short-circuited, not in inputs)
+        //
+        // No single Some(_) replacement can satisfy all three; nor
+        // can None. The three assertions together force an honest
+        // implementation.
+        let tree = ite("a", cond("b"), const_(false));
+        let mut i = std::collections::BTreeMap::new();
+        i.insert("a".to_string(), true);
+        i.insert("b".to_string(), true);
+        assert_eq!(evaluate_partial(&tree, &i), Some(true));
+        i.insert("b".to_string(), false);
+        assert_eq!(evaluate_partial(&tree, &i), Some(false));
+        i.insert("a".to_string(), false);
+        i.remove("b");
+        assert_eq!(evaluate_partial(&tree, &i), Some(false));
+    }
 }
