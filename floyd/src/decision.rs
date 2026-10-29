@@ -739,7 +739,10 @@ fn is_coverage_branch_counter(
     // The discriminant is assigned by a statement in THIS block.
     // Without this check we would absorb switchInts on inherited
     // values (where the counter interpretation does not apply).
-    block.statements.iter().any(|stmt| statement_writes(stmt, discr))
+    block
+        .statements
+        .iter()
+        .any(|stmt| statement_writes(stmt, discr))
 }
 
 /// Does `stmt` write to any local via a value-producing assignment?
