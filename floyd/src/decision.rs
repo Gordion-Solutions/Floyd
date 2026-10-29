@@ -693,6 +693,97 @@ fn downcast_variant_for(b: &MirBlock, scrutinee: LocalId) -> Option<String> {
     })
 }
 
+/// Does this block's terminator look like a rustc
+/// `-Zcoverage-options=branch,condition` branch counter rather than a
+/// logical boolean switchInt?
+///
+/// The marker shape is `switchInt(_X) -> [0: A, otherwise: B]` where
+/// `A` and `B` both have terminator `goto <common>`, and `_X` is
+/// assigned by a statement in the current block. When this holds,
+/// the switchInt is instrumentation emitted by rustc to count the
+/// two outcomes of `_X` for coverage purposes — it does not
+/// discriminate real control flow, so decomposition should treat
+/// the assignment to `_X` as the block's terminal value.
+fn is_coverage_branch_counter(
+    block: &MirBlock,
+    discr: LocalId,
+    targets: &[(u128, BlockId)],
+    otherwise: BlockId,
+    f: &MirFunction,
+) -> bool {
+    // Boolean shape: a single explicit `0` arm plus `otherwise`.
+    if targets.len() != 1 || targets[0].0 != 0 {
+        return false;
+    }
+    // Both arms immediately `goto` the same successor.
+    let then_succ = goto_target(f, otherwise);
+    let else_succ = goto_target(f, targets[0].1);
+    if then_succ.is_none() || then_succ != else_succ {
+        return false;
+    }
+    // Both arms must be pure instrumentation — no value-producing
+    // assignments. In rustc's branch-counter emission the arms
+    // contain only a `Coverage::VirtualCounter` statement plus the
+    // `goto`. Without this guard, legitimate shapes like
+    // `_3 = Gt(_1, const 50); switchInt(_3) -> [0: {_0 = const
+    // false; goto X}, otherwise: {_0 = copy _2; goto X}]` — a real
+    // inline-comparison `&&` — would be absorbed, hiding the
+    // decision from the decomposer.
+    for &arm_id in &[otherwise, targets[0].1] {
+        if let Some(arm) = f.blocks.iter().find(|b| b.id == arm_id) {
+            if arm.statements.iter().any(is_value_producing_assign) {
+                return false;
+            }
+        }
+    }
+    // The discriminant is assigned by a statement in THIS block.
+    // Without this check we would absorb switchInts on inherited
+    // values (where the counter interpretation does not apply).
+    block.statements.iter().any(|stmt| statement_writes(stmt, discr))
+}
+
+/// Does `stmt` write to any local via a value-producing assignment?
+/// Used to distinguish coverage-instrumentation arms (which only
+/// contain `Coverage::VirtualCounter` + `goto`) from legitimate
+/// branch arms (which assign to `_0` or another local).
+fn is_value_producing_assign(stmt: &MirStatement) -> bool {
+    matches!(
+        stmt,
+        MirStatement::AssignConstBool { .. }
+            | MirStatement::AssignCopy { .. }
+            | MirStatement::AssignBinaryCompare { .. }
+            | MirStatement::AssignCaptureRead { .. }
+            | MirStatement::AssignDiscriminant { .. }
+            | MirStatement::AssignDowncast { .. }
+    )
+}
+
+/// Return the `goto` target of `block_id` if its terminator is a
+/// plain `Goto`, else `None`.
+fn goto_target(f: &MirFunction, block_id: BlockId) -> Option<BlockId> {
+    f.blocks.iter().find(|b| b.id == block_id).and_then(|b| {
+        if let MirTerminator::Goto { target, .. } = &b.terminator {
+            Some(*target)
+        } else {
+            None
+        }
+    })
+}
+
+/// Does `stmt` write to local `dst_local`? Covers every statement
+/// kind the decomposer treats as a value-producing assignment.
+fn statement_writes(stmt: &MirStatement, dst_local: LocalId) -> bool {
+    match stmt {
+        MirStatement::AssignConstBool { dst, .. }
+        | MirStatement::AssignCopy { dst, .. }
+        | MirStatement::AssignBinaryCompare { dst, .. }
+        | MirStatement::AssignCaptureRead { dst, .. }
+        | MirStatement::AssignDiscriminant { dst, .. }
+        | MirStatement::AssignDowncast { dst, .. } => *dst == dst_local,
+        _ => false,
+    }
+}
+
 /// Extract a leaf [`Node`] from a terminal block.
 ///
 /// Looks for an `AssignConstBool` or `AssignCopy` statement that sets
@@ -709,7 +800,29 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
     // would short-circuit as a terminal value, hiding the `&&` from
     // the decomposer.
     let in_block_switchint = match &block.terminator {
-        MirTerminator::SwitchInt { discr, .. } => Some(*discr),
+        MirTerminator::SwitchInt {
+            discr,
+            targets,
+            otherwise,
+            ..
+        } => {
+            // Coverage-instrumentation branch counter:
+            // `switchInt(_X) -> [0: A, otherwise: B]` where both A
+            // and B `goto` the same successor. Rustc inserts this
+            // when `-Cinstrument-coverage` runs with
+            // `-Zcoverage-options=branch,condition` to count the
+            // two outcomes of a boolean sub-expression — it has no
+            // effect on logical control flow. Classify it as "not
+            // a real switchInt on `_X`" so the preceding
+            // assignment to `_X` in this block (`_0 = copy _4;`
+            // on the terminal leaf of an `&&`/`||` chain) is
+            // accepted as the terminal value.
+            if is_coverage_branch_counter(block, *discr, targets, *otherwise, f) {
+                None
+            } else {
+                Some(*discr)
+            }
+        }
         _ => None,
     };
     let downstream_switchint = match &block.terminator {
@@ -958,6 +1071,46 @@ fn decide(_1: bool, _2: bool) -> bool {
 }
 "#;
 
+    /// `rustc --emit=mir` output for `fn decide(a, b) -> bool { a && b }`
+    /// as emitted with `-Zcoverage-options=branch,condition` — the
+    /// terminal `b` leaf has an extra `switchInt(_0)` branch counter
+    /// whose arms both `goto` a common successor without touching
+    /// `_0`. The engine should treat it as pure instrumentation and
+    /// recover the same ITE as the un-instrumented shape.
+    const DECIDE_COVERAGE_COUNTER_AND_MIR: &str = r#"
+fn decide(_1: bool, _2: bool) -> bool {
+    debug a => _1;
+    debug b => _2;
+    let mut _0: bool;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = copy _2;
+        switchInt(copy _0) -> [0: bb4, otherwise: bb3];
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb5;
+    }
+
+    bb3: {
+        goto -> bb5;
+    }
+
+    bb4: {
+        goto -> bb5;
+    }
+
+    bb5: {
+        return;
+    }
+}
+"#;
+
     /// `rustc --emit=mir` output for `fn decide(a, b) -> bool { a || b }`.
     const DECIDE_OR_MIR: &str = r#"
 fn decide(_1: bool, _2: bool) -> bool {
@@ -1099,6 +1252,26 @@ fn decide(_1: bool, _2: bool, _3: bool) -> bool {
         let tree = decompose(&mir);
         assert_eq!(tree.decisions.len(), 1);
         assert_eq!(tree.decisions[0], ite("a", const_(false), cond("b")));
+    }
+
+    #[test]
+    fn decompose_sees_through_coverage_branch_counter_on_terminal_leaf() {
+        // `a && b` compiled with `-Zcoverage-options=branch,condition`.
+        // The terminal `b` leaf becomes `_0 = copy _2; switchInt(_0)
+        // -> [0: bb4, otherwise: bb3]` with `bb3` and `bb4` both just
+        // `goto bb5`. That inner switchInt is a rustc coverage branch
+        // counter, not a logical switch — the decomposer treats it
+        // as if the block ended `goto bb5` and recovers the same ITE
+        // as the un-instrumented shape. Without this handling,
+        // coverage-instrumented MIR for any pure-boolean function
+        // whose body IS the returned expression declines to
+        // decompose (production-visible: no user running `cargo
+        // floyd test` on `pub fn foo(...) -> bool { ... }` would
+        // see MC/DC output).
+        let mir = mir::parse_text(DECIDE_COVERAGE_COUNTER_AND_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(tree.decisions[0], ite("a", cond("b"), const_(false)));
     }
 
     /// `rustc --emit=mir` output for
