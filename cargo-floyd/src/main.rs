@@ -26,7 +26,10 @@ use floyd::masking::{
     Variant,
 };
 use floyd::mir;
+use floyd::profile;
 use floyd::runner;
+
+mod selector;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -239,9 +242,7 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
     };
 
     let mut all_tests = Vec::new();
-    let mut all_observations = Vec::new();
-    let mut chosen_tree: Option<floyd::DecisionTree> = None;
-    let mut chosen_provenance: Option<floyd::DecisionProvenance> = None;
+    let mut candidates: Vec<selector::Candidate> = Vec::new();
 
     for (art_idx, artifact) in build.test_artifacts.iter().enumerate() {
         let mir_text = match std::fs::read_to_string(&artifact.mir_path) {
@@ -252,24 +253,30 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
             Ok(m) => m,
             Err(_) => continue,
         };
-        let tree = decision::decompose(&mir);
-        if tree.decisions.is_empty() {
+
+        // Collect every function in this MIR whose body is a
+        // decomposable decision. (Replaces the previous `pick the
+        // first non-empty tree` logic — we score candidates by
+        // observation count at the end.)
+        let mut artifact_candidates: Vec<(floyd::DecisionTree, floyd::DecisionProvenance)> =
+            Vec::new();
+        for f in &mir.functions {
+            if let Some(node) = decision::decompose_function(f) {
+                artifact_candidates.push((
+                    floyd::DecisionTree {
+                        decisions: vec![node],
+                    },
+                    correlate::provenance_for(f),
+                ));
+            }
+        }
+        if artifact_candidates.is_empty() {
             continue;
         }
-        // Phase 1 first cut: take the first non-empty decision tree as
-        // THE decision under analysis. Multi-decision aggregation lands
-        // in a future release. Record provenance (function name +
-        // source span) of the first function that contributed a
-        // recognised decision.
-        if chosen_tree.is_none() {
-            chosen_tree = Some(tree.clone());
-            chosen_provenance = mir
-                .functions
-                .iter()
-                .find(|f| decision::decompose_function(f).is_some())
-                .map(correlate::provenance_for);
-        }
 
+        // Run every test ONCE and keep each test's parsed coverage,
+        // then correlate per candidate against the shared coverage
+        // set. Avoids re-running tests per candidate (expensive).
         let tests = match runner::list_tests(&artifact.binary_path) {
             Ok(t) => t,
             Err(e) => {
@@ -277,7 +284,8 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
                 return ExitCode::from(1);
             }
         };
-
+        let mut per_test_coverage: Vec<(String, profile::CoverageReport)> =
+            Vec::with_capacity(tests.len());
         for (test_idx, test_name) in tests.iter().enumerate() {
             let prof = workdir.join(format!("cov-{art_idx:03}-{test_idx:03}.profraw"));
             if let Err(e) = runner::run_test_isolated(&artifact.binary_path, test_name, &prof) {
@@ -297,20 +305,32 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
                     return ExitCode::from(1);
                 }
             };
-            if let Some(obs) = correlate::observation_from_coverage(
-                Some(test_name.clone()),
-                &mir,
-                &coverage,
-                &tree,
-            ) {
-                all_observations.push(obs);
-            }
+            per_test_coverage.push((test_name.clone(), coverage));
             all_tests.push(test_name.clone());
+        }
+
+        for (tree, prov) in artifact_candidates {
+            let mut obs = Vec::new();
+            for (test_name, coverage) in &per_test_coverage {
+                if let Some(o) = correlate::observation_from_coverage(
+                    Some(test_name.clone()),
+                    &mir,
+                    coverage,
+                    &tree,
+                ) {
+                    obs.push(o);
+                }
+            }
+            candidates.push(selector::Candidate {
+                tree,
+                provenance: prov,
+                observations: obs,
+            });
         }
     }
 
-    let tree = match chosen_tree {
-        Some(t) => t,
+    let chosen = match selector::pick_best(candidates) {
+        Some(c) => c,
         None => {
             eprintln!(
                 "cargo-floyd: no recognised decisions in any test target. \
@@ -321,8 +341,10 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
             return ExitCode::from(1);
         }
     };
-    let mut analysis = masking::analyze_with_runtime(&tree, &all_observations, Variant::Masking);
-    analysis.provenance = chosen_provenance;
+    let all_observations = chosen.observations.clone();
+    let mut analysis =
+        masking::analyze_with_runtime(&chosen.tree, &all_observations, Variant::Masking);
+    analysis.provenance = Some(chosen.provenance);
 
     match format {
         Format::Text => {
@@ -405,8 +427,6 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
             return ExitCode::from(1);
         }
     };
-    let tree = decision::decompose(&mir);
-
     // 4. Enumerate the binary's tests.
     let tests = match runner::list_tests(&compiled.binary_path) {
         Ok(t) => t,
@@ -423,8 +443,23 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
         return ExitCode::from(1);
     }
 
-    // 5. Run each test individually, build a ConditionObservation.
-    let mut observations = Vec::new();
+    // 4b. Collect per-function candidates (smarter selector) and
+    //     pre-compute coverage per test — same shape as the cargo-mode path.
+    let mut artifact_candidates: Vec<(floyd::DecisionTree, floyd::DecisionProvenance)> = Vec::new();
+    for f in &mir.functions {
+        if let Some(node) = decision::decompose_function(f) {
+            artifact_candidates.push((
+                floyd::DecisionTree {
+                    decisions: vec![node],
+                },
+                correlate::provenance_for(f),
+            ));
+        }
+    }
+
+    // 5. Run each test individually.
+    let mut per_test_coverage: Vec<(String, profile::CoverageReport)> =
+        Vec::with_capacity(tests.len());
     for (idx, test_name) in tests.iter().enumerate() {
         let prof = workdir.join(format!("cov-{idx:03}.profraw"));
         if let Err(e) = runner::run_test_isolated(&compiled.binary_path, test_name, &prof) {
@@ -444,21 +479,41 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
                 return ExitCode::from(1);
             }
         };
-        if let Some(obs) =
-            correlate::observation_from_coverage(Some(test_name.clone()), &mir, &coverage, &tree)
-        {
-            observations.push(obs);
-        }
+        per_test_coverage.push((test_name.clone(), coverage));
     }
 
-    // 6. Combined static + runtime analysis, with provenance of the
-    //    first function that produced a recognised decision.
-    let mut analysis = masking::analyze_with_runtime(&tree, &observations, Variant::Masking);
-    analysis.provenance = mir
-        .functions
-        .iter()
-        .find(|f| decision::decompose_function(f).is_some())
-        .map(correlate::provenance_for);
+    // Build candidates with per-tree observations.
+    let mut candidates: Vec<selector::Candidate> = Vec::new();
+    for (tree, prov) in artifact_candidates {
+        let mut obs = Vec::new();
+        for (test_name, coverage) in &per_test_coverage {
+            if let Some(o) =
+                correlate::observation_from_coverage(Some(test_name.clone()), &mir, coverage, &tree)
+            {
+                obs.push(o);
+            }
+        }
+        candidates.push(selector::Candidate {
+            tree,
+            provenance: prov,
+            observations: obs,
+        });
+    }
+
+    // 6. Pick the best candidate, run the analysis.
+    let chosen = match selector::pick_best(candidates) {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "cargo-floyd: no recognised decisions in {}",
+                source.display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let observations = chosen.observations.clone();
+    let mut analysis = masking::analyze_with_runtime(&chosen.tree, &observations, Variant::Masking);
+    analysis.provenance = Some(chosen.provenance);
 
     match format {
         Format::Text => print_runtime_report(source, &tests, &observations, &analysis),
