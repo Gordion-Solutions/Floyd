@@ -20,7 +20,7 @@
 //!
 //! ## Status
 //!
-//! v0.2.6. The `cargo floyd test` workflow runs end-to-end on real
+//! v0.2.7. The `cargo floyd test` workflow runs end-to-end on real
 //! cargo projects, recovering boolean decisions built from `&&`,
 //! `||`, `!`, inline comparisons (`>`, `<`, `==`, `!=`, `>=`, `<=`),
 //! `if let` with a binding, the `?` operator (skip-through),
