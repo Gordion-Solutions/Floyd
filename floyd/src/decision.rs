@@ -745,8 +745,13 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
             MirStatement::AssignBinaryCompare {
                 dst, op, lhs, rhs, ..
             } if !feeds_switchint(*dst) => {
+                // Issue #18: if the compare has an unnamed-local
+                // operand, compare_condition_name returns None and we
+                // decline the function. (Returning None from an
+                // extract_terminal_value branch declines the whole
+                // extraction path.)
                 return Some(Node::Condition {
-                    name: compare_condition_name(*op, lhs, rhs, f),
+                    name: compare_condition_name(*op, lhs, rhs, f)?,
                 });
             }
             MirStatement::AssignCaptureRead { dst, holds_ref, .. }
@@ -857,7 +862,7 @@ fn synthesize_compare_name(block: &MirBlock, discr: LocalId, f: &MirFunction) ->
     block.statements.iter().find_map(|s| match s {
         MirStatement::AssignBinaryCompare {
             dst, op, lhs, rhs, ..
-        } if *dst == discr => Some(compare_condition_name(*op, lhs, rhs, f)),
+        } if *dst == discr => compare_condition_name(*op, lhs, rhs, f),
         _ => None,
     })
 }
@@ -865,26 +870,33 @@ fn synthesize_compare_name(block: &MirBlock, discr: LocalId, f: &MirFunction) ->
 /// Synthesize a human-readable condition name for an inline
 /// comparison like `speed > 50` or `a < b`.
 ///
-/// Locals render via their debug name (`speed`, `a`); unnamed
-/// locals fall back to `_<N>`. Constants render via their type-
-/// stripped form (so `50_i32` reads as `50`).
-fn compare_condition_name(op: CompareOp, lhs: &Operand, rhs: &Operand, f: &MirFunction) -> String {
-    format!(
+/// Returns `None` if either operand is an un-named MIR local
+/// (Issue #18): surfacing `_3 == _4`-style names in reports is
+/// unanalysable and would mislead a user. The None propagates up
+/// through `synthesize_compare_name` to the decomposer, which
+/// then declines the function — "no decision recovered" is the
+/// correct output here.
+fn compare_condition_name(
+    op: CompareOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    f: &MirFunction,
+) -> Option<String> {
+    Some(format!(
         "{} {} {}",
-        operand_display(lhs, f),
+        operand_display(lhs, f)?,
         op.as_source_str(),
-        operand_display(rhs, f)
-    )
+        operand_display(rhs, f)?,
+    ))
 }
 
-fn operand_display(op: &Operand, f: &MirFunction) -> String {
+/// Render a MIR operand as a human-readable string, or return `None`
+/// if it would be a MIR-internal `_N` placeholder (unnamed local).
+/// See [`compare_condition_name`] for why the None short-circuits.
+fn operand_display(op: &Operand, f: &MirFunction) -> Option<String> {
     match op {
-        Operand::Copy(id) | Operand::Move(id) => f
-            .debug_names
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| format!("_{id}")),
-        Operand::Const(_) => op.const_display_value().to_string(),
+        Operand::Copy(id) | Operand::Move(id) => f.debug_names.get(id).cloned(),
+        Operand::Const(_) => Some(op.const_display_value().to_string()),
     }
 }
 
@@ -2076,6 +2088,45 @@ fn decide(_1: Option<bool>, _2: bool) -> Option<bool> {
         let via_direct = decompose_from_block(f, entry_id);
         assert!(via_wrapper.is_some());
         assert_eq!(via_wrapper, via_direct);
+    }
+
+    #[test]
+    fn operand_display_returns_name_for_debug_named_local() {
+        // Named local renders via debug_names.
+        let mut f = MirFunction::default();
+        f.debug_names.insert(5, "speed".to_string());
+        let op = Operand::Copy(5);
+        assert_eq!(operand_display(&op, &f), Some("speed".to_string()));
+    }
+
+    #[test]
+    fn operand_display_returns_none_for_unnamed_local() {
+        // Issue #18: unnamed local (no debug_names entry) must
+        // return None rather than falling back to .
+        let f = MirFunction::default();
+        let op = Operand::Copy(3);
+        assert_eq!(operand_display(&op, &f), None);
+    }
+
+    #[test]
+    fn compare_condition_name_declines_on_unnamed_operand() {
+        // Issue #18: if either operand lacks a debug name,
+        // compare_condition_name returns None so the decomposer
+        // declines the whole function.
+        let mut f = MirFunction::default();
+        f.debug_names.insert(1, "a".to_string());
+        // One named, one unnamed.
+        let got = compare_condition_name(
+            CompareOp::Eq,
+            &Operand::Copy(1),
+            &Operand::Copy(2), // not in debug_names
+            &f,
+        );
+        assert_eq!(got, None);
+        // Both named — succeeds.
+        f.debug_names.insert(2, "b".to_string());
+        let got = compare_condition_name(CompareOp::Eq, &Operand::Copy(1), &Operand::Copy(2), &f);
+        assert_eq!(got.as_deref(), Some("a == b"));
     }
 
     #[test]
