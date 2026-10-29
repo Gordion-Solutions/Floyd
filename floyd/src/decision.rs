@@ -732,6 +732,28 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
     let feeds_switchint =
         |dst: LocalId| in_block_switchint == Some(dst) || downstream_switchint == Some(dst);
 
+    // Terminal-block gate: an assignment is only a "terminal
+    // value" when control flow does not continue past this block
+    // via a function call. `Call` terminators write the call's
+    // return into their destination AFTER running — any
+    // `AssignCopy` earlier in the block is argument prep, not the
+    // function's own return value. Without this gate, a block like
+    // `bb0: { _3 = copy (*_1); _2 = f(move _3) -> bb1; }` is
+    // misread as returning `_1`'s debug-name as a Condition leaf
+    // (semver's `ptr_as_str` regression: `debug repr => _1` was
+    // false-positively surfaced as a 1-condition decision).
+    //
+    // `Goto`, `Return`, `Unreachable`, and `SwitchInt` all keep
+    // the current-block assignments as either the terminal value
+    // (`Goto`/`Return`) or as discriminant setup (`SwitchInt`,
+    // handled via `feeds_switchint`), so they stay in scope.
+    if matches!(
+        &block.terminator,
+        MirTerminator::Call { .. } | MirTerminator::Other { .. }
+    ) {
+        return None;
+    }
+
     for stmt in &block.statements {
         match stmt {
             MirStatement::AssignConstBool { dst, value, .. } if !feeds_switchint(*dst) => {

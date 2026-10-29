@@ -241,10 +241,35 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
         }
     };
 
-    let mut all_tests = Vec::new();
-    let mut candidates: Vec<selector::Candidate> = Vec::new();
+    // Phase 4 cross-artifact correlation (Issue #13 follow-on):
+    //
+    // Candidates live in the MIR of ONE artifact (typically the lib's,
+    // for library functions). The tests exercising those candidates
+    // live in OTHER artifacts (the integration-test binaries). So we
+    // collect candidates per artifact, run tests per artifact, then
+    // correlate every candidate against every test's coverage —
+    // regardless of which artifact each came from. Without this,
+    // lib candidates always scored 0 observations because the lib
+    // artifact itself has no unit tests (e.g. semver's `ptr_as_str`).
 
-    for (art_idx, artifact) in build.test_artifacts.iter().enumerate() {
+    struct ArtifactInfo {
+        mir: floyd::Mir,
+        binary_path: std::path::PathBuf,
+        tests: Vec<String>,
+    }
+
+    struct RawCandidate {
+        tree: floyd::DecisionTree,
+        prov: floyd::DecisionProvenance,
+        artifact_idx: usize,
+    }
+
+    let mut artifacts: Vec<ArtifactInfo> = Vec::new();
+    let mut raw_candidates: Vec<RawCandidate> = Vec::new();
+    let mut all_tests: Vec<String> = Vec::new();
+
+    // Pass 1: parse MIR, enumerate tests, collect candidates per artifact.
+    for artifact in build.test_artifacts.iter() {
         let mir_text = match std::fs::read_to_string(&artifact.mir_path) {
             Ok(s) => s,
             Err(_) => continue,
@@ -253,30 +278,6 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
             Ok(m) => m,
             Err(_) => continue,
         };
-
-        // Collect every function in this MIR whose body is a
-        // decomposable decision. (Replaces the previous `pick the
-        // first non-empty tree` logic — we score candidates by
-        // observation count at the end.)
-        let mut artifact_candidates: Vec<(floyd::DecisionTree, floyd::DecisionProvenance)> =
-            Vec::new();
-        for f in &mir.functions {
-            if let Some(node) = decision::decompose_function(f) {
-                artifact_candidates.push((
-                    floyd::DecisionTree {
-                        decisions: vec![node],
-                    },
-                    correlate::provenance_for(f),
-                ));
-            }
-        }
-        if artifact_candidates.is_empty() {
-            continue;
-        }
-
-        // Run every test ONCE and keep each test's parsed coverage,
-        // then correlate per candidate against the shared coverage
-        // set. Avoids re-running tests per candidate (expensive).
         let tests = match runner::list_tests(&artifact.binary_path) {
             Ok(t) => t,
             Err(e) => {
@@ -284,11 +285,36 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
                 return ExitCode::from(1);
             }
         };
-        let mut per_test_coverage: Vec<(String, profile::CoverageReport)> =
-            Vec::with_capacity(tests.len());
-        for (test_idx, test_name) in tests.iter().enumerate() {
+        for t in &tests {
+            all_tests.push(t.clone());
+        }
+        let art_idx = artifacts.len();
+        for f in &mir.functions {
+            if let Some(node) = decision::decompose_function(f) {
+                raw_candidates.push(RawCandidate {
+                    tree: floyd::DecisionTree {
+                        decisions: vec![node],
+                    },
+                    prov: correlate::provenance_for(f),
+                    artifact_idx: art_idx,
+                });
+            }
+        }
+        artifacts.push(ArtifactInfo {
+            mir,
+            binary_path: artifact.binary_path.clone(),
+            tests,
+        });
+    }
+
+    // Pass 2: run every test across every artifact once; keep each
+    // test's parsed coverage. We intentionally do NOT dedupe test
+    // names across artifacts — two artifacts can share a test name.
+    let mut all_coverage: Vec<(String, profile::CoverageReport)> = Vec::new();
+    for (art_idx, info) in artifacts.iter().enumerate() {
+        for (test_idx, test_name) in info.tests.iter().enumerate() {
             let prof = workdir.join(format!("cov-{art_idx:03}-{test_idx:03}.profraw"));
-            if let Err(e) = runner::run_test_isolated(&artifact.binary_path, test_name, &prof) {
+            if let Err(e) = runner::run_test_isolated(&info.binary_path, test_name, &prof) {
                 eprintln!("cargo-floyd: {e}");
                 return ExitCode::from(1);
             }
@@ -296,7 +322,7 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
                 &prof,
                 &profdata_tool,
                 &cov_tool,
-                &artifact.binary_path,
+                &info.binary_path,
                 workdir,
             ) {
                 Ok(c) => c,
@@ -305,28 +331,33 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
                     return ExitCode::from(1);
                 }
             };
-            per_test_coverage.push((test_name.clone(), coverage));
-            all_tests.push(test_name.clone());
+            all_coverage.push((test_name.clone(), coverage));
         }
+    }
 
-        for (tree, prov) in artifact_candidates {
-            let mut obs = Vec::new();
-            for (test_name, coverage) in &per_test_coverage {
-                if let Some(o) = correlate::observation_from_coverage(
-                    Some(test_name.clone()),
-                    &mir,
-                    coverage,
-                    &tree,
-                ) {
-                    obs.push(o);
-                }
+    // Pass 3: for each candidate, correlate against every test's
+    // coverage. Use the originating artifact's MIR for debug-name
+    // resolution — the function is defined there even when it's
+    // exercised by another artifact's tests.
+    let mut candidates: Vec<selector::Candidate> = Vec::new();
+    for raw in raw_candidates {
+        let mir = &artifacts[raw.artifact_idx].mir;
+        let mut obs = Vec::new();
+        for (test_name, coverage) in &all_coverage {
+            if let Some(o) = correlate::observation_from_coverage(
+                Some(test_name.clone()),
+                mir,
+                coverage,
+                &raw.tree,
+            ) {
+                obs.push(o);
             }
-            candidates.push(selector::Candidate {
-                tree,
-                provenance: prov,
-                observations: obs,
-            });
         }
+        candidates.push(selector::Candidate {
+            tree: raw.tree,
+            provenance: raw.prov,
+            observations: obs,
+        });
     }
 
     let chosen = match selector::pick_best(candidates) {
