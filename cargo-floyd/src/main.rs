@@ -607,6 +607,25 @@ fn print_runtime_report_body(
     );
     println!();
 
+    // Issue #14: 0 observations against a non-empty decision tree is
+    // misleading. Users read "UNEXERCISED" as "my suite is weak" when
+    // the actual cause is Floyd analysed a function the suite does
+    // not touch at all. Warn clearly.
+    if observations.is_empty() && !analysis.matrix.conditions.is_empty() {
+        let func = analysis
+            .provenance
+            .as_ref()
+            .and_then(|p| p.function_name.as_deref())
+            .unwrap_or("<unknown>");
+        println!("WARNING: the analysed decision in `{func}` was not");
+        println!("         exercised by any observed test.  Floyd may have selected a");
+        println!("         function the test suite does not call; the 'UNEXERCISED'");
+        println!("         status below reflects that, not a weak test suite.  Consider");
+        println!("         adding a #[test] that calls `{func}`, or verify which");
+        println!("         function Floyd analysed via --format=json's provenance block.");
+        println!();
+    }
+
     if !observations.is_empty() {
         println!("Per-test observations:");
         for obs in observations {

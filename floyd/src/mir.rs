@@ -560,7 +560,19 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
                             // operator synthesizes for a local the
                             // user named `x`). The user's name is
                             // always first in source order.
-                            f.debug_names.entry(local).or_insert(name);
+                            //
+                            // Issue #12: skip reserved identifiers
+                            // that can never be a Boolean condition.
+                            // Methods declare `debug self => _1;` but
+                            // the self receiver is a struct value, not
+                            // a decision condition. Letting `self` into
+                            // debug_names causes the decomposer to pick
+                            // method bodies and report nonsensical
+                            // conditions like "self: UNEXERCISED" on
+                            // method-heavy real-world crates.
+                            if !is_reserved_debug_name(&name) {
+                                f.debug_names.entry(local).or_insert(name);
+                            }
                         }
                         Some(DebugAnnotation::Capture(c)) => {
                             f.captures.push(c);
@@ -759,6 +771,21 @@ enum DebugAnnotation {
     /// `debug name => <capture-expr>;` — a closure capture in
     /// one of the by-value, by-ref, or FnMut forms.
     Capture(MirCapture),
+}
+
+/// Reserved debug names that must not become condition names.
+///
+/// Currently just `self` — rustc emits `debug self => _1;` for method
+/// receivers, but the receiver is never a Boolean condition. Letting
+/// it into `debug_names` would cause the decomposer to accept the
+/// method body and surface `self` as the condition name, confusing
+/// any user who reads the resulting report.
+///
+/// This is pattern-matched by name rather than by MIR type because the
+/// current parser does not retain type information for debug bindings.
+/// A future type-aware pass would subsume this filter.
+fn is_reserved_debug_name(name: &str) -> bool {
+    matches!(name, "self")
 }
 
 fn parse_debug(line: &str) -> Option<DebugAnnotation> {
@@ -1350,6 +1377,39 @@ fn decide(_1: bool, _2: bool) -> bool {
         let names = &mir.functions[0].debug_names;
         assert_eq!(names.get(&1), Some(&"a".to_string()));
         assert_eq!(names.get(&2), Some(&"b".to_string()));
+    }
+
+    /// Issue #12: `self` is a reserved method-receiver name, never a
+    /// Boolean condition. The debug-name intake must drop it so the
+    /// decomposer declines method bodies that would otherwise surface
+    /// `self` as a condition name.
+    #[test]
+    fn self_debug_name_is_dropped_from_debug_names() {
+        let mir_with_self = r#"
+fn is_valid(_1: &Config) -> bool {
+    debug self => _1;
+    let mut _0: bool;
+
+    bb0: {
+        _0 = const true;
+        return;
+    }
+}
+"#;
+        let mir = parse_text(mir_with_self).expect("parse ok");
+        let names = &mir.functions[0].debug_names;
+        assert!(
+            !names.values().any(|v| v == "self"),
+            "self must never appear in debug_names (got {names:?})"
+        );
+    }
+
+    #[test]
+    fn is_reserved_debug_name_covers_self() {
+        assert!(is_reserved_debug_name("self"));
+        assert!(!is_reserved_debug_name("a"));
+        assert!(!is_reserved_debug_name("x"));
+        assert!(!is_reserved_debug_name("Self")); // Self is a type alias, not a receiver
     }
 
     #[test]

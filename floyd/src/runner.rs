@@ -223,9 +223,10 @@ pub fn profraw_to_coverage(
             message: format!("could not exec: {e}"),
         })?;
     if !out.status.success() {
+        let raw = String::from_utf8_lossy(&out.stderr).into_owned();
         return Err(RunnerError {
             stage: "llvm-cov export",
-            message: String::from_utf8_lossy(&out.stderr).into_owned(),
+            message: wrap_llvm_crash_message(&raw),
         });
     }
     let cov_text = String::from_utf8(out.stdout).map_err(|e| RunnerError {
@@ -236,6 +237,24 @@ pub fn profraw_to_coverage(
         stage: "parse coverage",
         message: e.to_string(),
     })
+}
+
+/// Issue #15: llvm-cov crashes with a raw LLVM stack trace that reads
+/// like Floyd itself failed. Detect the crash signature and prepend a
+/// human-readable summary so the user understands this is an upstream
+/// LLVM issue, not a Floyd bug.
+fn wrap_llvm_crash_message(raw: &str) -> String {
+    let is_llvm_crash =
+        raw.contains("PLEASE submit a bug report") || raw.contains("llvm::sys::PrintStackTrace");
+    if is_llvm_crash {
+        format!(
+            "llvm-cov crashed while exporting coverage. This is an upstream LLVM bug \
+             (see https://github.com/llvm/llvm-project/issues/), not a Floyd failure \
+             — Floyd itself did not crash. Raw stack trace follows for a bug report:\n\n{raw}"
+        )
+    } else {
+        raw.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -251,5 +270,27 @@ mod tests {
         let s = format!("{e}");
         assert!(s.contains("llvm-cov export"));
         assert!(s.contains("boom"));
+    }
+
+    /// Issue #15: a raw LLVM stack trace must get a human-readable
+    /// prefix so users don't think Floyd crashed.
+    #[test]
+    fn wraps_llvm_crash_with_floyd_disclaimer() {
+        let raw_stack = "PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/\n\
+                         Stack dump without symbol names (ensure you have llvm-symbolizer…\n\
+                         0  llvm-cov                 0x000000010f896098 llvm::sys::PrintStackTrace…";
+        let wrapped = wrap_llvm_crash_message(raw_stack);
+        assert!(wrapped.contains("llvm-cov crashed"));
+        assert!(wrapped.contains("Floyd itself did not crash"));
+        // The original raw stack is preserved for bug reports.
+        assert!(wrapped.contains("PrintStackTrace"));
+    }
+
+    /// Non-LLVM-crash stderr (ordinary errors, file-not-found, etc.)
+    /// passes through unchanged.
+    #[test]
+    fn passes_non_llvm_crash_through_unchanged() {
+        let raw = "error: profile does not match binary";
+        assert_eq!(wrap_llvm_crash_message(raw), raw);
     }
 }
