@@ -20,7 +20,7 @@
 //!
 //! ## Status
 //!
-//! v0.2.8. The `cargo floyd test` workflow runs end-to-end on real
+//! v0.2.9. The `cargo floyd test` workflow runs end-to-end on real
 //! cargo projects, recovering boolean decisions built from `&&`,
 //! `||`, `!`, inline comparisons (`>`, `<`, `==`, `!=`, `>=`, `<=`),
 //! `if let` with a binding, the `?` operator (skip-through),
@@ -37,7 +37,12 @@
 //! [`RuntimeAnalysis::provenance`] with the function name, source
 //! file, and start line of the analysed decision, so reports can
 //! cite source locations without reconstructing them from the
-//! surrounding build context. The recovered pattern set is pinned
+//! surrounding build context. Test discovery and per-test
+//! correlation are cross-artifact: a decision defined in one
+//! artifact's MIR (typically the lib's) is scored against every
+//! test's coverage across every artifact that links it, so a lib
+//! candidate exercised only through integration-test binaries is
+//! still observed. The recovered pattern set is pinned
 //! by the `corpus/` directory; see
 //! [`corpus/v1/`](https://github.com/Gordion-Solutions/Floyd/tree/main/corpus/v1)
 //! for the safety-critical decision patterns the engine is
