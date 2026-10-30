@@ -238,6 +238,22 @@ pub enum MirStatement {
         /// Source span, if present in the MIR.
         span: Option<SourceSpan>,
     },
+    /// `_<dst> = Not(copy _<src>);` (or `move _<src>`).
+    ///
+    /// Boolean unary negation. Emitted by rustc when
+    /// `-Cinstrument-coverage` runs with
+    /// `-Zcoverage-options=branch,condition` — the Not operation's
+    /// two outcomes need their own branch counter, so rustc
+    /// materialises it as a distinct statement instead of folding
+    /// the `!` into a switchInt arm swap (the fallback shape).
+    AssignUnaryNot {
+        /// Destination local (bool-typed).
+        dst: LocalId,
+        /// Source local being negated.
+        src: LocalId,
+        /// Source span, if present in the MIR.
+        span: Option<SourceSpan>,
+    },
     /// A statement shape Phase 0 doesn't yet parse. Preserved verbatim.
     Other {
         /// Original text of the statement.
@@ -1073,6 +1089,15 @@ fn parse_statement(line: &str, span: Option<SourceSpan>) -> Option<MirStatement>
             rhs: cmp.rhs,
             span,
         });
+    }
+    // `_X = Not(copy _Y);` / `_X = Not(move _Y);` — boolean unary
+    // negation. See `MirStatement::AssignUnaryNot` for context.
+    if let Some(inner) = rhs.strip_prefix("Not(") {
+        if let Some(arg) = inner.strip_suffix(')') {
+            if let Some(src) = parse_local_token(arg.trim()) {
+                return Some(MirStatement::AssignUnaryNot { dst, src, span });
+            }
+        }
     }
     None
 }

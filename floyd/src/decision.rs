@@ -758,6 +758,7 @@ fn is_value_producing_assign(stmt: &MirStatement) -> bool {
             | MirStatement::AssignCaptureRead { .. }
             | MirStatement::AssignDiscriminant { .. }
             | MirStatement::AssignDowncast { .. }
+            | MirStatement::AssignUnaryNot { .. }
     )
 }
 
@@ -782,7 +783,8 @@ fn statement_writes(stmt: &MirStatement, dst_local: LocalId) -> bool {
         | MirStatement::AssignBinaryCompare { dst, .. }
         | MirStatement::AssignCaptureRead { dst, .. }
         | MirStatement::AssignDiscriminant { dst, .. }
-        | MirStatement::AssignDowncast { dst, .. } => *dst == dst_local,
+        | MirStatement::AssignDowncast { dst, .. }
+        | MirStatement::AssignUnaryNot { dst, .. } => *dst == dst_local,
         _ => false,
     }
 }
@@ -878,6 +880,24 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
             MirStatement::AssignCopy { dst, src, .. } if !feeds_switchint(*dst) => {
                 if let Some(name) = f.debug_names.get(src) {
                     return Some(Node::Condition { name: name.clone() });
+                }
+            }
+            MirStatement::AssignUnaryNot { dst, src, .. } if !feeds_switchint(*dst) => {
+                // `_dst = Not(copy _src)` as a terminal value: the
+                // decision's result is `!<src_name>`. Emit a
+                // `Node::Condition` naming the complement
+                // (`!<src_name>`), so runtime branch counts coming
+                // from the Not's own branch counter — which track
+                // the NEGATED value — map cleanly onto the
+                // condition name shown in the report. (If instead
+                // we named the condition `<src_name>` with an ITE
+                // inversion, per-test observations would display
+                // the Not's output under the raw-input name,
+                // confusing the reader.)
+                if let Some(name) = f.debug_names.get(src) {
+                    return Some(Node::Condition {
+                        name: format!("!{name}"),
+                    });
                 }
             }
             MirStatement::AssignBinaryCompare {
@@ -1255,6 +1275,51 @@ fn decide(_1: bool, _2: bool, _3: bool) -> bool {
         let tree = decompose(&mir);
         assert_eq!(tree.decisions.len(), 1);
         assert_eq!(tree.decisions[0], ite("a", const_(false), cond("b")));
+    }
+
+    /// `rustc --emit=mir` output for `fn decide(a) -> bool { !a }`
+    /// as emitted with `-Zcoverage-options=branch,condition` — the
+    /// `!` becomes an explicit `_0 = Not(copy _1)` statement
+    /// followed by a coverage branch counter switchInt.
+    const DECIDE_NOT_WITH_COVERAGE_COUNTER_MIR: &str = r#"
+fn decide(_1: bool) -> bool {
+    debug a => _1;
+    let mut _0: bool;
+
+    bb0: {
+        _0 = Not(copy _1);
+        switchInt(copy _0) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        goto -> bb3;
+    }
+
+    bb2: {
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn decompose_recovers_unary_not_as_negated_condition() {
+        // `!a` compiled with `-Zcoverage-options=branch,condition`:
+        // the Not is materialised as `_0 = Not(copy _1)` followed
+        // by a coverage branch counter switchInt(_0). The
+        // decomposer treats the terminal value as `Condition{"!a"}`
+        // so the branch counter's true/false counts (which track
+        // the Not's OUTPUT value) map onto the correct condition
+        // name in the report. Alternative naming (`Condition{"a"}`
+        // with an ITE inversion) would display the Not's output
+        // under the raw-input name — confusing to readers.
+        let mir = mir::parse_text(DECIDE_NOT_WITH_COVERAGE_COUNTER_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(tree.decisions[0], cond("!a"));
     }
 
     #[test]

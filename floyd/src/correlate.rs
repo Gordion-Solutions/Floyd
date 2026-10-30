@@ -204,15 +204,36 @@ fn collect_condition_spans(f: &MirFunction) -> BTreeMap<String, SourceSpan> {
             }
         }
         for stmt in &block.statements {
-            if let MirStatement::AssignCopy {
-                src,
-                span: Some(span),
-                ..
-            } = stmt
-            {
-                if let Some(name) = f.debug_names.get(src) {
-                    spans.entry(name.clone()).or_insert_with(|| span.clone());
+            match stmt {
+                MirStatement::AssignCopy {
+                    src,
+                    span: Some(span),
+                    ..
+                } => {
+                    if let Some(name) = f.debug_names.get(src) {
+                        spans.entry(name.clone()).or_insert_with(|| span.clone());
+                    }
                 }
+                MirStatement::AssignUnaryNot {
+                    src,
+                    span: Some(span),
+                    ..
+                } => {
+                    // `_dst = Not(copy _src)` — rustc emits a
+                    // dedicated branch counter on the Not's OUTPUT,
+                    // so the natural condition identity at this
+                    // span is `!<src_name>` (its true/false counts
+                    // reflect `!<src_name>`'s runtime value). The
+                    // decomposer encodes the terminal value as
+                    // `Node::Condition { name: "!<src_name>" }` to
+                    // match.
+                    if let Some(name) = f.debug_names.get(src) {
+                        spans
+                            .entry(format!("!{name}"))
+                            .or_insert_with(|| span.clone());
+                    }
+                }
+                _ => {}
             }
         }
     }
