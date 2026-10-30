@@ -32,19 +32,6 @@ pub struct Candidate {
     pub observations: Vec<ConditionObservation>,
 }
 
-/// Pick the best candidate from a collection.
-///
-/// Scoring (lexicographic, descending):
-///   1. observation count — a candidate exercised by many tests
-///      produces a richer MC/DC verdict than one no test touches
-///   2. candidate tier — see [`tier`]. When no candidate has
-///      observations (common on real crates whose decisions use
-///      `match`/`if let`/`?` the engine does not yet decompose),
-///      the tiebreak would otherwise pick an arbitrary closure or
-///      test-internal function. The tier ordering surfaces a
-///      user-written top-level `pub fn` over a `{closure#N}` body
-///      over a `#[test]` function's internals.
-///   3. condition count — richer tree beats a single-condition one
 /// Outcome of [`pick_best`].
 ///
 /// The three variants let the caller tell apart genuinely different
@@ -67,6 +54,20 @@ pub enum PickResult {
     Picked(Candidate),
 }
 
+/// Pick the best candidate from a collection.
+///
+/// Scoring (lexicographic, descending):
+///
+/// 1. observation count — a candidate exercised by many tests
+///    produces a richer MC/DC verdict than one no test touches.
+/// 2. candidate tier — see [`tier`]. When no candidate has
+///    observations (common on real crates whose decisions use
+///    `match`/`if let`/`?` the engine does not yet decompose),
+///    the tiebreak would otherwise pick an arbitrary closure or
+///    test-internal function. The tier ordering surfaces a
+///    user-written top-level `pub fn` over a `{closure#N}` body
+///    over a `#[test]` function's internals.
+/// 3. condition count — richer tree beats a single-condition one.
 pub fn pick_best(candidates: Vec<Candidate>) -> PickResult {
     // A candidate with zero Condition leaves is not an MC/DC decision —
     // its tree is just Const / Const branches, so there is nothing to
