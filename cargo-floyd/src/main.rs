@@ -264,9 +264,17 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
         artifact_idx: usize,
     }
 
+    #[derive(serde::Serialize, Clone, Debug)]
+    struct DeclinedFunction {
+        name: String,
+        source_file: Option<String>,
+        line: Option<u32>,
+    }
+
     let mut artifacts: Vec<ArtifactInfo> = Vec::new();
     let mut raw_candidates: Vec<RawCandidate> = Vec::new();
     let mut all_tests: Vec<String> = Vec::new();
+    let mut declined: Vec<DeclinedFunction> = Vec::new();
 
     // Pass 1: parse MIR, enumerate tests, collect candidates per artifact.
     for artifact in build.test_artifacts.iter() {
@@ -297,6 +305,21 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
                     },
                     prov: correlate::provenance_for(f),
                     artifact_idx: art_idx,
+                });
+            } else if decision::has_switchint(f) {
+                // The function has at least one switchInt — i.e. a
+                // decision in the source — but the decomposer did
+                // not match any supported pattern. Record it for
+                // the honest-scope report so a reader can see what
+                // the engine declined, instead of silently ignoring
+                // it. Pure straight-line functions and pure Call
+                // delegations fall out here (no switchInt), so
+                // they do not pollute the list.
+                let prov = correlate::provenance_for(f);
+                declined.push(DeclinedFunction {
+                    name: prov.function_name.unwrap_or_default(),
+                    source_file: prov.source_file,
+                    line: prov.line,
                 });
             }
         }
@@ -373,15 +396,19 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
                  verify which candidates Floyd considered via \
                  `--format=json`'s provenance block."
             );
+            print_out_of_scope_report(&declined);
             return ExitCode::from(1);
         }
         selector::PickResult::NoCandidates => {
             eprintln!(
                 "cargo-floyd: no recognised decisions in any test target. \
                  The engine currently supports `&&`, `||`, `!`, and nested \
-                 combinations; `if let`, `?`, and `match` patterns are not \
-                 yet implemented."
+                 combinations; `if let`, `?`, and `match` patterns are \
+                 partially supported (2-arm const-returning shapes); \
+                 non-boolean decisions and arms that end in a function \
+                 call are out of scope."
             );
+            print_out_of_scope_report(&declined);
             return ExitCode::from(1);
         }
     };
@@ -396,6 +423,7 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
             println!();
             println!("Test targets: {}", build.test_artifacts.len());
             print_runtime_report_body(&all_tests, &all_observations, &analysis);
+            print_out_of_scope_report(&declined);
         }
         Format::Json => {
             #[derive(serde::Serialize)]
@@ -406,6 +434,12 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
                 tests_discovered: &'a [String],
                 observations: &'a [ConditionObservation],
                 analysis: &'a RuntimeAnalysis,
+                /// Functions with a `switchInt`-shaped decision that
+                /// the engine's current patterns did not match. The
+                /// engine declined them rather than report a wrong
+                /// verdict — honest-scope evidence for ISO 26262 /
+                /// DO-178C qualification audits.
+                out_of_scope: &'a [DeclinedFunction],
             }
             let report = Report {
                 manifest: manifest.display().to_string(),
@@ -414,6 +448,7 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
                 tests_discovered: &all_tests,
                 observations: &all_observations,
                 analysis: &analysis,
+                out_of_scope: &declined,
             };
             match serde_json::to_string_pretty(&report) {
                 Ok(s) => println!("{s}"),
@@ -830,6 +865,24 @@ fn format_inputs(conditions: &[String], row: &TruthTableRow) -> String {
         .map(|c| format!("{c}={}", bool_glyph(row.inputs[c])))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn print_out_of_scope_report(declined: &[impl std::fmt::Debug]) {
+    if declined.is_empty() {
+        return;
+    }
+    // Keep the display open-core-honest: show the headline count
+    // and up to 10 names. Full list is in the JSON output's
+    // `out_of_scope` field for anyone wiring Floyd into a
+    // qualification toolchain.
+    println!();
+    println!(
+        "Out of scope: {} function(s) have a decision in a shape \
+         the engine's current patterns do not recognise. The engine \
+         declined them rather than report a wrong verdict. See \
+         --format=json's `out_of_scope` for the full list.",
+        declined.len()
+    );
 }
 
 fn bool_glyph(v: bool) -> &'static str {

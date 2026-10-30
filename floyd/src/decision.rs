@@ -761,7 +761,20 @@ fn try_if_let_from_block(block: &MirBlock, f: &MirFunction) -> Option<Node> {
     }))
 }
 
-pub(crate) fn is_unreachable_block(id: BlockId, f: &MirFunction) -> bool {
+/// Does this function contain at least one `switchInt` terminator?
+///
+/// Used by the honest-scope report in `cargo-floyd` to tell "the
+/// function has no decision at all" (pure straight-line code, pure
+/// Call delegation, etc.) apart from "the function HAS a decision
+/// but the engine's current patterns did not match it". The first
+/// case is uninteresting; the second is what the report surfaces.
+pub fn has_switchint(f: &MirFunction) -> bool {
+    f.blocks
+        .iter()
+        .any(|b| matches!(b.terminator, MirTerminator::SwitchInt { .. }))
+}
+
+fn is_unreachable_block(id: BlockId, f: &MirFunction) -> bool {
     f.blocks
         .iter()
         .find(|b| b.id == id)
