@@ -361,8 +361,21 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
     }
 
     let chosen = match selector::pick_best(candidates) {
-        Some(c) => c,
-        None => {
+        selector::PickResult::Picked(c) => c,
+        selector::PickResult::AllUnobserved => {
+            eprintln!(
+                "cargo-floyd: Floyd found decomposable boolean decisions in \
+                 your code, but no test exercised any of them. \
+                 The decisions it recognised live in closures \
+                 or test-adjacent helpers that the test suite \
+                 does not call directly. Add a test that calls \
+                 one of your top-level `pub fn` decisions, or \
+                 verify which candidates Floyd considered via \
+                 `--format=json`'s provenance block."
+            );
+            return ExitCode::from(1);
+        }
+        selector::PickResult::NoCandidates => {
             eprintln!(
                 "cargo-floyd: no recognised decisions in any test target. \
                  The engine currently supports `&&`, `||`, `!`, and nested \
@@ -533,8 +546,21 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
 
     // 6. Pick the best candidate, run the analysis.
     let chosen = match selector::pick_best(candidates) {
-        Some(c) => c,
-        None => {
+        selector::PickResult::Picked(c) => c,
+        selector::PickResult::AllUnobserved => {
+            eprintln!(
+                "cargo-floyd: Floyd found decomposable boolean decisions in \
+                 your code, but no test exercised any of them. \
+                 The decisions it recognised live in closures \
+                 or test-adjacent helpers that the test suite \
+                 does not call directly. Add a test that calls \
+                 one of your top-level `pub fn` decisions, or \
+                 verify which candidates Floyd considered via \
+                 `--format=json`'s provenance block."
+            );
+            return ExitCode::from(1);
+        }
+        selector::PickResult::NoCandidates => {
             eprintln!(
                 "cargo-floyd: no recognised decisions in {}",
                 source.display()
