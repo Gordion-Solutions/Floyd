@@ -11,6 +11,7 @@ keywords = ["mcdc", "coverage", "safety", "iso26262", "cargo-subcommand"]
 categories = ["development-tools::testing", "development-tools::cargo-plugins"]
 
 [dependencies]
+rayon = "1"
 floyd = { path = "../floyd", version = "0.2.9" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

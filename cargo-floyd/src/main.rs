@@ -262,6 +262,7 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
         tree: floyd::DecisionTree,
         prov: floyd::DecisionProvenance,
         artifact_idx: usize,
+        fn_idx: usize,
     }
 
     #[derive(serde::Serialize, Clone, Debug)]
@@ -275,9 +276,29 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
     let mut raw_candidates: Vec<RawCandidate> = Vec::new();
     let mut all_tests: Vec<String> = Vec::new();
     let mut declined: Vec<DeclinedFunction> = Vec::new();
+    // Pragmatic scalability guard: rustc's `--emit=mir` on a test
+    // binary that pulls in deep generic chains can produce MIR
+    // files hundreds of megabytes in size (bytes'
+    // `test_bytes_vec_alloc` is 349 MB — 4.2 million lines).
+    // Parsing those in Floyd's text parser blocks progress on the
+    // whole crate for 10+ minutes. We skip them above a size
+    // threshold and surface the skip in the honest-scope report,
+    // so the user sees exactly which artifacts were elided and
+    // why.
+    const MAX_MIR_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
+    let mut skipped_oversize_mirs: Vec<(std::path::PathBuf, u64)> = Vec::new();
 
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] starting Pass 1 (parse MIR + enumerate tests)");
+    }
     // Pass 1: parse MIR, enumerate tests, collect candidates per artifact.
     for artifact in build.test_artifacts.iter() {
+        if let Ok(meta) = std::fs::metadata(&artifact.mir_path) {
+            if meta.len() > MAX_MIR_BYTES {
+                skipped_oversize_mirs.push((artifact.mir_path.clone(), meta.len()));
+                continue;
+            }
+        }
         let mir_text = match std::fs::read_to_string(&artifact.mir_path) {
             Ok(s) => s,
             Err(_) => continue,
@@ -297,7 +318,7 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
             all_tests.push(t.clone());
         }
         let art_idx = artifacts.len();
-        for f in &mir.functions {
+        for (fn_idx, f) in mir.functions.iter().enumerate() {
             if let Some(node) = decision::decompose_function(f) {
                 raw_candidates.push(RawCandidate {
                     tree: floyd::DecisionTree {
@@ -305,6 +326,7 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
                     },
                     prov: correlate::provenance_for(f),
                     artifact_idx: art_idx,
+                    fn_idx,
                 });
             } else if decision::has_switchint(f) {
                 // The function has at least one switchInt — i.e. a
@@ -330,57 +352,161 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
         });
     }
 
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] Pass 1 complete: {} candidates, {} declined, {} artifacts, {} skipped-oversize",
+        raw_candidates.len(), declined.len(), artifacts.len(), skipped_oversize_mirs.len());
+    }
     // Pass 2: run every test across every artifact once; keep each
     // test's parsed coverage. We intentionally do NOT dedupe test
     // names across artifacts — two artifacts can share a test name.
-    let mut all_coverage: Vec<(String, profile::CoverageReport)> = Vec::new();
-    for (art_idx, info) in artifacts.iter().enumerate() {
-        for (test_idx, test_name) in info.tests.iter().enumerate() {
-            let prof = workdir.join(format!("cov-{art_idx:03}-{test_idx:03}.profraw"));
-            if let Err(e) = runner::run_test_isolated(&info.binary_path, test_name, &prof) {
-                eprintln!("cargo-floyd: {e}");
-                return ExitCode::from(1);
-            }
-            let coverage = match runner::profraw_to_coverage(
+    //
+    // Parallelised across tests via rayon. Each per-test job is
+    // self-contained (unique profraw file per `(art_idx, test_idx)`,
+    // no shared state), and the real wall-clock work is in three
+    // sequential subprocess calls per job (test invocation,
+    // `llvm-profdata merge`, `llvm-cov export`). Serialising those
+    // across every test in every artifact was the scalability
+    // blocker surfaced on real crates: `bytes`, `uuid`, `blake3`,
+    // `base64`, `chrono`, `url` all exceeded 10 minutes before
+    // this pass. On N logical cores, rayon runs min(N, jobs) jobs
+    // in parallel.
+    #[derive(Clone)]
+    struct TestJob {
+        art_idx: usize,
+        test_idx: usize,
+        test_name: String,
+        binary_path: std::path::PathBuf,
+    }
+
+    let jobs: Vec<TestJob> = artifacts
+        .iter()
+        .enumerate()
+        .flat_map(|(art_idx, info)| {
+            let bp = info.binary_path.clone();
+            info.tests
+                .iter()
+                .enumerate()
+                .map(move |(test_idx, test_name)| TestJob {
+                    art_idx,
+                    test_idx,
+                    test_name: test_name.clone(),
+                    binary_path: bp.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!(
+            "[progress] starting Pass 2: {} tests across {} artifacts",
+            jobs.len(),
+            artifacts.len()
+        );
+    }
+    let progress_counter = std::sync::atomic::AtomicUsize::new(0);
+    let progress_total = jobs.len();
+
+    use rayon::prelude::*;
+    let results: Result<Vec<(String, profile::CoverageReport)>, String> = jobs
+        .par_iter()
+        .map(|job| -> Result<(String, profile::CoverageReport), String> {
+            let prof = workdir.join(format!(
+                "cov-{:03}-{:03}.profraw",
+                job.art_idx, job.test_idx
+            ));
+            runner::run_test_isolated(&job.binary_path, &job.test_name, &prof)
+                .map_err(|e| e.to_string())?;
+            let coverage = runner::profraw_to_coverage(
                 &prof,
                 &profdata_tool,
                 &cov_tool,
-                &info.binary_path,
+                &job.binary_path,
                 workdir,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("cargo-floyd: {e}");
-                    return ExitCode::from(1);
+            )
+            .map_err(|e| e.to_string())?;
+            let n = progress_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n % 10 == 0 || n == progress_total {
+                if std::env::var("FLOYD_DIAG").is_ok() {
+                    eprintln!("[progress]   {n}/{progress_total}");
                 }
-            };
-            all_coverage.push((test_name.clone(), coverage));
+            }
+            Ok((job.test_name.clone(), coverage))
+        })
+        .collect();
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] Pass 2 complete");
+    }
+
+    let all_coverage = match results {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("cargo-floyd: {e}");
+            return ExitCode::from(1);
         }
+    };
+
+    // Pre-compute condition span maps per artifact's MIR. Done
+    // once; reused across every (candidate, test) pair in Pass 3.
+    // This turns Pass 3 from O(candidates × tests × functions ×
+    // blocks) into O(functions × blocks) + O(candidates × tests).
+    // On `bytes` (10 candidates, 1053 tests, ~500 functions per
+    // artifact MIR), that is a factor-of-thousands speedup.
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] starting Pass 3 prep (precompute span maps)");
+    }
+    let prepared: Vec<correlate::PreparedMir<'_>> = artifacts
+        .iter()
+        .map(|a| correlate::prepare_mir(&a.mir))
+        .collect();
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] Pass 3 prep complete");
+    }
+
+    // Pre-compute per-test coverage lookups (one `HashMap` per
+    // test so Pass 3's `find_matching_function` scan becomes O(1)).
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] prepping per-test coverage lookups");
+    }
+    let prepared_covs: Vec<(String, correlate::PreparedCoverage<'_>)> = all_coverage
+        .par_iter()
+        .map(|(name, cov)| (name.clone(), correlate::prepare_coverage_lookup(cov)))
+        .collect();
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] coverage lookups ready: {}", prepared_covs.len());
     }
 
     // Pass 3: for each candidate, correlate against every test's
-    // coverage. Use the originating artifact's MIR for debug-name
-    // resolution — the function is defined there even when it's
-    // exercised by another artifact's tests.
-    let mut candidates: Vec<selector::Candidate> = Vec::new();
-    for raw in raw_candidates {
-        let mir = &artifacts[raw.artifact_idx].mir;
-        let mut obs = Vec::new();
-        for (test_name, coverage) in &all_coverage {
-            if let Some(o) = correlate::observation_from_coverage(
-                Some(test_name.clone()),
-                mir,
-                coverage,
-                &raw.tree,
-            ) {
-                obs.push(o);
+    // coverage using the pre-computed span maps and coverage
+    // lookups. Parallelised across candidates — each is
+    // independent.
+    let candidates: Vec<selector::Candidate> = raw_candidates
+        .into_par_iter()
+        .map(|raw| {
+            let prep = &prepared[raw.artifact_idx];
+            let obs: Vec<_> = prepared_covs
+                .iter()
+                .filter_map(|(test_name, prepared_cov)| {
+                    correlate::observation_from_prepared_coverage(
+                        Some(test_name.clone()),
+                        prep,
+                        raw.fn_idx,
+                        prepared_cov,
+                        &raw.tree,
+                    )
+                })
+                .collect();
+            selector::Candidate {
+                tree: raw.tree,
+                provenance: raw.prov,
+                observations: obs,
             }
-        }
-        candidates.push(selector::Candidate {
-            tree: raw.tree,
-            provenance: raw.prov,
-            observations: obs,
-        });
+        })
+        .collect();
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!(
+            "[progress] Pass 3 complete: {} candidates",
+            candidates.len()
+        );
     }
 
     let chosen = match selector::pick_best(candidates) {
@@ -396,7 +522,7 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
                  verify which candidates Floyd considered via \
                  `--format=json`'s provenance block."
             );
-            print_out_of_scope_report(&declined);
+            print_out_of_scope_report(&declined, &skipped_oversize_mirs);
             return ExitCode::from(1);
         }
         selector::PickResult::NoCandidates => {
@@ -408,7 +534,7 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
                  non-boolean decisions and arms that end in a function \
                  call are out of scope."
             );
-            print_out_of_scope_report(&declined);
+            print_out_of_scope_report(&declined, &skipped_oversize_mirs);
             return ExitCode::from(1);
         }
     };
@@ -423,7 +549,7 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
             println!();
             println!("Test targets: {}", build.test_artifacts.len());
             print_runtime_report_body(&all_tests, &all_observations, &analysis);
-            print_out_of_scope_report(&declined);
+            print_out_of_scope_report(&declined, &skipped_oversize_mirs);
         }
         Format::Json => {
             #[derive(serde::Serialize)]
@@ -867,22 +993,41 @@ fn format_inputs(conditions: &[String], row: &TruthTableRow) -> String {
         .join(", ")
 }
 
-fn print_out_of_scope_report(declined: &[impl std::fmt::Debug]) {
-    if declined.is_empty() {
-        return;
+fn print_out_of_scope_report(
+    declined: &[impl std::fmt::Debug],
+    skipped_oversize_mirs: &[(std::path::PathBuf, u64)],
+) {
+    if !declined.is_empty() {
+        println!();
+        println!(
+            "Out of scope: {} function(s) have a decision in a shape \
+             the engine's current patterns do not recognise. The engine \
+             declined them rather than report a wrong verdict. See \
+             --format=json's `out_of_scope` for the full list.",
+            declined.len()
+        );
     }
-    // Keep the display open-core-honest: show the headline count
-    // and up to 10 names. Full list is in the JSON output's
-    // `out_of_scope` field for anyone wiring Floyd into a
-    // qualification toolchain.
-    println!();
-    println!(
-        "Out of scope: {} function(s) have a decision in a shape \
-         the engine's current patterns do not recognise. The engine \
-         declined them rather than report a wrong verdict. See \
-         --format=json's `out_of_scope` for the full list.",
-        declined.len()
-    );
+    if !skipped_oversize_mirs.is_empty() {
+        println!();
+        println!(
+            "Skipped {} MIR file(s) above the 50 MB scalability \
+             threshold (monomorphisation explosion in test \
+             binaries). These artifacts were not analysed — \
+             candidates and tests they would have contributed are \
+             absent from the verdict:",
+            skipped_oversize_mirs.len()
+        );
+        for (path, size) in skipped_oversize_mirs.iter().take(5) {
+            println!(
+                "  {}  ({:.0} MB)",
+                path.display(),
+                (*size as f64) / (1024.0 * 1024.0)
+            );
+        }
+        if skipped_oversize_mirs.len() > 5 {
+            println!("  ... and {} more", skipped_oversize_mirs.len() - 5);
+        }
+    }
 }
 
 fn bool_glyph(v: bool) -> &'static str {
