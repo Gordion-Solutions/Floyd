@@ -195,12 +195,31 @@ fn collect_condition_spans(f: &MirFunction) -> BTreeMap<String, SourceSpan> {
     for block in &f.blocks {
         if let MirTerminator::SwitchInt {
             discr,
+            targets,
+            otherwise,
             span: Some(span),
             ..
         } = &block.terminator
         {
+            // Debug-named discriminant: bool short-circuits and the
+            // inline-compare temporaries (whose debug names are set
+            // by name propagation) land here.
             if let Some(name) = f.debug_names.get(discr) {
                 spans.entry(name.clone()).or_insert_with(|| span.clone());
+            }
+            // Match / if-let synthetic conditions: tie
+            // `x == 0`, `x == Option::variant_1`, etc. to the
+            // switchInt's source span so coverage branch counts
+            // for the arm land on the right condition name. Without
+            // this, every `pub fn f(x: Option<..>) -> bool { if let
+            // Some(_) = x { .. } else { .. } }` reports 0
+            // observations even when its tests exercise both arms.
+            if let Some(names) = crate::decision::match_switchint_condition_names(
+                block, f, *discr, targets, *otherwise,
+            ) {
+                for name in names {
+                    spans.entry(name).or_insert_with(|| span.clone());
+                }
             }
         }
         for stmt in &block.statements {
@@ -279,6 +298,58 @@ fn find_matching_function<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `_X = discriminant(_scrutinee); switchInt(_X) -> ...` for a
+    /// 2-variant enum should surface the "scrutinee == variant_N"
+    /// condition name mapped to the switchInt's source span, so
+    /// coverage branch counts for the arm land under that name
+    /// during correlation.
+    #[test]
+    fn collect_condition_spans_covers_enum_switchint_variant() {
+        let mir_text = r#"
+fn decide(_1: Option<i32>) -> bool {
+    debug x => _1;
+    let mut _0: bool;
+    let mut _2: isize;
+
+    bb0: {
+        _2 = discriminant(_1);           // scope 0 at src/lib.rs:5:12: 5:19
+        switchInt(move _2) -> [1: bb2, 0: bb1, otherwise: bb3]; // scope 0 at src/lib.rs:5:12: 5:19
+    }
+
+    bb1: {
+        _0 = const false;
+        goto -> bb4;
+    }
+
+    bb2: {
+        _0 = const true;
+        goto -> bb4;
+    }
+
+    bb3: {
+        unreachable;
+    }
+
+    bb4: {
+        return;
+    }
+}
+"#;
+        let mir = crate::mir::parse_text(mir_text).expect("MIR parses");
+        let f = mir.functions.first().expect("one function parsed");
+        let spans = collect_condition_spans(f);
+        // Decomposer surfaces `x == variant_1` (the `Some` arm value,
+        // since the Option type carries generic parameters and so is
+        // not a "simple type identifier"). That exact string must be
+        // present in the span map so runtime counts for the switchInt
+        // branch region are joined to the condition name.
+        assert!(
+            spans.contains_key("x == variant_1"),
+            "spans did not contain the synthesised match condition name; got: {:?}",
+            spans.keys().collect::<Vec<_>>()
+        );
+    }
     use crate::mir;
     use crate::profile;
 

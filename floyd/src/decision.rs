@@ -371,7 +371,7 @@ fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node>
 /// Type of a local as declared in the function header or `let`
 /// declarations. Returns `None` for synthetic locals (return place,
 /// temporaries) that don't appear in either list.
-fn local_type(f: &MirFunction, local: LocalId) -> Option<&str> {
+pub(crate) fn local_type(f: &MirFunction, local: LocalId) -> Option<&str> {
     f.args
         .iter()
         .find(|a| a.local == local)
@@ -492,7 +492,7 @@ fn try_match_from_block(
 }
 
 /// How `try_match_from_block` names its synthetic conditions.
-enum MatchNamingStyle {
+pub(crate) enum MatchNamingStyle {
     IntegerLiteral {
         scrutinee_name: String,
     },
@@ -503,7 +503,7 @@ enum MatchNamingStyle {
 }
 
 impl MatchNamingStyle {
-    fn cond_for_value(&self, value: u128) -> String {
+    pub(crate) fn cond_for_value(&self, value: u128) -> String {
         match self {
             MatchNamingStyle::IntegerLiteral { scrutinee_name } => {
                 format!("{scrutinee_name} == {value}")
@@ -526,7 +526,92 @@ impl MatchNamingStyle {
 /// reference types fail this check and the namer falls back to a
 /// bare `variant_<N>` to avoid producing ugly conditions like
 /// `r == Result<bool, ()>::variant_0`.
-fn is_simple_type_identifier(s: &str) -> bool {
+/// Return the synthetic condition names a `switchInt` on an integer
+/// or enum discriminant would surface through the match / if-let
+/// decomposer, in the order those names appear as `cond` fields of
+/// the resulting ITE tree (outermost arm first).
+///
+/// Used by [`crate::correlate::collect_condition_spans`] to tie
+/// synthesised names like `x == 0` and `x == Option::variant_1` to
+/// the switchInt's source span, so runtime branch counts for the
+/// `match` / `if let` land on the right condition. Mirrors
+/// [`try_match_from_block`]'s naming exactly — if the two drift,
+/// correlation silently misses matches.
+///
+/// Returns `None` when `block` is not a match/if-let-shaped
+/// switchInt (bool short-circuits, closures that read captured
+/// bools, and `?`-style terminators are not this handler's
+/// responsibility).
+pub(crate) fn match_switchint_condition_names(
+    block: &MirBlock,
+    f: &MirFunction,
+    discr: LocalId,
+    targets: &[(u128, BlockId)],
+    otherwise: BlockId,
+) -> Option<Vec<String>> {
+    // Bool discriminants go through the handle_boolean path; their
+    // condition name is the discr's debug name or a synthesised
+    // compare name, not a `scrutinee == value` string.
+    if local_type(f, discr) == Some("bool") {
+        return None;
+    }
+    let enum_scrutinee = block.statements.iter().find_map(|s| match s {
+        MirStatement::AssignDiscriminant { dst, src, .. } if *dst == discr => Some(*src),
+        _ => None,
+    });
+    let style = match enum_scrutinee {
+        Some(scrutinee) => {
+            let scrutinee_name = f
+                .debug_names
+                .get(&scrutinee)
+                .cloned()
+                .unwrap_or_else(|| format!("_{scrutinee}"));
+            let scrutinee_type = local_type(f, scrutinee).map(str::to_string);
+            MatchNamingStyle::Enum {
+                scrutinee_name,
+                scrutinee_type,
+            }
+        }
+        None => {
+            let scrutinee_name = f
+                .debug_names
+                .get(&discr)
+                .cloned()
+                .unwrap_or_else(|| format!("_{discr}"));
+            MatchNamingStyle::IntegerLiteral { scrutinee_name }
+        }
+    };
+
+    // Same arm filter the decomposer uses: unreachable targets drop
+    // out before naming so correlator and decomposer stay in sync.
+    let reachable_arms: Vec<(u128, BlockId)> = targets
+        .iter()
+        .copied()
+        .filter(|(_, t)| !is_unreachable_block(*t, f))
+        .collect();
+    if reachable_arms.is_empty() {
+        return None;
+    }
+    let other_reachable = !is_unreachable_block(otherwise, f);
+
+    // The decomposer emits one `cond_for_value` per arm EXCEPT the
+    // last when `otherwise` is unreachable (that arm becomes the
+    // unconditional fallthrough — no condition in the tree).
+    let n_named = if other_reachable {
+        reachable_arms.len()
+    } else {
+        reachable_arms.len().saturating_sub(1)
+    };
+    Some(
+        reachable_arms
+            .iter()
+            .take(n_named)
+            .map(|(v, _)| style.cond_for_value(*v))
+            .collect(),
+    )
+}
+
+pub(crate) fn is_simple_type_identifier(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -676,7 +761,7 @@ fn try_if_let_from_block(block: &MirBlock, f: &MirFunction) -> Option<Node> {
     }))
 }
 
-fn is_unreachable_block(id: BlockId, f: &MirFunction) -> bool {
+pub(crate) fn is_unreachable_block(id: BlockId, f: &MirFunction) -> bool {
     f.blocks
         .iter()
         .find(|b| b.id == id)
