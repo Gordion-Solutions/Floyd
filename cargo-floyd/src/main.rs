@@ -319,24 +319,38 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
         }
         let art_idx = artifacts.len();
         for (fn_idx, f) in mir.functions.iter().enumerate() {
-            if let Some(node) = decision::decompose_function(f) {
-                raw_candidates.push(RawCandidate {
-                    tree: floyd::DecisionTree {
-                        decisions: vec![node],
-                    },
-                    prov: correlate::provenance_for(f),
-                    artifact_idx: art_idx,
-                    fn_idx,
-                });
-            } else if decision::has_switchint(f) {
-                // The function has at least one switchInt — i.e. a
-                // decision in the source — but the decomposer did
-                // not match any supported pattern. Record it for
-                // the honest-scope report so a reader can see what
-                // the engine declined, instead of silently ignoring
-                // it. Pure straight-line functions and pure Call
-                // delegations fall out here (no switchInt), so
-                // they do not pollute the list.
+            // Require BOTH a successful decomposition AND the
+            // presence of at least one `switchInt` in the function.
+            // Without that `switchInt` gate, boolean-passthrough
+            // helpers like `fn f(x: bool) -> bool { x }` register
+            // as candidates — the decomposer produces a
+            // `Node::Condition { name: "x" }`, but the function has
+            // no actual decision in it (no branch), so llvm-cov
+            // emits zero branch regions for it, correlation can't
+            // produce an observation, and the candidate shows up
+            // under the "reached-but-unobserved" bucket as a
+            // false-positive correlation bug. It's not a bug —
+            // there is no decision to measure in the first place.
+            // These passthroughs are not out-of-scope either; they
+            // are "no boolean decision at all", so they do not
+            // belong in the OOS report.
+            if decision::has_switchint(f) {
+                if let Some(node) = decision::decompose_function(f) {
+                    raw_candidates.push(RawCandidate {
+                        tree: floyd::DecisionTree {
+                            decisions: vec![node],
+                        },
+                        prov: correlate::provenance_for(f),
+                        artifact_idx: art_idx,
+                        fn_idx,
+                    });
+                    continue;
+                }
+            }
+            if decision::has_switchint(f) {
+                // Has a switchInt (so some kind of decision) but
+                // the decomposer did not match any supported
+                // pattern. Honest-scope report entry.
                 let prov = correlate::provenance_for(f);
                 declined.push(DeclinedFunction {
                     name: prov.function_name.unwrap_or_default(),
@@ -508,19 +522,109 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
         );
     }
 
+    // Classify every candidate by whether its own function was
+    // actually reached at runtime by any test. Lets us split the
+    // AllUnobserved message into (a) candidates the test suite
+    // genuinely never invoked and (b) candidates the suite DID
+    // run through but Floyd's span-match correlation missed —
+    // the latter is a Floyd bug, the former a user gap, and
+    // conflating them hides evidence that matters to a
+    // qualification audit.
+    let candidate_reach: Vec<bool> = candidates
+        .iter()
+        .map(|c| {
+            let fn_name = c.provenance.function_name.as_deref().unwrap_or("");
+            prepared_covs
+                .iter()
+                .any(|(_, pcov)| pcov.find(fn_name).map(|f| f.count > 0).unwrap_or(false))
+        })
+        .collect();
+
+    // FLOYD_DIAG span-mismatch probe: for every candidate that
+    // WAS reached at runtime but produced zero observations,
+    // dump its MIR condition spans alongside the first
+    // reaching test's coverage branch regions. Lets a human
+    // diff the two and see what offset / file-path shift the
+    // span-equality join is tripping on.
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        for (c, reached) in candidates.iter().zip(candidate_reach.iter()) {
+            if !*reached || !c.observations.is_empty() {
+                continue;
+            }
+            let fn_name = c.provenance.function_name.as_deref().unwrap_or("");
+            eprintln!("[span-diag] candidate fn={fn_name}");
+            // MIR condition spans — rebuild for this function via
+            // the correlate helper (prepared.function_spans is
+            // keyed by fn_idx, not reachable from this scope
+            // cleanly; collecting the one function's spans here
+            // is cheap).
+            for (art_idx, info) in artifacts.iter().enumerate() {
+                if let Some((fidx, f)) = info
+                    .mir
+                    .functions
+                    .iter()
+                    .enumerate()
+                    .find(|(_, f)| f.name == fn_name)
+                {
+                    eprintln!("[span-diag]   artifact {art_idx} function_idx={fidx}");
+                    let spans = &prepared[art_idx].function_spans[fidx];
+                    for (name, span) in spans {
+                        eprintln!("[span-diag]     MIR cond '{name}' @ {span:?}");
+                    }
+                    break;
+                }
+            }
+            // Coverage branches from the first reaching test.
+            for (test_name, pcov) in prepared_covs.iter() {
+                if let Some(fc) = pcov.find(fn_name) {
+                    if fc.count > 0 {
+                        eprintln!(
+                            "[span-diag]   test '{test_name}' has {} branches, count={}",
+                            fc.branches.len(),
+                            fc.count
+                        );
+                        for b in fc.branches.iter().take(10) {
+                            eprintln!(
+                                "[span-diag]     COV branch @ {:?} true={} false={}",
+                                b.span, b.true_count, b.false_count
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let reached_count = candidate_reach.iter().filter(|r| **r).count();
+    let unreached_count = candidate_reach.len() - reached_count;
+
     let chosen = match selector::pick_best(candidates) {
         selector::PickResult::Picked(c) => c,
         selector::PickResult::AllUnobserved => {
             eprintln!(
-                "cargo-floyd: Floyd found decomposable boolean decisions in \
-                 your code, but no test exercised any of them. \
-                 The decisions it recognised live in closures \
-                 or test-adjacent helpers that the test suite \
-                 does not call directly. Add a test that calls \
-                 one of your top-level `pub fn` decisions, or \
-                 verify which candidates Floyd considered via \
-                 `--format=json`'s provenance block."
+                "cargo-floyd: Floyd found decomposable boolean \
+                 decisions in your code, but no test produced a \
+                 usable observation for any of them."
             );
+            if reached_count > 0 {
+                eprintln!(
+                    "  {reached_count} candidate(s) WERE invoked at \
+                     runtime, but Floyd's span-match could not join \
+                     them to a coverage branch region. This is most \
+                     likely a Floyd correlation bug (rustc span \
+                     drift under optimisation); please file an \
+                     issue with --format=json's provenance block."
+                );
+            }
+            if unreached_count > 0 {
+                eprintln!(
+                    "  {unreached_count} candidate(s) were never \
+                     invoked by any test — add a test that calls \
+                     one of your top-level `pub fn` decisions, or \
+                     verify which candidates were considered via \
+                     --format=json's provenance block."
+                );
+            }
             print_out_of_scope_report(&declined, &skipped_oversize_mirs);
             return ExitCode::from(1);
         }
