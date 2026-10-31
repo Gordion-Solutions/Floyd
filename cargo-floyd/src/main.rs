@@ -425,10 +425,9 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
             )
             .map_err(|e| e.to_string())?;
             let n = progress_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n % 10 == 0 || n == progress_total {
-                if std::env::var("FLOYD_DIAG").is_ok() {
-                    eprintln!("[progress]   {n}/{progress_total}");
-                }
+            if (n.is_multiple_of(10) || n == progress_total) && std::env::var("FLOYD_DIAG").is_ok()
+            {
+                eprintln!("[progress]   {n}/{progress_total}");
             }
             Ok((job.test_name.clone(), coverage))
         })

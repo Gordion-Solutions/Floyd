@@ -245,7 +245,7 @@ pub struct PreparedCoverage<'c> {
 }
 
 impl<'c> PreparedCoverage<'c> {
-    /// O(1) analogue of [`find_matching_function`].
+    /// O(1) analogue of a linear scan over `coverage.functions`.
     pub fn find(&self, mir_name: &str) -> Option<&FunctionCoverage> {
         // Exact name first (fast path for coverage symbols that
         // happen to match the mir name verbatim).
