@@ -336,11 +336,28 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
             // belong in the OOS report.
             if decision::has_switchint(f) {
                 if let Some(node) = decision::decompose_function(f) {
+                    let prov = correlate::provenance_for(f);
+                    // Reject candidates whose decision spans come
+                    // from inlined-stdlib macro expansions.
+                    // Rustc paths of the form `/rustc/<hash>/library/
+                    // core/src/macros/mod.rs` are the hygiene
+                    // bindings of `assert_eq!`, `debug_assert!`,
+                    // `panic!`, and friends — not user-written
+                    // decisions. On blake3 and other
+                    // test-heavy crates, every `#[test] fn x() {
+                    // assert_eq!(a, b); }` was being flagged as a
+                    // candidate whose "conditions" `left_val` and
+                    // `right_val` are the macro's own locals,
+                    // producing reached-but-unobserved false
+                    // positives in the AllUnobserved verdict.
+                    if is_stdlib_macro_span(prov.source_file.as_deref()) {
+                        continue;
+                    }
                     raw_candidates.push(RawCandidate {
                         tree: floyd::DecisionTree {
                             decisions: vec![node],
                         },
-                        prov: correlate::provenance_for(f),
+                        prov,
                         artifact_idx: art_idx,
                         fn_idx,
                     });
@@ -1094,6 +1111,28 @@ fn format_inputs(conditions: &[String], row: &TruthTableRow) -> String {
         .map(|c| format!("{c}={}", bool_glyph(row.inputs[c])))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Does this source-file path belong to the standard-library
+/// macro expansion namespace that rustc stamps at compile time?
+///
+/// The canonical shape is `/rustc/<hash>/library/<crate>/src/...`
+/// where `<crate>` is `core`, `std`, `alloc`, `proc_macro`, or a
+/// test-harness crate. Also catches cargo-registry proc-macro
+/// expansions whose spans point back to the macro definition
+/// site rather than the user call site. Candidates whose
+/// decision lives in those paths are macro hygiene bindings
+/// (`left_val` / `right_val` from `assert_eq!`, etc.), not
+/// user-written decisions, and should not be surfaced as MC/DC
+/// candidates.
+fn is_stdlib_macro_span(file: Option<&str>) -> bool {
+    let Some(f) = file else {
+        return false;
+    };
+    f.starts_with("/rustc/")
+        || f.contains("/library/core/")
+        || f.contains("/library/std/")
+        || f.contains("/library/alloc/")
 }
 
 fn print_out_of_scope_report(

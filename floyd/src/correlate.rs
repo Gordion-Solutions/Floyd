@@ -400,6 +400,29 @@ fn collect_condition_spans(f: &MirFunction) -> BTreeMap<String, SourceSpan> {
                             .or_insert_with(|| span.clone());
                     }
                 }
+                MirStatement::AssignBinaryCompare {
+                    op,
+                    lhs,
+                    rhs,
+                    span: Some(span),
+                    ..
+                } => {
+                    // Inline-compare pattern `_T = Op(lhs, rhs);
+                    // switchInt(_T) -> ...` (e.g. `byte >= 32 &&
+                    // byte <= 126` in base64's `is_valid_b64_symbol`).
+                    // The decomposer synthesises a condition name
+                    // like `byte >= 32` via `compare_condition_name`
+                    // and feeds it to the tree. Without this entry
+                    // the span map had NO name for `_T`, so Pass 3
+                    // correlation produced zero observations
+                    // against runtime branch counts even though
+                    // llvm-cov reports the branch region at exactly
+                    // the compare's statement span. Mirror the
+                    // decomposer's naming so correlation lands.
+                    if let Some(name) = crate::decision::compare_condition_name(*op, lhs, rhs, f) {
+                        spans.entry(name).or_insert_with(|| span.clone());
+                    }
+                }
                 _ => {}
             }
         }

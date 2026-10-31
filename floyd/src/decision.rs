@@ -1132,7 +1132,7 @@ fn synthesize_compare_name(block: &MirBlock, discr: LocalId, f: &MirFunction) ->
 /// through `synthesize_compare_name` to the decomposer, which
 /// then declines the function — "no decision recovered" is the
 /// correct output here.
-fn compare_condition_name(
+pub(crate) fn compare_condition_name(
     op: CompareOp,
     lhs: &Operand,
     rhs: &Operand,
