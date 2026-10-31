@@ -59,6 +59,14 @@ pub struct SourceSpan {
 pub struct Mir {
     /// Top-level functions in source order.
     pub functions: Vec<MirFunction>,
+    /// Count of function definitions in the input text whose fn
+    /// header the parser could not recognise. The function body is
+    /// skipped (brace-balanced); the count surfaces that something
+    /// was elided so the honest-scope report can tell a reader
+    /// "Floyd parsed M of M+N functions in this MIR, N were in
+    /// shapes the engine's grammar does not yet model (HRTB
+    /// signatures, complex trait objects, ...)".
+    pub unparseable_functions: usize,
 }
 
 /// One function's MIR.
@@ -235,6 +243,22 @@ pub enum MirStatement {
         lhs: Operand,
         /// Right-hand operand.
         rhs: Operand,
+        /// Source span, if present in the MIR.
+        span: Option<SourceSpan>,
+    },
+    /// `_<dst> = Not(copy _<src>);` (or `move _<src>`).
+    ///
+    /// Boolean unary negation. Emitted by rustc when
+    /// `-Cinstrument-coverage` runs with
+    /// `-Zcoverage-options=branch,condition` — the Not operation's
+    /// two outcomes need their own branch counter, so rustc
+    /// materialises it as a distinct statement instead of folding
+    /// the `!` into a switchInt arm swap (the fallback shape).
+    AssignUnaryNot {
+        /// Destination local (bool-typed).
+        dst: LocalId,
+        /// Source local being negated.
+        src: LocalId,
         /// Source span, if present in the MIR.
         span: Option<SourceSpan>,
     },
@@ -500,13 +524,30 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
         // Open a brace: either a function or a basic block header.
         if code.ends_with('{') {
             if depth == 0 {
-                let f = parse_fn_header(code).ok_or_else(|| ParseError {
-                    line: line_no,
-                    message: format!("expected fn header, got: {code}"),
-                })?;
-                current_fn = Some(f);
-                depth = 1;
-                continue;
+                match parse_fn_header(code) {
+                    Some(f) => {
+                        current_fn = Some(f);
+                        depth = 1;
+                        continue;
+                    }
+                    None => {
+                        // Error-tolerant: an unparseable fn header
+                        // (complex HRTB generics, trait object
+                        // return types the current grammar does
+                        // not model) skips the whole function body
+                        // via the `skip_depth` mechanism. One
+                        // unparseable function must not kill the
+                        // whole MIR parse — a 2.9MB MIR with 360
+                        // functions should surface the 359 that
+                        // DO parse. The count is tracked so the
+                        // honest-scope reporter can say "N
+                        // functions could not be parsed by this
+                        // engine's MIR grammar".
+                        mir.unparseable_functions += 1;
+                        skip_depth = 1;
+                        continue;
+                    }
+                }
             } else if depth == 1 {
                 let id = parse_bb_header(code).ok_or_else(|| ParseError {
                     line: line_no,
@@ -1073,6 +1114,15 @@ fn parse_statement(line: &str, span: Option<SourceSpan>) -> Option<MirStatement>
             rhs: cmp.rhs,
             span,
         });
+    }
+    // `_X = Not(copy _Y);` / `_X = Not(move _Y);` — boolean unary
+    // negation. See `MirStatement::AssignUnaryNot` for context.
+    if let Some(inner) = rhs.strip_prefix("Not(") {
+        if let Some(arg) = inner.strip_suffix(')') {
+            if let Some(src) = parse_local_token(arg.trim()) {
+                return Some(MirStatement::AssignUnaryNot { dst, src, span });
+            }
+        }
     }
     None
 }

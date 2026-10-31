@@ -371,7 +371,7 @@ fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node>
 /// Type of a local as declared in the function header or `let`
 /// declarations. Returns `None` for synthetic locals (return place,
 /// temporaries) that don't appear in either list.
-fn local_type(f: &MirFunction, local: LocalId) -> Option<&str> {
+pub(crate) fn local_type(f: &MirFunction, local: LocalId) -> Option<&str> {
     f.args
         .iter()
         .find(|a| a.local == local)
@@ -492,7 +492,7 @@ fn try_match_from_block(
 }
 
 /// How `try_match_from_block` names its synthetic conditions.
-enum MatchNamingStyle {
+pub(crate) enum MatchNamingStyle {
     IntegerLiteral {
         scrutinee_name: String,
     },
@@ -503,7 +503,7 @@ enum MatchNamingStyle {
 }
 
 impl MatchNamingStyle {
-    fn cond_for_value(&self, value: u128) -> String {
+    pub(crate) fn cond_for_value(&self, value: u128) -> String {
         match self {
             MatchNamingStyle::IntegerLiteral { scrutinee_name } => {
                 format!("{scrutinee_name} == {value}")
@@ -526,7 +526,92 @@ impl MatchNamingStyle {
 /// reference types fail this check and the namer falls back to a
 /// bare `variant_<N>` to avoid producing ugly conditions like
 /// `r == Result<bool, ()>::variant_0`.
-fn is_simple_type_identifier(s: &str) -> bool {
+/// Return the synthetic condition names a `switchInt` on an integer
+/// or enum discriminant would surface through the match / if-let
+/// decomposer, in the order those names appear as `cond` fields of
+/// the resulting ITE tree (outermost arm first).
+///
+/// Used by [`crate::correlate::collect_condition_spans`] to tie
+/// synthesised names like `x == 0` and `x == Option::variant_1` to
+/// the switchInt's source span, so runtime branch counts for the
+/// `match` / `if let` land on the right condition. Mirrors
+/// [`try_match_from_block`]'s naming exactly — if the two drift,
+/// correlation silently misses matches.
+///
+/// Returns `None` when `block` is not a match/if-let-shaped
+/// switchInt (bool short-circuits, closures that read captured
+/// bools, and `?`-style terminators are not this handler's
+/// responsibility).
+pub(crate) fn match_switchint_condition_names(
+    block: &MirBlock,
+    f: &MirFunction,
+    discr: LocalId,
+    targets: &[(u128, BlockId)],
+    otherwise: BlockId,
+) -> Option<Vec<String>> {
+    // Bool discriminants go through the handle_boolean path; their
+    // condition name is the discr's debug name or a synthesised
+    // compare name, not a `scrutinee == value` string.
+    if local_type(f, discr) == Some("bool") {
+        return None;
+    }
+    let enum_scrutinee = block.statements.iter().find_map(|s| match s {
+        MirStatement::AssignDiscriminant { dst, src, .. } if *dst == discr => Some(*src),
+        _ => None,
+    });
+    let style = match enum_scrutinee {
+        Some(scrutinee) => {
+            let scrutinee_name = f
+                .debug_names
+                .get(&scrutinee)
+                .cloned()
+                .unwrap_or_else(|| format!("_{scrutinee}"));
+            let scrutinee_type = local_type(f, scrutinee).map(str::to_string);
+            MatchNamingStyle::Enum {
+                scrutinee_name,
+                scrutinee_type,
+            }
+        }
+        None => {
+            let scrutinee_name = f
+                .debug_names
+                .get(&discr)
+                .cloned()
+                .unwrap_or_else(|| format!("_{discr}"));
+            MatchNamingStyle::IntegerLiteral { scrutinee_name }
+        }
+    };
+
+    // Same arm filter the decomposer uses: unreachable targets drop
+    // out before naming so correlator and decomposer stay in sync.
+    let reachable_arms: Vec<(u128, BlockId)> = targets
+        .iter()
+        .copied()
+        .filter(|(_, t)| !is_unreachable_block(*t, f))
+        .collect();
+    if reachable_arms.is_empty() {
+        return None;
+    }
+    let other_reachable = !is_unreachable_block(otherwise, f);
+
+    // The decomposer emits one `cond_for_value` per arm EXCEPT the
+    // last when `otherwise` is unreachable (that arm becomes the
+    // unconditional fallthrough — no condition in the tree).
+    let n_named = if other_reachable {
+        reachable_arms.len()
+    } else {
+        reachable_arms.len().saturating_sub(1)
+    };
+    Some(
+        reachable_arms
+            .iter()
+            .take(n_named)
+            .map(|(v, _)| style.cond_for_value(*v))
+            .collect(),
+    )
+}
+
+pub(crate) fn is_simple_type_identifier(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -676,6 +761,19 @@ fn try_if_let_from_block(block: &MirBlock, f: &MirFunction) -> Option<Node> {
     }))
 }
 
+/// Does this function contain at least one `switchInt` terminator?
+///
+/// Used by the honest-scope report in `cargo-floyd` to tell "the
+/// function has no decision at all" (pure straight-line code, pure
+/// Call delegation, etc.) apart from "the function HAS a decision
+/// but the engine's current patterns did not match it". The first
+/// case is uninteresting; the second is what the report surfaces.
+pub fn has_switchint(f: &MirFunction) -> bool {
+    f.blocks
+        .iter()
+        .any(|b| matches!(b.terminator, MirTerminator::SwitchInt { .. }))
+}
+
 fn is_unreachable_block(id: BlockId, f: &MirFunction) -> bool {
     f.blocks
         .iter()
@@ -691,6 +789,102 @@ fn downcast_variant_for(b: &MirBlock, scrutinee: LocalId) -> Option<String> {
         }
         _ => None,
     })
+}
+
+/// Does this block's terminator look like a rustc
+/// `-Zcoverage-options=branch,condition` branch counter rather than a
+/// logical boolean switchInt?
+///
+/// The marker shape is `switchInt(_X) -> [0: A, otherwise: B]` where
+/// `A` and `B` both have terminator `goto <common>`, and `_X` is
+/// assigned by a statement in the current block. When this holds,
+/// the switchInt is instrumentation emitted by rustc to count the
+/// two outcomes of `_X` for coverage purposes — it does not
+/// discriminate real control flow, so decomposition should treat
+/// the assignment to `_X` as the block's terminal value.
+fn is_coverage_branch_counter(
+    block: &MirBlock,
+    discr: LocalId,
+    targets: &[(u128, BlockId)],
+    otherwise: BlockId,
+    f: &MirFunction,
+) -> bool {
+    // Boolean shape: a single explicit `0` arm plus `otherwise`.
+    if targets.len() != 1 || targets[0].0 != 0 {
+        return false;
+    }
+    // Both arms immediately `goto` the same successor.
+    let then_succ = goto_target(f, otherwise);
+    let else_succ = goto_target(f, targets[0].1);
+    if then_succ.is_none() || then_succ != else_succ {
+        return false;
+    }
+    // Both arms must be pure instrumentation — no value-producing
+    // assignments. In rustc's branch-counter emission the arms
+    // contain only a `Coverage::VirtualCounter` statement plus the
+    // `goto`. Without this guard, legitimate shapes like
+    // `_3 = Gt(_1, const 50); switchInt(_3) -> [0: {_0 = const
+    // false; goto X}, otherwise: {_0 = copy _2; goto X}]` — a real
+    // inline-comparison `&&` — would be absorbed, hiding the
+    // decision from the decomposer.
+    for &arm_id in &[otherwise, targets[0].1] {
+        if let Some(arm) = f.blocks.iter().find(|b| b.id == arm_id) {
+            if arm.statements.iter().any(is_value_producing_assign) {
+                return false;
+            }
+        }
+    }
+    // The discriminant is assigned by a statement in THIS block.
+    // Without this check we would absorb switchInts on inherited
+    // values (where the counter interpretation does not apply).
+    block
+        .statements
+        .iter()
+        .any(|stmt| statement_writes(stmt, discr))
+}
+
+/// Does `stmt` write to any local via a value-producing assignment?
+/// Used to distinguish coverage-instrumentation arms (which only
+/// contain `Coverage::VirtualCounter` + `goto`) from legitimate
+/// branch arms (which assign to `_0` or another local).
+fn is_value_producing_assign(stmt: &MirStatement) -> bool {
+    matches!(
+        stmt,
+        MirStatement::AssignConstBool { .. }
+            | MirStatement::AssignCopy { .. }
+            | MirStatement::AssignBinaryCompare { .. }
+            | MirStatement::AssignCaptureRead { .. }
+            | MirStatement::AssignDiscriminant { .. }
+            | MirStatement::AssignDowncast { .. }
+            | MirStatement::AssignUnaryNot { .. }
+    )
+}
+
+/// Return the `goto` target of `block_id` if its terminator is a
+/// plain `Goto`, else `None`.
+fn goto_target(f: &MirFunction, block_id: BlockId) -> Option<BlockId> {
+    f.blocks.iter().find(|b| b.id == block_id).and_then(|b| {
+        if let MirTerminator::Goto { target, .. } = &b.terminator {
+            Some(*target)
+        } else {
+            None
+        }
+    })
+}
+
+/// Does `stmt` write to local `dst_local`? Covers every statement
+/// kind the decomposer treats as a value-producing assignment.
+fn statement_writes(stmt: &MirStatement, dst_local: LocalId) -> bool {
+    match stmt {
+        MirStatement::AssignConstBool { dst, .. }
+        | MirStatement::AssignCopy { dst, .. }
+        | MirStatement::AssignBinaryCompare { dst, .. }
+        | MirStatement::AssignCaptureRead { dst, .. }
+        | MirStatement::AssignDiscriminant { dst, .. }
+        | MirStatement::AssignDowncast { dst, .. }
+        | MirStatement::AssignUnaryNot { dst, .. } => *dst == dst_local,
+        _ => false,
+    }
 }
 
 /// Extract a leaf [`Node`] from a terminal block.
@@ -709,7 +903,29 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
     // would short-circuit as a terminal value, hiding the `&&` from
     // the decomposer.
     let in_block_switchint = match &block.terminator {
-        MirTerminator::SwitchInt { discr, .. } => Some(*discr),
+        MirTerminator::SwitchInt {
+            discr,
+            targets,
+            otherwise,
+            ..
+        } => {
+            // Coverage-instrumentation branch counter:
+            // `switchInt(_X) -> [0: A, otherwise: B]` where both A
+            // and B `goto` the same successor. Rustc inserts this
+            // when `-Cinstrument-coverage` runs with
+            // `-Zcoverage-options=branch,condition` to count the
+            // two outcomes of a boolean sub-expression — it has no
+            // effect on logical control flow. Classify it as "not
+            // a real switchInt on `_X`" so the preceding
+            // assignment to `_X` in this block (`_0 = copy _4;`
+            // on the terminal leaf of an `&&`/`||` chain) is
+            // accepted as the terminal value.
+            if is_coverage_branch_counter(block, *discr, targets, *otherwise, f) {
+                None
+            } else {
+                Some(*discr)
+            }
+        }
         _ => None,
     };
     let downstream_switchint = match &block.terminator {
@@ -762,6 +978,24 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
             MirStatement::AssignCopy { dst, src, .. } if !feeds_switchint(*dst) => {
                 if let Some(name) = f.debug_names.get(src) {
                     return Some(Node::Condition { name: name.clone() });
+                }
+            }
+            MirStatement::AssignUnaryNot { dst, src, .. } if !feeds_switchint(*dst) => {
+                // `_dst = Not(copy _src)` as a terminal value: the
+                // decision's result is `!<src_name>`. Emit a
+                // `Node::Condition` naming the complement
+                // (`!<src_name>`), so runtime branch counts coming
+                // from the Not's own branch counter — which track
+                // the NEGATED value — map cleanly onto the
+                // condition name shown in the report. (If instead
+                // we named the condition `<src_name>` with an ITE
+                // inversion, per-test observations would display
+                // the Not's output under the raw-input name,
+                // confusing the reader.)
+                if let Some(name) = f.debug_names.get(src) {
+                    return Some(Node::Condition {
+                        name: format!("!{name}"),
+                    });
                 }
             }
             MirStatement::AssignBinaryCompare {
@@ -958,6 +1192,46 @@ fn decide(_1: bool, _2: bool) -> bool {
 }
 "#;
 
+    /// `rustc --emit=mir` output for `fn decide(a, b) -> bool { a && b }`
+    /// as emitted with `-Zcoverage-options=branch,condition` — the
+    /// terminal `b` leaf has an extra `switchInt(_0)` branch counter
+    /// whose arms both `goto` a common successor without touching
+    /// `_0`. The engine should treat it as pure instrumentation and
+    /// recover the same ITE as the un-instrumented shape.
+    const DECIDE_COVERAGE_COUNTER_AND_MIR: &str = r#"
+fn decide(_1: bool, _2: bool) -> bool {
+    debug a => _1;
+    debug b => _2;
+    let mut _0: bool;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = copy _2;
+        switchInt(copy _0) -> [0: bb4, otherwise: bb3];
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb5;
+    }
+
+    bb3: {
+        goto -> bb5;
+    }
+
+    bb4: {
+        goto -> bb5;
+    }
+
+    bb5: {
+        return;
+    }
+}
+"#;
+
     /// `rustc --emit=mir` output for `fn decide(a, b) -> bool { a || b }`.
     const DECIDE_OR_MIR: &str = r#"
 fn decide(_1: bool, _2: bool) -> bool {
@@ -1099,6 +1373,71 @@ fn decide(_1: bool, _2: bool, _3: bool) -> bool {
         let tree = decompose(&mir);
         assert_eq!(tree.decisions.len(), 1);
         assert_eq!(tree.decisions[0], ite("a", const_(false), cond("b")));
+    }
+
+    /// `rustc --emit=mir` output for `fn decide(a) -> bool { !a }`
+    /// as emitted with `-Zcoverage-options=branch,condition` — the
+    /// `!` becomes an explicit `_0 = Not(copy _1)` statement
+    /// followed by a coverage branch counter switchInt.
+    const DECIDE_NOT_WITH_COVERAGE_COUNTER_MIR: &str = r#"
+fn decide(_1: bool) -> bool {
+    debug a => _1;
+    let mut _0: bool;
+
+    bb0: {
+        _0 = Not(copy _1);
+        switchInt(copy _0) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        goto -> bb3;
+    }
+
+    bb2: {
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn decompose_recovers_unary_not_as_negated_condition() {
+        // `!a` compiled with `-Zcoverage-options=branch,condition`:
+        // the Not is materialised as `_0 = Not(copy _1)` followed
+        // by a coverage branch counter switchInt(_0). The
+        // decomposer treats the terminal value as `Condition{"!a"}`
+        // so the branch counter's true/false counts (which track
+        // the Not's OUTPUT value) map onto the correct condition
+        // name in the report. Alternative naming (`Condition{"a"}`
+        // with an ITE inversion) would display the Not's output
+        // under the raw-input name — confusing to readers.
+        let mir = mir::parse_text(DECIDE_NOT_WITH_COVERAGE_COUNTER_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(tree.decisions[0], cond("!a"));
+    }
+
+    #[test]
+    fn decompose_sees_through_coverage_branch_counter_on_terminal_leaf() {
+        // `a && b` compiled with `-Zcoverage-options=branch,condition`.
+        // The terminal `b` leaf becomes `_0 = copy _2; switchInt(_0)
+        // -> [0: bb4, otherwise: bb3]` with `bb3` and `bb4` both just
+        // `goto bb5`. That inner switchInt is a rustc coverage branch
+        // counter, not a logical switch — the decomposer treats it
+        // as if the block ended `goto bb5` and recovers the same ITE
+        // as the un-instrumented shape. Without this handling,
+        // coverage-instrumented MIR for any pure-boolean function
+        // whose body IS the returned expression declines to
+        // decompose (production-visible: no user running `cargo
+        // floyd test` on `pub fn foo(...) -> bool { ... }` would
+        // see MC/DC output).
+        let mir = mir::parse_text(DECIDE_COVERAGE_COUNTER_AND_MIR).expect("MIR parses");
+        let tree = decompose(&mir);
+        assert_eq!(tree.decisions.len(), 1);
+        assert_eq!(tree.decisions[0], ite("a", cond("b"), const_(false)));
     }
 
     /// `rustc --emit=mir` output for

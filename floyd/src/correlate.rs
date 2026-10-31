@@ -37,7 +37,7 @@
 use crate::decision::{self, DecisionTree};
 use crate::masking::ConditionObservation;
 use crate::mir::{Mir, MirFunction, MirStatement, MirTerminator, SourceSpan};
-use crate::profile::CoverageReport;
+use crate::profile::{CoverageReport, FunctionCoverage};
 use std::collections::BTreeMap;
 
 /// The result of joining MIR decision structure with runtime
@@ -151,6 +151,154 @@ pub fn observation_from_coverage(
     })
 }
 
+/// A MIR with per-function condition-span maps pre-computed.
+///
+/// `observation_from_coverage` and the lower-level [`correlate`] both
+/// rebuild `collect_condition_spans` for every function on every
+/// call. On a crate with hundreds of tests and a MIR that holds
+/// hundreds of monomorphised functions, Pass 3 rebuilds the same
+/// span map `candidates × tests` times — easily tens of millions of
+/// redundant walks on a large crate. `PreparedMir` builds every
+/// function's span map ONCE at Pass 1 so Pass 3 is just lookup +
+/// join against runtime counts.
+pub struct PreparedMir<'m> {
+    /// The MIR itself. Borrowed to keep the pre-computation cost
+    /// out of ownership.
+    pub mir: &'m Mir,
+    /// Function name → `(name → SourceSpan)` map. Function ordering
+    /// matches `mir.functions` for direct indexed access when
+    /// callers need it.
+    pub function_spans: Vec<BTreeMap<String, SourceSpan>>,
+}
+
+/// Build a [`PreparedMir`] for the given MIR, computing each
+/// function's condition-span map once up-front.
+pub fn prepare_mir(mir: &Mir) -> PreparedMir<'_> {
+    let function_spans = mir.functions.iter().map(collect_condition_spans).collect();
+    PreparedMir {
+        mir,
+        function_spans,
+    }
+}
+
+/// Build an [`ConditionObservation`] for one candidate and one
+/// test's coverage, using pre-computed span data and the candidate's
+/// known home-function index.
+///
+/// The old `observation_from_coverage` iterated EVERY function in
+/// the MIR against every call — correct, but on a big crate with
+/// hundreds of monomorphised functions and thousands of tests it
+/// turned Pass 3 into billions of operations. Pass 3 only cares
+/// about the decision rooted in the candidate's own function, so
+/// this entry point consults just `prepared.function_spans[fn_idx]`
+/// and the matching coverage function — O(branches) per call.
+///
+/// `prepared_cov` is a per-test coverage lookup table (`name` →
+/// `&FunctionCoverage`) that lets us skip the linear
+/// `find_matching_function` scan + `rustc_demangle` work on every
+/// call. Built once per test's coverage via
+/// [`prepare_coverage_lookup`].
+pub fn observation_from_prepared_coverage(
+    test_name: Option<String>,
+    prepared: &PreparedMir<'_>,
+    fn_idx: usize,
+    prepared_cov: &PreparedCoverage<'_>,
+    tree: &DecisionTree,
+) -> Option<ConditionObservation> {
+    let f = prepared.mir.functions.get(fn_idx)?;
+    let spans = prepared.function_spans.get(fn_idx)?;
+    let cov_fn = prepared_cov.find(&f.name)?;
+    let mut inputs = BTreeMap::new();
+    for (name, span) in spans {
+        if let Some(branch) = cov_fn.branches.iter().find(|b| spans_match(&b.span, span)) {
+            if branch.true_count > 0 {
+                inputs.insert(name.clone(), true);
+            } else if branch.false_count > 0 {
+                inputs.insert(name.clone(), false);
+            }
+        }
+    }
+    let decision_node = tree.decisions.first()?;
+    let result = decision::evaluate_partial(decision_node, &inputs)?;
+    Some(ConditionObservation {
+        test_name,
+        inputs,
+        result,
+    })
+}
+
+/// Per-test coverage lookup accelerator.
+///
+/// `find_matching_function` on a bare `CoverageReport` is a linear
+/// scan over every function in the coverage, demangling each name
+/// on every call. On a crate with 100 coverage functions and 1000
+/// tests × 10 candidates, that is 1,000,000 `rustc_demangle` calls.
+/// `PreparedCoverage` pre-computes a tail-indexed lookup once per
+/// test coverage so Pass 3 lookup is O(1) per call.
+pub struct PreparedCoverage<'c> {
+    /// The raw coverage report.
+    pub coverage: &'c CoverageReport,
+    /// `tail(demangled)` → index into `coverage.functions`. The tail
+    /// is the final `::`-segment or the segment after a legacy
+    /// `::h` hash strip; it matches a MIR function name directly.
+    tail_lookup: std::collections::HashMap<String, usize>,
+}
+
+impl<'c> PreparedCoverage<'c> {
+    /// O(1) analogue of a linear scan over `coverage.functions`.
+    pub fn find(&self, mir_name: &str) -> Option<&FunctionCoverage> {
+        // Exact name first (fast path for coverage symbols that
+        // happen to match the mir name verbatim).
+        if let Some(f) = self.coverage.functions.iter().find(|c| c.name == mir_name) {
+            return Some(f);
+        }
+        let idx = *self.tail_lookup.get(mir_name)?;
+        self.coverage.functions.get(idx)
+    }
+}
+
+/// Pre-compute [`PreparedCoverage`] for one coverage report.
+pub fn prepare_coverage_lookup(coverage: &CoverageReport) -> PreparedCoverage<'_> {
+    let mut tail_lookup: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::with_capacity(coverage.functions.len() * 2);
+    for (idx, c) in coverage.functions.iter().enumerate() {
+        let demangled = rustc_demangle::demangle(&c.name).to_string();
+        let trimmed = demangled
+            .rsplit_once("::h")
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(demangled.as_str())
+            .to_string();
+        // Full trimmed name (useful when `mir_name == trimmed`).
+        tail_lookup.entry(trimmed.clone()).or_insert(idx);
+        // Suffix matches: last `::`-separated segment, and tail
+        // starting at any `::`. These mirror the matching strategy
+        // in `find_matching_function` so lookup produces the same
+        // result for every mir_name that function would accept.
+        if let Some(last) = trimmed.rsplit("::").next() {
+            tail_lookup.entry(last.to_string()).or_insert(idx);
+        }
+        // Also index each suffix `::<...>` so `mir_name` that
+        // starts midway through a path (e.g. an impl bracket) still
+        // lands. We walk the string and index each `::` suffix.
+        let mut rest = trimmed.as_str();
+        while let Some(pos) = rest.find("::") {
+            rest = &rest[pos + 2..];
+            tail_lookup.entry(rest.to_string()).or_insert(idx);
+        }
+    }
+    PreparedCoverage {
+        coverage,
+        tail_lookup,
+    }
+}
+
+/// Deprecated: use [`observation_from_prepared_coverage`] with
+/// [`prepare_coverage_lookup`] for cheap Pass 3 correlation. Kept
+/// because the single-source mode and the public API still rely
+/// on it.
+#[allow(dead_code)]
+fn _unused_old_prepared_observation() {}
+
 /// Collect a `name -> SourceSpan` map for every named condition that
 /// appears in the function's MIR.
 ///
@@ -195,24 +343,64 @@ fn collect_condition_spans(f: &MirFunction) -> BTreeMap<String, SourceSpan> {
     for block in &f.blocks {
         if let MirTerminator::SwitchInt {
             discr,
+            targets,
+            otherwise,
             span: Some(span),
             ..
         } = &block.terminator
         {
+            // Debug-named discriminant: bool short-circuits and the
+            // inline-compare temporaries (whose debug names are set
+            // by name propagation) land here.
             if let Some(name) = f.debug_names.get(discr) {
                 spans.entry(name.clone()).or_insert_with(|| span.clone());
             }
+            // Match / if-let synthetic conditions: tie
+            // `x == 0`, `x == Option::variant_1`, etc. to the
+            // switchInt's source span so coverage branch counts
+            // for the arm land on the right condition name. Without
+            // this, every `pub fn f(x: Option<..>) -> bool { if let
+            // Some(_) = x { .. } else { .. } }` reports 0
+            // observations even when its tests exercise both arms.
+            if let Some(names) = crate::decision::match_switchint_condition_names(
+                block, f, *discr, targets, *otherwise,
+            ) {
+                for name in names {
+                    spans.entry(name).or_insert_with(|| span.clone());
+                }
+            }
         }
         for stmt in &block.statements {
-            if let MirStatement::AssignCopy {
-                src,
-                span: Some(span),
-                ..
-            } = stmt
-            {
-                if let Some(name) = f.debug_names.get(src) {
-                    spans.entry(name.clone()).or_insert_with(|| span.clone());
+            match stmt {
+                MirStatement::AssignCopy {
+                    src,
+                    span: Some(span),
+                    ..
+                } => {
+                    if let Some(name) = f.debug_names.get(src) {
+                        spans.entry(name.clone()).or_insert_with(|| span.clone());
+                    }
                 }
+                MirStatement::AssignUnaryNot {
+                    src,
+                    span: Some(span),
+                    ..
+                } => {
+                    // `_dst = Not(copy _src)` — rustc emits a
+                    // dedicated branch counter on the Not's OUTPUT,
+                    // so the natural condition identity at this
+                    // span is `!<src_name>` (its true/false counts
+                    // reflect `!<src_name>`'s runtime value). The
+                    // decomposer encodes the terminal value as
+                    // `Node::Condition { name: "!<src_name>" }` to
+                    // match.
+                    if let Some(name) = f.debug_names.get(src) {
+                        spans
+                            .entry(format!("!{name}"))
+                            .or_insert_with(|| span.clone());
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -258,6 +446,58 @@ fn find_matching_function<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `_X = discriminant(_scrutinee); switchInt(_X) -> ...` for a
+    /// 2-variant enum should surface the "scrutinee == variant_N"
+    /// condition name mapped to the switchInt's source span, so
+    /// coverage branch counts for the arm land under that name
+    /// during correlation.
+    #[test]
+    fn collect_condition_spans_covers_enum_switchint_variant() {
+        let mir_text = r#"
+fn decide(_1: Option<i32>) -> bool {
+    debug x => _1;
+    let mut _0: bool;
+    let mut _2: isize;
+
+    bb0: {
+        _2 = discriminant(_1);           // scope 0 at src/lib.rs:5:12: 5:19
+        switchInt(move _2) -> [1: bb2, 0: bb1, otherwise: bb3]; // scope 0 at src/lib.rs:5:12: 5:19
+    }
+
+    bb1: {
+        _0 = const false;
+        goto -> bb4;
+    }
+
+    bb2: {
+        _0 = const true;
+        goto -> bb4;
+    }
+
+    bb3: {
+        unreachable;
+    }
+
+    bb4: {
+        return;
+    }
+}
+"#;
+        let mir = crate::mir::parse_text(mir_text).expect("MIR parses");
+        let f = mir.functions.first().expect("one function parsed");
+        let spans = collect_condition_spans(f);
+        // Decomposer surfaces `x == variant_1` (the `Some` arm value,
+        // since the Option type carries generic parameters and so is
+        // not a "simple type identifier"). That exact string must be
+        // present in the span map so runtime counts for the switchInt
+        // branch region are joined to the condition name.
+        assert!(
+            spans.contains_key("x == variant_1"),
+            "spans did not contain the synthesised match condition name; got: {:?}",
+            spans.keys().collect::<Vec<_>>()
+        );
+    }
     use crate::mir;
     use crate::profile;
 
