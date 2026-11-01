@@ -33,6 +33,99 @@ mod selector;
 use std::path::Path;
 use std::process::ExitCode;
 
+/// How runtime mode resolved candidate selection. Carried in the
+/// JSON report so a consumer can tell a real verdict apart from the
+/// two decline paths without parsing stderr.
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeVerdict {
+    /// A candidate was picked and `analysis` holds its verdict.
+    Analysed,
+    /// No decomposable boolean decision was found.
+    NoCandidates,
+    /// Decomposable decisions were found but no test produced a
+    /// usable observation for any of them.
+    AllUnobserved,
+}
+
+/// A function with a `switchInt`-shaped decision that the engine's
+/// current patterns did not match.
+#[derive(serde::Serialize, Clone, Debug)]
+struct DeclinedFunction {
+    name: String,
+    source_file: Option<String>,
+    line: Option<u32>,
+}
+
+/// One decomposable candidate the engine considered, with whether
+/// any test reached its function at runtime.
+#[derive(serde::Serialize, Clone, Debug)]
+struct CandidateSummary {
+    function_name: Option<String>,
+    source_file: Option<String>,
+    line: Option<u32>,
+    /// True when at least one test's coverage shows the function
+    /// was executed.
+    invoked: bool,
+    /// Number of tests that produced a usable observation.
+    observations: usize,
+}
+
+/// A test-binary MIR file skipped by the size guard.
+#[derive(serde::Serialize, Clone, Debug)]
+struct SkippedMir {
+    path: String,
+    bytes: u64,
+}
+
+/// JSON document for `cargo floyd test --format=json` on a cargo
+/// project. Emitted on every exit path, including the two decline
+/// paths, so `out_of_scope` and `candidates` are always obtainable.
+#[derive(serde::Serialize)]
+struct CargoRuntimeReport<'a> {
+    manifest: String,
+    workspace_root: String,
+    test_targets: usize,
+    verdict: RuntimeVerdict,
+    tests_discovered: &'a [String],
+    observations: &'a [ConditionObservation],
+    /// `None` unless `verdict` is `analysed`.
+    analysis: Option<&'a RuntimeAnalysis>,
+    /// Every decomposable candidate considered, before selection.
+    candidates: &'a [CandidateSummary],
+    /// Functions with a `switchInt`-shaped decision that the
+    /// engine's current patterns did not match. The engine declined
+    /// them rather than report a wrong verdict — honest-scope
+    /// evidence for ISO 26262 / DO-178C qualification audits.
+    out_of_scope: &'a [DeclinedFunction],
+    /// MIR files above the size guard that were not analysed.
+    skipped_oversize_mirs: &'a [SkippedMir],
+}
+
+/// JSON document for `cargo floyd test --format=json <file.rs>`.
+#[derive(serde::Serialize)]
+struct SingleRuntimeReport<'a> {
+    source: String,
+    verdict: RuntimeVerdict,
+    tests_discovered: &'a [String],
+    observations: &'a [ConditionObservation],
+    /// `None` unless `verdict` is `analysed`.
+    analysis: Option<&'a RuntimeAnalysis>,
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> Result<(), ExitCode> {
+    match serde_json::to_string_pretty(value) {
+        Ok(s) => {
+            println!("{s}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("cargo-floyd: serialize JSON: {e}");
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 enum Format {
     Text,
@@ -347,13 +440,6 @@ fn run_test_mode_cargo(
         prov: floyd::DecisionProvenance,
         artifact_idx: usize,
         fn_idx: usize,
-    }
-
-    #[derive(serde::Serialize, Clone, Debug)]
-    struct DeclinedFunction {
-        name: String,
-        source_file: Option<String>,
-        line: Option<u32>,
     }
 
     let mut artifacts: Vec<ArtifactInfo> = Vec::new();
@@ -717,6 +803,57 @@ fn run_test_mode_cargo(
     }
     let reached_count = candidate_reach.iter().filter(|r| **r).count();
     let unreached_count = candidate_reach.len() - reached_count;
+    let candidate_summaries: Vec<CandidateSummary> = candidates
+        .iter()
+        .zip(candidate_reach.iter())
+        .map(|(c, reached)| CandidateSummary {
+            function_name: c.provenance.function_name.clone(),
+            source_file: c.provenance.source_file.clone(),
+            line: c.provenance.line,
+            invoked: *reached,
+            observations: c.observations.len(),
+        })
+        .collect();
+    let skipped_mirs: Vec<SkippedMir> = skipped_oversize_mirs
+        .iter()
+        .map(|(path, bytes)| SkippedMir {
+            path: path.display().to_string(),
+            bytes: *bytes,
+        })
+        .collect();
+    let manifest_str = manifest.display().to_string();
+    let workspace_root_str = build.workspace_root.display().to_string();
+    let test_targets = build.test_artifacts.len();
+    let report = |verdict, observations, analysis| CargoRuntimeReport {
+        manifest: manifest_str.clone(),
+        workspace_root: workspace_root_str.clone(),
+        test_targets,
+        verdict,
+        tests_discovered: &all_tests,
+        observations,
+        analysis,
+        candidates: &candidate_summaries,
+        out_of_scope: &declined,
+        skipped_oversize_mirs: &skipped_mirs,
+    };
+    // Decline paths: the human-readable explanation goes to stderr
+    // in every format; stdout carries only the format's document.
+    let emit_decline = |verdict| -> ExitCode {
+        match format {
+            Format::Text => {
+                print_out_of_scope_report(&mut std::io::stdout(), &declined, &skipped_oversize_mirs)
+            }
+            Format::Json => {
+                if let Err(code) = print_json(&report(verdict, &[], None)) {
+                    return code;
+                }
+            }
+            Format::Junit => {
+                print_out_of_scope_report(&mut std::io::stderr(), &declined, &skipped_oversize_mirs)
+            }
+        }
+        ExitCode::from(1)
+    };
 
     let chosen = match selector::pick_best(candidates) {
         selector::PickResult::Picked(c) => c,
@@ -742,11 +879,10 @@ fn run_test_mode_cargo(
                      invoked by any test — add a test that calls \
                      one of your top-level `pub fn` decisions, or \
                      verify which candidates were considered via \
-                     --format=json's provenance block."
+                     --format=json's `candidates` list."
                 );
             }
-            print_out_of_scope_report(&declined, &skipped_oversize_mirs);
-            return ExitCode::from(1);
+            return emit_decline(RuntimeVerdict::AllUnobserved);
         }
         selector::PickResult::NoCandidates => {
             eprintln!(
@@ -757,8 +893,7 @@ fn run_test_mode_cargo(
                  non-boolean decisions and arms that end in a function \
                  call are out of scope."
             );
-            print_out_of_scope_report(&declined, &skipped_oversize_mirs);
-            return ExitCode::from(1);
+            return emit_decline(RuntimeVerdict::NoCandidates);
         }
     };
     let all_observations = chosen.observations.clone();
@@ -772,39 +907,15 @@ fn run_test_mode_cargo(
             println!();
             println!("Test targets: {}", build.test_artifacts.len());
             print_runtime_report_body(&all_tests, &all_observations, &analysis);
-            print_out_of_scope_report(&declined, &skipped_oversize_mirs);
+            print_out_of_scope_report(&mut std::io::stdout(), &declined, &skipped_oversize_mirs);
         }
         Format::Json => {
-            #[derive(serde::Serialize)]
-            struct Report<'a> {
-                manifest: String,
-                workspace_root: String,
-                test_targets: usize,
-                tests_discovered: &'a [String],
-                observations: &'a [ConditionObservation],
-                analysis: &'a RuntimeAnalysis,
-                /// Functions with a `switchInt`-shaped decision that
-                /// the engine's current patterns did not match. The
-                /// engine declined them rather than report a wrong
-                /// verdict — honest-scope evidence for ISO 26262 /
-                /// DO-178C qualification audits.
-                out_of_scope: &'a [DeclinedFunction],
-            }
-            let report = Report {
-                manifest: manifest.display().to_string(),
-                workspace_root: build.workspace_root.display().to_string(),
-                test_targets: build.test_artifacts.len(),
-                tests_discovered: &all_tests,
-                observations: &all_observations,
-                analysis: &analysis,
-                out_of_scope: &declined,
-            };
-            match serde_json::to_string_pretty(&report) {
-                Ok(s) => println!("{s}"),
-                Err(e) => {
-                    eprintln!("cargo-floyd: serialize JSON: {e}");
-                    return ExitCode::from(1);
-                }
+            if let Err(code) = print_json(&report(
+                RuntimeVerdict::Analysed,
+                &all_observations,
+                Some(&analysis),
+            )) {
+                return code;
             }
         }
         Format::Junit => {
@@ -929,6 +1040,21 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     }
 
     // 6. Pick the best candidate, run the analysis.
+    let report = |verdict, observations, analysis| SingleRuntimeReport {
+        source: source.display().to_string(),
+        verdict,
+        tests_discovered: &tests,
+        observations,
+        analysis,
+    };
+    let emit_decline = |verdict| -> ExitCode {
+        if let Format::Json = format {
+            if let Err(code) = print_json(&report(verdict, &[], None)) {
+                return code;
+            }
+        }
+        ExitCode::from(1)
+    };
     let chosen = match selector::pick_best(candidates) {
         selector::PickResult::Picked(c) => c,
         selector::PickResult::AllUnobserved => {
@@ -942,14 +1068,14 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
                  verify which candidates Floyd considered via \
                  `--format=json`'s provenance block."
             );
-            return ExitCode::from(1);
+            return emit_decline(RuntimeVerdict::AllUnobserved);
         }
         selector::PickResult::NoCandidates => {
             eprintln!(
                 "cargo-floyd: no recognised decisions in {}",
                 source.display()
             );
-            return ExitCode::from(1);
+            return emit_decline(RuntimeVerdict::NoCandidates);
         }
     };
     let observations = chosen.observations.clone();
@@ -959,25 +1085,12 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     match format {
         Format::Text => print_runtime_report(source, &tests, &observations, &analysis),
         Format::Json => {
-            #[derive(serde::Serialize)]
-            struct Report<'a> {
-                source: String,
-                tests_discovered: &'a [String],
-                observations: &'a [ConditionObservation],
-                analysis: &'a RuntimeAnalysis,
-            }
-            let report = Report {
-                source: source.display().to_string(),
-                tests_discovered: &tests,
-                observations: &observations,
-                analysis: &analysis,
-            };
-            match serde_json::to_string_pretty(&report) {
-                Ok(s) => println!("{s}"),
-                Err(e) => {
-                    eprintln!("cargo-floyd: serialize JSON: {e}");
-                    return ExitCode::from(1);
-                }
+            if let Err(code) = print_json(&report(
+                RuntimeVerdict::Analysed,
+                &observations,
+                Some(&analysis),
+            )) {
+                return code;
             }
         }
         Format::Junit => {
@@ -1239,12 +1352,14 @@ fn is_stdlib_macro_span(file: Option<&str>) -> bool {
 }
 
 fn print_out_of_scope_report(
+    out: &mut dyn std::io::Write,
     declined: &[impl std::fmt::Debug],
     skipped_oversize_mirs: &[(std::path::PathBuf, u64)],
 ) {
     if !declined.is_empty() {
-        println!();
-        println!(
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
             "Out of scope: {} function(s) have a decision in a shape \
              the engine's current patterns do not recognise. The engine \
              declined them rather than report a wrong verdict. See \
@@ -1253,8 +1368,9 @@ fn print_out_of_scope_report(
         );
     }
     if !skipped_oversize_mirs.is_empty() {
-        println!();
-        println!(
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
             "Skipped {} MIR file(s) above the 50 MB scalability \
              threshold (monomorphisation explosion in test \
              binaries). These artifacts were not analysed — \
@@ -1263,14 +1379,15 @@ fn print_out_of_scope_report(
             skipped_oversize_mirs.len()
         );
         for (path, size) in skipped_oversize_mirs.iter().take(5) {
-            println!(
+            let _ = writeln!(
+                out,
                 "  {}  ({:.0} MB)",
                 path.display(),
                 (*size as f64) / (1024.0 * 1024.0)
             );
         }
         if skipped_oversize_mirs.len() > 5 {
-            println!("  ... and {} more", skipped_oversize_mirs.len() - 5);
+            let _ = writeln!(out, "  ... and {} more", skipped_oversize_mirs.len() - 5);
         }
     }
 }
@@ -1377,6 +1494,48 @@ mod tests {
         assert_eq!(xml_escape("don't"), "don&apos;t");
         // Ampersand must run first so `&lt;` doesn't become `&amp;lt;`.
         assert_eq!(xml_escape("a < b & c"), "a &lt; b &amp; c");
+    }
+
+    #[test]
+    fn decline_json_report_carries_out_of_scope_and_candidates() {
+        let declined = vec![DeclinedFunction {
+            name: "crate::f".to_string(),
+            source_file: Some("src/lib.rs".to_string()),
+            line: Some(7),
+        }];
+        let candidates = vec![CandidateSummary {
+            function_name: Some("crate::g".to_string()),
+            source_file: Some("src/lib.rs".to_string()),
+            line: Some(12),
+            invoked: false,
+            observations: 0,
+        }];
+        let skipped = vec![SkippedMir {
+            path: "target/x.mir".to_string(),
+            bytes: 1,
+        }];
+        let report = CargoRuntimeReport {
+            manifest: "Cargo.toml".to_string(),
+            workspace_root: ".".to_string(),
+            test_targets: 1,
+            verdict: RuntimeVerdict::AllUnobserved,
+            tests_discovered: &[],
+            observations: &[],
+            analysis: None,
+            candidates: &candidates,
+            out_of_scope: &declined,
+            skipped_oversize_mirs: &skipped,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string_pretty(&report).unwrap()).unwrap();
+        assert_eq!(v["verdict"], "all_unobserved");
+        assert!(v["analysis"].is_null());
+        assert_eq!(v["observations"].as_array().unwrap().len(), 0);
+        assert_eq!(v["out_of_scope"][0]["name"], "crate::f");
+        assert_eq!(v["out_of_scope"][0]["line"], 7);
+        assert_eq!(v["candidates"][0]["function_name"], "crate::g");
+        assert_eq!(v["candidates"][0]["invoked"], false);
+        assert_eq!(v["skipped_oversize_mirs"][0]["bytes"], 1);
     }
 
     #[test]
