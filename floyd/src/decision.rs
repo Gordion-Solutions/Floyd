@@ -209,8 +209,8 @@ pub fn decompose_from_block(f: &MirFunction, block_id: BlockId) -> Option<Node> 
 }
 
 /// Guard for the branch-taken-as-result lift: both arms of a
-/// bool-switchInt must be `Call`-terminated AND neither Call target
-/// may be a panic / noreturn stdlib function.
+/// bool-switchInt must be `Call`- or `Assert`-terminated AND neither
+/// Call target may be a panic / noreturn stdlib function.
 ///
 /// Panic blacklist is matched by substring on the Call's `func_text`
 /// (the verbatim MIR expression of the called function). Catches
@@ -242,21 +242,12 @@ fn arms_are_non_panic_calls(f: &MirFunction, else_arm_id: BlockId, then_arm_id: 
                     || t.contains("::panic_fmt")
                     || t.contains("::unreachable"))
             }
-            // rustc also emits an `assert(cond, "...") -> [success:
-            // bbN, unwind ...]` terminator for overflow checks
-            // (`a + b` with checked arithmetic) and debug_assert!
-            // expansions. Floyd's current parser classifies this as
-            // `MirTerminator::Other`. The `success:` continuation
-            // IS the normal control-flow path — equivalent in
-            // effect to a non-panic Call for the branch-taken-as-
-            // result reading. Accept it here (narrowed by the
-            // `assert(` prefix + `-> [success:` structure so we
-            // do not sweep in arbitrary `Other` terminators we
-            // have not characterised).
-            MirTerminator::Other { text, .. } => {
-                let t = text.as_str();
-                t.contains("assert(") && t.contains("-> [success:")
-            }
+            // rustc's checked-operation terminator (overflow check
+            // on `a + b`, bounds check, divide-by-zero check). Its
+            // `success` continuation IS the normal control-flow
+            // path, equivalent in effect to a non-panic Call for
+            // the branch-taken-as-result reading.
+            MirTerminator::Assert { .. } => true,
             _ => false,
         }
     };
@@ -457,6 +448,7 @@ fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node>
         | MirTerminator::Return { .. }
         | MirTerminator::Unreachable { .. }
         | MirTerminator::Call { .. }
+        | MirTerminator::Assert { .. }
         | MirTerminator::Other { .. } => None,
     }
 }
@@ -1052,13 +1044,18 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
     // (semver's `ptr_as_str` regression: `debug repr => _1` was
     // false-positively surfaced as a 1-condition decision).
     //
+    // `Assert` is gated the same way: the statements before it set
+    // up the checked operation (`_5 = AddWithOverflow(..)`) and
+    // control continues to its `success` block, which produces the
+    // value.
+    //
     // `Goto`, `Return`, `Unreachable`, and `SwitchInt` all keep
     // the current-block assignments as either the terminal value
     // (`Goto`/`Return`) or as discriminant setup (`SwitchInt`,
     // handled via `feeds_switchint`), so they stay in scope.
     if matches!(
         &block.terminator,
-        MirTerminator::Call { .. } | MirTerminator::Other { .. }
+        MirTerminator::Call { .. } | MirTerminator::Assert { .. } | MirTerminator::Other { .. }
     ) {
         return None;
     }
@@ -2890,6 +2887,151 @@ fn <impl at a.rs:2:1: 2:7>::twice(_1: &mut D, _2: u32, _3: u32, _4: bool) -> boo
         f.debug_names.insert(2, "b".to_string());
         let got = compare_condition_name(CompareOp::Eq, &Operand::Copy(1), &Operand::Copy(2), &f);
         assert_eq!(got.as_deref(), Some("a == b"));
+    }
+
+    /// `rustc +nightly --emit=mir -Zmir-include-spans -C overflow-checks=on
+    /// -Cinstrument-coverage -Zcoverage-options=branch,condition` output
+    /// (nightly 1.101, 2026-10-28; the flags cargo-floyd builds with)
+    /// for
+    ///
+    /// ```text
+    /// pub fn pick(c: bool, a: u32, b: u32) -> u32 {
+    ///     if c { a + 1 } else { b * 2 }
+    /// }
+    /// ```
+    ///
+    /// Both arms of `if c` end in an overflow-check `assert`.
+    const PICK_ASSERT_ARMS_MIR: &str = r#"
+fn pick(_1: bool, _2: u32, _3: u32) -> u32 {
+    debug c => _1;                       // in scope 0 at pick.rs:1:13: 1:14
+    debug a => _2;                       // in scope 0 at pick.rs:1:22: 1:23
+    debug b => _3;                       // in scope 0 at pick.rs:1:30: 1:31
+    let mut _0: u32;                     // return place in scope 0 at pick.rs:1:41: 1:44
+    let mut _4: (u32, bool);             // in scope 0 at pick.rs:2:12: 2:17
+    let mut _5: (u32, bool);             // in scope 0 at pick.rs:2:27: 2:32
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => pick.rs:2:8: 2:9 (#0)
+
+    coverage Code { bcb: bcb0 } => pick.rs:1:1: 1:44 (#0);
+    coverage Code { bcb: bcb0 } => pick.rs:2:8: 2:9 (#0);
+    coverage Code { bcb: bcb1 } => pick.rs:2:12: 2:17 (#0);
+    coverage Code { bcb: bcb3 } => pick.rs:2:27: 2:32 (#0);
+    coverage Code { bcb: bcb2 } => pick.rs:3:1: 3:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => pick.rs:2:8: 2:9 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at pick.rs:2:8: 2:9
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 0 at pick.rs:2:8: 2:9
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at pick.rs:2:12: 2:17
+        _4 = AddWithOverflow(copy _2, const 1_u32); // scope 0 at pick.rs:2:12: 2:17
+        assert(!move (_4.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _2, const 1_u32) -> [success: bb3, unwind continue]; // scope 0 at pick.rs:2:12: 2:17
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at pick.rs:2:27: 2:32
+        _5 = MulWithOverflow(copy _3, const 2_u32); // scope 0 at pick.rs:2:27: 2:32
+        assert(!move (_5.1: bool), "attempt to compute `{} * {}`, which would overflow", copy _3, const 2_u32) -> [success: bb4, unwind continue]; // scope 0 at pick.rs:2:27: 2:32
+    }
+
+    bb3: {
+        _0 = move (_4.0: u32);           // scope 0 at pick.rs:2:12: 2:17
+        goto -> bb5;                     // scope 0 at pick.rs:2:5: 2:34
+    }
+
+    bb4: {
+        _0 = move (_5.0: u32);           // scope 0 at pick.rs:2:27: 2:32
+        goto -> bb5;                     // scope 0 at pick.rs:2:5: 2:34
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at pick.rs:3:2: 3:2
+        return;                          // scope 0 at pick.rs:3:2: 3:2
+    }
+}
+"#;
+
+    /// Same toolchain, `-C overflow-checks=on -C debug-assertions=on`,
+    /// for
+    ///
+    /// ```text
+    /// pub fn add_checked(a: u32, b: u32) -> u32 {
+    ///     debug_assert!(a < 1000);
+    ///     a + b
+    /// }
+    /// ```
+    ///
+    /// The `debug_assert!` guard's false arm diverges into
+    /// `core::panicking::panic`; its true arm is an overflow assert.
+    const DEBUG_ASSERT_GUARD_MIR: &str = r#"
+fn add_checked(_1: u32, _2: u32) -> u32 {
+    debug a => _1;                       // in scope 0 at ov.rs:1:20: 1:21
+    debug b => _2;                       // in scope 0 at ov.rs:1:28: 1:29
+    let mut _0: u32;                     // return place in scope 0 at ov.rs:1:39: 1:42
+    let mut _3: bool;                    // in scope 0 at ov.rs:2:19: 2:27
+    let mut _4: !;                       // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+    let mut _5: (u32, bool);             // in scope 0 at ov.rs:3:5: 3:10
+
+    bb0: {
+        _3 = Lt(copy _1, const 1000_u32); // scope 0 at ov.rs:2:19: 2:27
+        switchInt(move _3) -> [0: bb1, otherwise: bb2]; // scope 0 at ov.rs:2:19: 2:27
+    }
+
+    bb1: {
+        _4 = core::panicking::panic(const "assertion failed: a < 1000") -> unwind continue; // scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+                                         // mir::ConstOperand
+                                         // + span: /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+                                         // + const_: Const { ty: fn(&'static str) -> ! {core::panicking::panic}, val: Value(core::panicking::panic) }
+                                         // mir::ConstOperand
+                                         // + span: no-location
+                                         // + const_: Const { ty: &str, val: Value("assertion failed: a < 1000") }
+    }
+
+    bb2: {
+        _5 = AddWithOverflow(copy _1, copy _2); // scope 0 at ov.rs:3:5: 3:10
+        assert(!move (_5.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _1, copy _2) -> [success: bb3, unwind continue]; // scope 0 at ov.rs:3:5: 3:10
+    }
+
+    bb3: {
+        _0 = move (_5.0: u32);           // scope 0 at ov.rs:3:5: 3:10
+        return;                          // scope 0 at ov.rs:4:2: 4:2
+    }
+}
+"#;
+
+    #[test]
+    fn branch_taken_lift_accepts_parsed_assert_arms() {
+        let mir = mir::parse_text(PICK_ASSERT_ARMS_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        assert!(matches!(
+            f.blocks[1].terminator,
+            MirTerminator::Assert { success: 3, .. }
+        ));
+        let node = decompose_function(f).expect("`if c` with assert arms is a decision");
+        assert_eq!(
+            node,
+            Node::Ite {
+                cond: "c".to_string(),
+                then_branch: Box::new(Node::Const { value: true }),
+                else_branch: Box::new(Node::Const { value: false }),
+            }
+        );
+    }
+
+    #[test]
+    fn debug_assert_guard_is_not_a_decision() {
+        // One arm is a parsed overflow `Assert`, the other the
+        // diverging `core::panicking::panic` call: the guard of a
+        // `debug_assert!` is not a user decision.
+        let mir = mir::parse_text(DEBUG_ASSERT_GUARD_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        assert!(matches!(
+            f.blocks[2].terminator,
+            MirTerminator::Assert { success: 3, .. }
+        ));
+        assert_eq!(decompose_function(f), None);
     }
 
     #[test]
