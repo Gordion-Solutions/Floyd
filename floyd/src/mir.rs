@@ -520,8 +520,8 @@ fn strip_switchintless_fn_bodies(input: &str) -> (String, usize) {
             let body_lines = j.saturating_sub(i);
             let worth_stripping = body_lines >= 50;
             if has_decision_marker || !worth_stripping {
-                for k in i..j {
-                    out.push_str(lines[k]);
+                for body_line in &lines[i..j] {
+                    out.push_str(body_line);
                     out.push('\n');
                 }
             } else {
@@ -594,7 +594,7 @@ fn is_fn_header_line(line: &str) -> bool {
 /// them to the corresponding statement / terminator. Span-less MIR
 /// is also accepted; the `span` fields are then `None`.
 ///
-/// Runs [`strip_switchintless_fn_bodies`] first, so functions whose
+/// Runs `strip_switchintless_fn_bodies` first, so functions whose
 /// bodies carry no `switchInt` terminator are brace-stripped before
 /// the main parse walk. The stripped count is surfaced via
 /// [`Mir::decisionless_functions`].

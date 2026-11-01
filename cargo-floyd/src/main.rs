@@ -679,7 +679,7 @@ fn run_test_mode_cargo(
             // cleanly; collecting the one function's spans here
             // is cheap).
             for (art_idx, info) in artifacts.iter().enumerate() {
-                if let Some((fidx, f)) = info
+                if let Some((fidx, _)) = info
                     .mir
                     .functions
                     .iter()
