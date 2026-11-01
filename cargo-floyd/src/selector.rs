@@ -7,7 +7,8 @@
 //! A **candidate** is one decomposable function in a MIR, paired with
 //! its provenance (name, file, line) and the observations that
 //! fell out of correlating the chosen tree against each test's
-//! coverage. The score is simply the number of observations; ties
+//! coverage. The score is the number of tests that produced an
+//! observation (see [`observed_tests`]); ties
 //! are broken by condition count (richer analysis is preferred when
 //! two candidates are equally observed).
 //!
@@ -58,8 +59,9 @@ pub enum PickResult {
 ///
 /// Scoring (lexicographic, descending):
 ///
-/// 1. observation count — a candidate exercised by many tests
-///    produces a richer MC/DC verdict than one no test touches.
+/// 1. observed-test count ([`observed_tests`]) — a candidate
+///    exercised by many tests produces a richer MC/DC verdict than
+///    one no test touches.
 /// 2. candidate tier — see [`tier`]. When no candidate has
 ///    observations (common on real crates whose decisions use
 ///    `match`/`if let`/`?` the engine does not yet decompose),
@@ -82,9 +84,8 @@ pub fn pick_best(candidates: Vec<Candidate>) -> PickResult {
         return PickResult::NoCandidates;
     }
     viable.sort_by(|a, b| {
-        b.observations
-            .len()
-            .cmp(&a.observations.len())
+        observed_tests(b)
+            .cmp(&observed_tests(a))
             .then_with(|| tier(&b.provenance).cmp(&tier(&a.provenance)))
             .then_with(|| count_conditions(&b.tree).cmp(&count_conditions(&a.tree)))
     });
@@ -98,6 +99,28 @@ pub fn pick_best(candidates: Vec<Candidate>) -> PickResult {
         return PickResult::AllUnobserved;
     }
     PickResult::Picked(top)
+}
+
+/// Number of distinct tests that produced at least one observation
+/// (a condition vector or an ambiguous record) for the candidate.
+///
+/// Counted per test rather than per observation because one test
+/// can contribute two vectors (the single-condition rule in
+/// `floyd::correlate::observations_from_counts`); counting those
+/// twice would bias selection toward single-condition candidates.
+/// Observations without a test name count individually.
+pub fn observed_tests(candidate: &Candidate) -> usize {
+    let named: BTreeSet<&str> = candidate
+        .observations
+        .iter()
+        .filter_map(|o| o.test_name.as_deref())
+        .collect();
+    let unnamed = candidate
+        .observations
+        .iter()
+        .filter(|o| o.test_name.is_none())
+        .count();
+    named.len() + unnamed
 }
 
 /// Candidate quality tier. Higher is better.
@@ -192,10 +215,8 @@ mod tests {
                 line: None,
             },
             observations: (0..n_obs)
-                .map(|i| ConditionObservation {
-                    test_name: Some(format!("t{i}")),
-                    inputs: BTreeMap::new(),
-                    result: false,
+                .map(|i| {
+                    ConditionObservation::vector(Some(format!("t{i}")), BTreeMap::new(), false)
                 })
                 .collect(),
         }
@@ -258,11 +279,7 @@ mod tests {
                 line: None,
             },
             observations: (0..5)
-                .map(|i| ConditionObservation {
-                    test_name: Some(format!("t{i}")),
-                    inputs: BTreeMap::new(),
-                    result: true,
-                })
+                .map(|i| ConditionObservation::vector(Some(format!("t{i}")), BTreeMap::new(), true))
                 .collect(),
         };
         // real_decision has 1 condition, 1 observation — should still win.

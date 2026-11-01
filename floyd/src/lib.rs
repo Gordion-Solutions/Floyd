@@ -68,7 +68,8 @@ pub mod runner;
 pub use correlate::DecisionMap;
 pub use decision::DecisionTree;
 pub use masking::{
-    ConditionObservation, ConditionStatus, DecisionProvenance, IndependenceMatrix, RuntimeAnalysis,
+    BranchCounts, ConditionObservation, ConditionStatus, DecisionProvenance, IndependenceMatrix,
+    RuntimeAnalysis,
 };
 pub use mir::Mir;
 pub use profile::CoverageReport;

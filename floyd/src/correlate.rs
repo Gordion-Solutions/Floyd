@@ -34,8 +34,8 @@
 //!
 //! [ADR-0002]: ../../../architecture/decisions/0002-runtime-pipeline.md
 
-use crate::decision::{self, DecisionTree};
-use crate::masking::ConditionObservation;
+use crate::decision::{self, DecisionTree, Node};
+use crate::masking::{BranchCounts, ConditionObservation};
 use crate::mir::{Mir, MirFunction, MirStatement, MirTerminator, SourceSpan};
 use crate::profile::{CoverageReport, FunctionCoverage};
 use std::collections::BTreeMap;
@@ -110,50 +110,220 @@ pub fn correlate(mir: &Mir, coverage: &CoverageReport) -> DecisionMap {
     map
 }
 
-/// Build a [`ConditionObservation`] from a single-test
-/// [`CoverageReport`], a [`Mir`] tree, and a [`DecisionTree`].
+/// Build the [`ConditionObservation`]s for one test from a
+/// single-test [`CoverageReport`], a [`Mir`] tree, and a
+/// [`DecisionTree`].
 ///
-/// For each condition the [`correlate`] join finds runtime counts
-/// for, infer the boolean value the test evaluated it to: `true` if
-/// `true_count > 0`, `false` if `false_count > 0`, *omitted* if both
-/// are zero (the condition was short-circuited and not evaluated in
-/// this test).
+/// Joins MIR to coverage with [`correlate`] and reduces the joined
+/// per-condition counters for the first decision in `tree` with
+/// [`observations_from_counts`]; see there for when the counters
+/// yield a condition vector and when the test is recorded as
+/// ambiguous. Returns an empty `Vec` if the tree is empty or the
+/// test did not evaluate the decision.
 ///
-/// The decision's result is computed by evaluating the first decision
-/// in `tree` under the inferred inputs via
-/// [`decision::evaluate_partial`]. Returns `None` if the tree is
-/// empty or the ITE evaluation needs a condition that wasn't observed
-/// (which would indicate inconsistent input data).
-pub fn observation_from_coverage(
+/// This path joins every MIR function, so it has no single
+/// enclosing function whose entry count could cross-check the
+/// evaluation count; it relies on the root-condition count alone.
+pub fn observations_from_coverage(
     test_name: Option<String>,
     mir: &Mir,
     coverage: &CoverageReport,
     tree: &DecisionTree,
-) -> Option<ConditionObservation> {
+) -> Vec<ConditionObservation> {
+    let Some(decision_node) = tree.decisions.first() else {
+        return Vec::new();
+    };
     let map = correlate(mir, coverage);
-    let mut inputs = BTreeMap::new();
+    let mut counts = BTreeMap::new();
     for f in &map.functions {
         for (name, runtime) in &f.conditions {
-            if runtime.true_count > 0 {
-                inputs.insert(name.clone(), true);
-            } else if runtime.false_count > 0 {
-                inputs.insert(name.clone(), false);
-            }
-            // Both 0 -> short-circuited; omit from inputs.
+            counts.insert(
+                name.clone(),
+                BranchCounts {
+                    true_count: runtime.true_count,
+                    false_count: runtime.false_count,
+                },
+            );
         }
     }
-    let decision_node = tree.decisions.first()?;
-    let result = decision::evaluate_partial(decision_node, &inputs)?;
-    Some(ConditionObservation {
+    observations_from_counts(test_name, decision_node, &counts, None)
+}
+
+/// The condition a decision tests first: the `cond` of its root
+/// [`Node::Ite`], or the leaf of a bare [`Node::Condition`].
+///
+/// An ITE tree is evaluated from its root, so this condition is
+/// tested on every entry into the decision and is never
+/// short-circuited. Its `true_count + false_count` is therefore the
+/// number of times the decision was evaluated. `None` for a
+/// constant decision, which tests no condition.
+fn root_condition(node: &Node) -> Option<&str> {
+    match node {
+        Node::Ite { cond, .. } => Some(cond),
+        Node::Condition { name } => Some(name),
+        _ => None,
+    }
+}
+
+/// Reduce one test's aggregate per-condition counters for one
+/// decision to the observations those counters prove occurred.
+///
+/// `counts` maps condition names to the test's `llvm-cov` branch
+/// counters. Those counters are TOTALS over every evaluation of the
+/// decision in the test, and each condition is counted on its own,
+/// so they do not record which values occurred *together*. A test
+/// that runs `a && b` as (T,T) and then (F,-) leaves `a = [1 T, 1 F]`,
+/// `b = [1 T, 0 F]`; collapsing each condition independently gives
+/// one vector, (T,T), and silently drops the (F,-) evaluation. Worse,
+/// for some decisions the collapsed vector never occurred at all.
+/// Floyd therefore only derives a vector when the counters determine
+/// it.
+///
+/// # Evaluation count
+///
+/// The number of times the test evaluated the decision, `N`, is the
+/// root condition's `true_count + false_count`. The root (the `cond`
+/// of the outermost [`Node::Ite`], or the leaf of a bare
+/// [`Node::Condition`]) is tested on every entry into the decision
+/// and is never short-circuited. This is the
+/// primary signal. `function_count`
+/// ([`FunctionCoverage::count`], when known) counts entries into the
+/// enclosing function, not evaluations of the decision: a function
+/// that evaluates the decision inside a loop has `N` greater than its
+/// entry count, and a decision behind an early `?` return has `N`
+/// smaller. It is used only as a consistency check (see rule 0).
+///
+/// # Rules, in order
+///
+/// 0. **Consistent counters.** Every condition of the decision is
+///    tested at most once per evaluation, so its total must not
+///    exceed `N`; and a decision evaluated `N > 0` times means its
+///    function was entered, so `function_count` must not be
+///    `Some(0)`. Inconsistent counters cannot be attributed and the
+///    test is recorded as ambiguous.
+/// 1. **Single evaluation.** `N == 1`: each evaluated condition has
+///    exactly one non-zero counter, which is its value. One vector.
+/// 2. **Uniform repeated evaluations.** `N > 1` but every condition
+///    was only ever true or only ever false in this test. The ITE
+///    path is fully determined by the condition values, so all `N`
+///    evaluations followed the same path with the same values. One
+///    vector (the same one rule 1 would derive).
+/// 3. **Single-condition decision.** A decision over one condition
+///    that was both true and false yields two vectors, `{c: T}` and
+///    `{c: F}`, however many evaluations there were: with one
+///    condition the vector is the condition's value, so each
+///    non-zero counter proves its vector occurred.
+/// 4. Otherwise the test is **ambiguous**: recorded with its
+///    evaluation count and raw counters, no vector, no result.
+///
+/// `N == 0` (the test never evaluated the decision) or a root with
+/// no counters yields no observation at all. Condition names in
+/// `counts` that the decision does not reference are ignored.
+pub fn observations_from_counts(
+    test_name: Option<String>,
+    decision: &Node,
+    counts: &BTreeMap<String, BranchCounts>,
+    function_count: Option<u64>,
+) -> Vec<ConditionObservation> {
+    let Some(root) = root_condition(decision) else {
+        return Vec::new();
+    };
+    let Some(evaluations) = counts.get(root).map(BranchCounts::total) else {
+        return Vec::new();
+    };
+    if evaluations == 0 {
+        return Vec::new();
+    }
+    let conditions = crate::masking::collect_conditions(decision);
+    let decision_counts: BTreeMap<String, BranchCounts> = conditions
+        .iter()
+        .filter_map(|c| counts.get(c).map(|n| (c.clone(), *n)))
+        .collect();
+
+    // Rule 0: counters that cannot describe `evaluations`
+    // evaluations of this decision are not attributable.
+    let consistent =
+        decision_counts.values().all(|c| c.total() <= evaluations) && function_count != Some(0);
+    if !consistent {
+        return vec![ConditionObservation::ambiguous(
+            test_name,
+            evaluations,
+            decision_counts,
+        )];
+    }
+
+    // Rules 1 and 2: one vector. With `evaluations == 1` every
+    // condition is one-sided, so rule 1 is the `N == 1` case of
+    // rule 2; both are spelled out for the reader.
+    let one_sided = |c: &BranchCounts| c.true_count == 0 || c.false_count == 0;
+    if evaluations == 1 || decision_counts.values().all(one_sided) {
+        let inputs: BTreeMap<String, bool> = decision_counts
+            .iter()
+            .filter(|(_, c)| c.total() > 0)
+            .map(|(name, c)| (name.clone(), c.true_count > 0))
+            .collect();
+        return vector_observation(test_name, decision, inputs, evaluations)
+            .into_iter()
+            .collect();
+    }
+
+    // Rule 3.
+    if conditions.len() == 1 {
+        return single_condition_rule(test_name, decision, root, evaluations);
+    }
+
+    // Rule 4.
+    vec![ConditionObservation::ambiguous(
         test_name,
-        inputs,
-        result,
-    })
+        evaluations,
+        decision_counts,
+    )]
+}
+
+/// Single-condition rule: a decision over ONE condition that the
+/// test evaluated both true and false (in any number of
+/// evaluations, e.g. in a loop) yields two vectors, `{c: T}` and
+/// `{c: F}`.
+///
+/// This is sound where the general case is not: with one condition
+/// the vector *is* the condition's value, so `true_count > 0` proves
+/// that `{c: T}` occurred and `false_count > 0` proves that `{c: F}`
+/// occurred. No combination of values across conditions has to be
+/// guessed. Called only when both counters are non-zero (the
+/// one-sided case is rule 2 of [`observations_from_counts`]).
+fn single_condition_rule(
+    test_name: Option<String>,
+    decision: &Node,
+    condition: &str,
+    evaluations: u64,
+) -> Vec<ConditionObservation> {
+    [true, false]
+        .into_iter()
+        .filter_map(|value| {
+            let inputs = BTreeMap::from([(condition.to_string(), value)]);
+            vector_observation(test_name.clone(), decision, inputs, evaluations)
+        })
+        .collect()
+}
+
+/// A condition-vector observation whose result is evaluated from
+/// `inputs`. `None` if the decision needs a condition missing from
+/// `inputs` (inconsistent counters).
+fn vector_observation(
+    test_name: Option<String>,
+    decision: &Node,
+    inputs: BTreeMap<String, bool>,
+    evaluations: u64,
+) -> Option<ConditionObservation> {
+    let result = decision::evaluate_partial(decision, &inputs)?;
+    let mut obs = ConditionObservation::vector(test_name, inputs, result);
+    obs.evaluations = Some(evaluations);
+    Some(obs)
 }
 
 /// A MIR with per-function condition-span maps pre-computed.
 ///
-/// `observation_from_coverage` and the lower-level [`correlate`] both
+/// [`observations_from_coverage`] and the lower-level [`correlate`] both
 /// rebuild `collect_condition_spans` for every function on every
 /// call. On a crate with hundreds of tests and a MIR that holds
 /// hundreds of monomorphised functions, Pass 3 rebuilds the same
@@ -181,11 +351,17 @@ pub fn prepare_mir(mir: &Mir) -> PreparedMir<'_> {
     }
 }
 
-/// Build an [`ConditionObservation`] for one candidate and one
+/// Build the [`ConditionObservation`]s for one candidate and one
 /// test's coverage, using pre-computed span data and the candidate's
 /// known home-function index.
 ///
-/// The old `observation_from_coverage` iterated EVERY function in
+/// The counters are reduced with [`observations_from_counts`], with
+/// the home function's entry count as its consistency cross-check:
+/// a vector only when the counters determine it, otherwise one
+/// ambiguous observation. Empty when the test did not reach the
+/// decision.
+///
+/// The old single-file path iterated EVERY function in
 /// the MIR against every call — correct, but on a big crate with
 /// hundreds of monomorphised functions and thousands of tests it
 /// turned Pass 3 into billions of operations. Pass 3 only cares
@@ -198,33 +374,36 @@ pub fn prepare_mir(mir: &Mir) -> PreparedMir<'_> {
 /// `find_matching_function` scan + `rustc_demangle` work on every
 /// call. Built once per test's coverage via
 /// [`prepare_coverage_lookup`].
-pub fn observation_from_prepared_coverage(
+pub fn observations_from_prepared_coverage(
     test_name: Option<String>,
     prepared: &PreparedMir<'_>,
     fn_idx: usize,
     prepared_cov: &PreparedCoverage<'_>,
     tree: &DecisionTree,
-) -> Option<ConditionObservation> {
-    let f = prepared.mir.functions.get(fn_idx)?;
-    let spans = prepared.function_spans.get(fn_idx)?;
-    let cov_fn = prepared_cov.find(&f.name)?;
-    let mut inputs = BTreeMap::new();
+) -> Vec<ConditionObservation> {
+    let (Some(f), Some(spans), Some(decision_node)) = (
+        prepared.mir.functions.get(fn_idx),
+        prepared.function_spans.get(fn_idx),
+        tree.decisions.first(),
+    ) else {
+        return Vec::new();
+    };
+    let Some(cov_fn) = prepared_cov.find(&f.name) else {
+        return Vec::new();
+    };
+    let mut counts = BTreeMap::new();
     for (name, span) in spans {
         if let Some(branch) = cov_fn.branches.iter().find(|b| spans_match(&b.span, span)) {
-            if branch.true_count > 0 {
-                inputs.insert(name.clone(), true);
-            } else if branch.false_count > 0 {
-                inputs.insert(name.clone(), false);
-            }
+            counts.insert(
+                name.clone(),
+                BranchCounts {
+                    true_count: branch.true_count,
+                    false_count: branch.false_count,
+                },
+            );
         }
     }
-    let decision_node = tree.decisions.first()?;
-    let result = decision::evaluate_partial(decision_node, &inputs)?;
-    Some(ConditionObservation {
-        test_name,
-        inputs,
-        result,
-    })
+    observations_from_counts(test_name, decision_node, &counts, Some(cov_fn.count))
 }
 
 /// Per-test coverage lookup accelerator.
@@ -292,7 +471,7 @@ pub fn prepare_coverage_lookup(coverage: &CoverageReport) -> PreparedCoverage<'_
     }
 }
 
-/// Deprecated: use [`observation_from_prepared_coverage`] with
+/// Deprecated: use [`observations_from_prepared_coverage`] with
 /// [`prepare_coverage_lookup`] for cheap Pass 3 correlation. Kept
 /// because the single-source mode and the public API still rely
 /// on it.
@@ -637,5 +816,255 @@ fn decide(_1: bool, _2: bool) -> bool {
         // decide is in MIR but not in coverage; we get an entry with no conditions populated.
         assert_eq!(map.functions.len(), 1);
         assert!(map.functions[0].conditions.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // observations_from_counts: when aggregate counters yield a vector
+    // -----------------------------------------------------------------------
+
+    fn cond(name: &str) -> Node {
+        Node::Condition {
+            name: name.to_string(),
+        }
+    }
+
+    fn konst(value: bool) -> Node {
+        Node::Const { value }
+    }
+
+    fn ite(c: &str, then_branch: Node, else_branch: Node) -> Node {
+        Node::Ite {
+            cond: c.to_string(),
+            then_branch: Box::new(then_branch),
+            else_branch: Box::new(else_branch),
+        }
+    }
+
+    /// `a && b`.
+    fn and_node() -> Node {
+        ite("a", cond("b"), konst(false))
+    }
+
+    fn counts(entries: &[(&str, u64, u64)]) -> BTreeMap<String, BranchCounts> {
+        entries
+            .iter()
+            .map(|(n, t, f)| {
+                (
+                    n.to_string(),
+                    BranchCounts {
+                        true_count: *t,
+                        false_count: *f,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn inputs(entries: &[(&str, bool)]) -> BTreeMap<String, bool> {
+        entries.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn single_evaluation_yields_the_vector() {
+        // (T,F) -> F, evaluated once.
+        let obs = observations_from_counts(
+            Some("once_tf".into()),
+            &and_node(),
+            &counts(&[("a", 1, 0), ("b", 0, 1)]),
+            Some(1),
+        );
+        assert_eq!(obs.len(), 1);
+        let o = &obs[0];
+        assert!(!o.ambiguous);
+        assert_eq!(o.inputs, inputs(&[("a", true), ("b", false)]));
+        assert_eq!(o.result, Some(false));
+        assert_eq!(o.evaluations, Some(1));
+        assert!(o.counts.is_empty());
+    }
+
+    #[test]
+    fn single_evaluation_omits_short_circuited_condition() {
+        // (F,-) -> F: b never evaluated.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 0, 1), ("b", 0, 0)]),
+            Some(1),
+        );
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].inputs, inputs(&[("a", false)]));
+        assert_eq!(obs[0].result, Some(false));
+    }
+
+    #[test]
+    fn multi_evaluation_multi_condition_is_ambiguous() {
+        // (T,T) then (F,-): the old collapse recorded (T,T) and lost
+        // the (F,-) evaluation.
+        let obs = observations_from_counts(
+            Some("loop_tt_then_f".into()),
+            &and_node(),
+            &counts(&[("a", 1, 1), ("b", 1, 0)]),
+            Some(1),
+        );
+        assert_eq!(obs.len(), 1);
+        let o = &obs[0];
+        assert!(o.ambiguous);
+        assert!(o.inputs.is_empty(), "no vector may be invented");
+        assert_eq!(o.result, None);
+        assert_eq!(o.evaluations, Some(2));
+        assert_eq!(o.counts, counts(&[("a", 1, 1), ("b", 1, 0)]));
+    }
+
+    #[test]
+    fn base64_is_valid_b64_symbol_counts_are_ambiguous() {
+        // rust-base64 `byte >= 32 && byte <= 126`, test
+        // symbol_matches_char_for_all_valid_symbols (256 calls):
+        // byte >= 32 = [224 T, 32 F], byte <= 126 = [95 T, 129 F].
+        let decision = ite("byte >= 32", cond("byte <= 126"), konst(false));
+        let raw = counts(&[("byte >= 32", 224, 32), ("byte <= 126", 95, 129)]);
+        let obs = observations_from_counts(
+            Some("symbol_matches_char_for_all_valid_symbols".into()),
+            &decision,
+            &raw,
+            Some(256),
+        );
+        assert_eq!(obs.len(), 1);
+        let o = &obs[0];
+        assert!(o.ambiguous);
+        assert!(o.inputs.is_empty());
+        assert_eq!(o.result, None);
+        assert_eq!(o.evaluations, Some(256));
+        assert_eq!(o.counts, raw);
+    }
+
+    #[test]
+    fn single_condition_decision_in_a_loop_is_credited_both_ways() {
+        // `if x { true } else { false }` evaluated 5 times: 3 T, 2 F.
+        let decision = ite("x", konst(true), konst(false));
+        let obs = observations_from_counts(
+            Some("loop".into()),
+            &decision,
+            &counts(&[("x", 3, 2)]),
+            Some(5),
+        );
+        assert_eq!(obs.len(), 2);
+        assert!(obs.iter().all(|o| !o.ambiguous && o.evaluations == Some(5)));
+        assert_eq!(obs[0].inputs, inputs(&[("x", true)]));
+        assert_eq!(obs[0].result, Some(true));
+        assert_eq!(obs[1].inputs, inputs(&[("x", false)]));
+        assert_eq!(obs[1].result, Some(false));
+
+        // And the pair is demonstrated by this one test.
+        let tree = DecisionTree {
+            decisions: vec![decision],
+        };
+        let r = crate::masking::analyze_with_runtime(&tree, &obs, crate::masking::Variant::Masking);
+        assert!(matches!(
+            r.condition_status["x"],
+            crate::masking::ConditionStatus::Exercised(_)
+        ));
+    }
+
+    #[test]
+    fn uniform_repeated_evaluations_yield_the_vector() {
+        // (T,F) three times: every condition one-sided, so every
+        // evaluation took the same path with the same values.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 3, 0), ("b", 0, 3)]),
+            Some(3),
+        );
+        assert_eq!(obs.len(), 1);
+        assert!(!obs[0].ambiguous);
+        assert_eq!(obs[0].inputs, inputs(&[("a", true), ("b", false)]));
+        assert_eq!(obs[0].result, Some(false));
+        assert_eq!(obs[0].evaluations, Some(3));
+    }
+
+    #[test]
+    fn evaluation_count_comes_from_the_root_not_the_function_count() {
+        // Decision evaluated twice in ONE call (loop in the body):
+        // function count 1 must not make it look single-evaluation.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 2, 0), ("b", 1, 1)]),
+            Some(1),
+        );
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+        assert_eq!(obs[0].evaluations, Some(2));
+    }
+
+    #[test]
+    fn inconsistent_counters_are_ambiguous() {
+        // Root says one evaluation, but b counted twice.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 1, 0), ("b", 2, 0)]),
+            Some(1),
+        );
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+
+        // Decision evaluated but the function was never entered.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 1, 0), ("b", 1, 0)]),
+            Some(0),
+        );
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+    }
+
+    #[test]
+    fn unevaluated_decision_yields_no_observation() {
+        assert!(observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 0, 0), ("b", 0, 0)]),
+            Some(0),
+        )
+        .is_empty());
+        // Root has no counters at all (span did not join).
+        assert!(
+            observations_from_counts(None, &and_node(), &counts(&[("b", 1, 0)]), None).is_empty()
+        );
+    }
+
+    #[test]
+    fn single_file_path_marks_merged_two_evaluation_coverage_ambiguous() {
+        // COVERAGE_JSON is `ff` and `tt` merged into one profile:
+        // two evaluations, a = [1, 1], b = [1, 0]. The old collapse
+        // reported it as the single vector (T,T).
+        let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
+        let cov = profile::parse(COVERAGE_JSON).expect("coverage parses");
+        let tree = decision::decompose(&mir);
+        let obs = observations_from_coverage(Some("merged".into()), &mir, &cov, &tree);
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+        assert_eq!(obs[0].evaluations, Some(2));
+    }
+
+    #[test]
+    fn prepared_path_uses_function_count_and_yields_vector_for_single_call() {
+        // Same function, one call evaluating (T,T).
+        let single = COVERAGE_JSON
+            .replace("\"count\": 2", "\"count\": 1")
+            .replace("[2, 5, 2, 6, 1, 1, 0, 0, 4]", "[2, 5, 2, 6, 1, 0, 0, 0, 4]");
+        let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
+        let cov = profile::parse(&single).expect("coverage parses");
+        let tree = decision::decompose(&mir);
+        let prepared = prepare_mir(&mir);
+        let pcov = prepare_coverage_lookup(&cov);
+        let obs =
+            observations_from_prepared_coverage(Some("tt".into()), &prepared, 0, &pcov, &tree);
+        assert_eq!(obs.len(), 1);
+        assert!(!obs[0].ambiguous);
+        assert_eq!(obs[0].inputs, inputs(&[("a", true), ("b", true)]));
+        assert_eq!(obs[0].result, Some(true));
     }
 }

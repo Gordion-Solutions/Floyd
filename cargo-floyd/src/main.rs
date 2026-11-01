@@ -743,8 +743,8 @@ fn run_test_mode_cargo(
             let prep = &prepared[raw.artifact_idx];
             let obs: Vec<_> = prepared_covs
                 .iter()
-                .filter_map(|(test_name, prepared_cov)| {
-                    correlate::observation_from_prepared_coverage(
+                .flat_map(|(test_name, prepared_cov)| {
+                    correlate::observations_from_prepared_coverage(
                         Some(test_name.clone()),
                         prep,
                         raw.fn_idx,
@@ -1077,11 +1077,12 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     for (tree, prov) in artifact_candidates {
         let mut obs = Vec::new();
         for (test_name, coverage) in &per_test_coverage {
-            if let Some(o) =
-                correlate::observation_from_coverage(Some(test_name.clone()), &mir, coverage, &tree)
-            {
-                obs.push(o);
-            }
+            obs.extend(correlate::observations_from_coverage(
+                Some(test_name.clone()),
+                &mir,
+                coverage,
+                &tree,
+            ));
         }
         candidates.push(selector::Candidate {
             tree,
@@ -1299,7 +1300,7 @@ fn print_runtime_report_body(
                     None => format!("{c}=-"),
                 })
                 .collect();
-            parts.push(format!("result={}", bool_glyph(obs.result)));
+            parts.push(format!("result={}", obs.result.map_or("?", bool_glyph)));
             let label = obs.test_name.as_deref().unwrap_or("?");
             println!("  {label:30}  {}", parts.join("  "));
         }
@@ -1320,7 +1321,7 @@ fn print_runtime_report_body(
                     bool_glyph(pair.test_2.result),
                 );
             }
-            Some(ConditionStatus::Unexercised) => {
+            Some(ConditionStatus::Unexercised | ConditionStatus::Ambiguous { .. }) => {
                 let missing = analysis
                     .matrix
                     .independence_pairs
@@ -1486,7 +1487,7 @@ fn print_runtime_junit(source: &str, analysis: &RuntimeAnalysis) {
         .filter(|c| {
             matches!(
                 analysis.condition_status.get(c.as_str()),
-                Some(ConditionStatus::Unexercised) | None
+                Some(ConditionStatus::Unexercised | ConditionStatus::Ambiguous { .. }) | None
             )
         })
         .count();
@@ -1503,7 +1504,7 @@ fn print_runtime_junit(source: &str, analysis: &RuntimeAnalysis) {
             Some(ConditionStatus::Exercised(_)) => {
                 println!(r#"    <testcase name="{case_name}" classname="floyd.mcdc"/>"#);
             }
-            Some(ConditionStatus::Unexercised) | None => {
+            Some(ConditionStatus::Unexercised | ConditionStatus::Ambiguous { .. }) | None => {
                 let required = analysis
                     .matrix
                     .independence_pairs

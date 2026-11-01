@@ -174,11 +174,11 @@ fn pipeline_on_001_simple_and() {
         let mut inputs = BTreeMap::new();
         inputs.insert("a".to_string(), a_val);
         inputs.insert("b".to_string(), b_val);
-        observations.push(ConditionObservation {
-            test_name: Some(format!("a={a_str},b={b_str}")),
+        observations.push(ConditionObservation::vector(
+            Some(format!("a={a_str},b={b_str}")),
             inputs,
             result,
-        });
+        ));
     }
 
     let tree = decision::decompose(&mir);
@@ -258,11 +258,11 @@ fn pipeline_detects_partial_coverage_on_001() {
         let mut inputs = BTreeMap::new();
         inputs.insert("a".to_string(), a_val);
         inputs.insert("b".to_string(), b_val);
-        observations.push(ConditionObservation {
-            test_name: Some(format!("a={a_str},b={b_str}")),
+        observations.push(ConditionObservation::vector(
+            Some(format!("a={a_str},b={b_str}")),
             inputs,
             result,
-        });
+        ));
     }
 
     let tree = decision::decompose(&mir);
