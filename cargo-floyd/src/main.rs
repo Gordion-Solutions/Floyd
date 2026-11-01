@@ -29,6 +29,7 @@ use floyd::mir;
 use floyd::profile;
 use floyd::runner;
 
+mod harness;
 mod selector;
 use std::path::Path;
 use std::process::ExitCode;
@@ -78,6 +79,16 @@ struct SkippedMir {
     bytes: u64,
 }
 
+/// A test target built with `harness = false`. Floyd does not run
+/// such binaries: they are plain programs that ignore libtest's
+/// `--list` / `--exact` flags and would execute their real `main`.
+#[derive(serde::Serialize, Clone, Debug)]
+struct NoHarnessTarget {
+    package: String,
+    target: String,
+    binary: String,
+}
+
 /// JSON document for `cargo floyd test --format=json` on a cargo
 /// project. Emitted on every exit path, including the two decline
 /// paths, so `out_of_scope` and `candidates` are always obtainable.
@@ -100,6 +111,9 @@ struct CargoRuntimeReport<'a> {
     out_of_scope: &'a [DeclinedFunction],
     /// MIR files above the size guard that were not analysed.
     skipped_oversize_mirs: &'a [SkippedMir],
+    /// Test targets with `harness = false` that were not listed or
+    /// run, and so contribute no tests or candidates.
+    skipped_no_harness: &'a [NoHarnessTarget],
 }
 
 /// JSON document for `cargo floyd test --format=json <file.rs>`.
@@ -457,12 +471,37 @@ fn run_test_mode_cargo(
     // why.
     let max_mir_bytes: u64 = max_mir_mb.unwrap_or(50) * 1024 * 1024;
     let mut skipped_oversize_mirs: Vec<(std::path::PathBuf, u64)> = Vec::new();
+    let mut skipped_no_harness: Vec<NoHarnessTarget> = Vec::new();
 
     if std::env::var("FLOYD_DIAG").is_ok() {
         eprintln!("[progress] starting Pass 1 (parse MIR + enumerate tests)");
     }
     // Pass 1: parse MIR, enumerate tests, collect candidates per artifact.
     for artifact in build.test_artifacts.iter() {
+        // `harness = false` targets are programs with their own
+        // `main`; `--list` would run them. Decide before invoking.
+        let uses_harness = artifact
+            .manifest_path
+            .as_deref()
+            .and_then(|mp| {
+                let text = std::fs::read_to_string(mp).ok()?;
+                Some(harness::target_uses_harness(
+                    &text,
+                    mp.parent().unwrap_or(Path::new(".")),
+                    &artifact.target_name,
+                    &artifact.target_kinds,
+                    &artifact.src_path,
+                ))
+            })
+            .unwrap_or(true);
+        if !uses_harness {
+            skipped_no_harness.push(NoHarnessTarget {
+                package: artifact.package_name.clone(),
+                target: artifact.target_name.clone(),
+                binary: artifact.binary_path.display().to_string(),
+            });
+            continue;
+        }
         if let Ok(meta) = std::fs::metadata(&artifact.mir_path) {
             if meta.len() > max_mir_bytes {
                 skipped_oversize_mirs.push((artifact.mir_path.clone(), meta.len()));
@@ -835,22 +874,29 @@ fn run_test_mode_cargo(
         candidates: &candidate_summaries,
         out_of_scope: &declined,
         skipped_oversize_mirs: &skipped_mirs,
+        skipped_no_harness: &skipped_no_harness,
     };
     // Decline paths: the human-readable explanation goes to stderr
     // in every format; stdout carries only the format's document.
     let emit_decline = |verdict| -> ExitCode {
         match format {
-            Format::Text => {
-                print_out_of_scope_report(&mut std::io::stdout(), &declined, &skipped_oversize_mirs)
-            }
+            Format::Text => print_out_of_scope_report(
+                &mut std::io::stdout(),
+                &declined,
+                &skipped_oversize_mirs,
+                &skipped_no_harness,
+            ),
             Format::Json => {
                 if let Err(code) = print_json(&report(verdict, &[], None)) {
                     return code;
                 }
             }
-            Format::Junit => {
-                print_out_of_scope_report(&mut std::io::stderr(), &declined, &skipped_oversize_mirs)
-            }
+            Format::Junit => print_out_of_scope_report(
+                &mut std::io::stderr(),
+                &declined,
+                &skipped_oversize_mirs,
+                &skipped_no_harness,
+            ),
         }
         ExitCode::from(1)
     };
@@ -907,7 +953,12 @@ fn run_test_mode_cargo(
             println!();
             println!("Test targets: {}", build.test_artifacts.len());
             print_runtime_report_body(&all_tests, &all_observations, &analysis);
-            print_out_of_scope_report(&mut std::io::stdout(), &declined, &skipped_oversize_mirs);
+            print_out_of_scope_report(
+                &mut std::io::stdout(),
+                &declined,
+                &skipped_oversize_mirs,
+                &skipped_no_harness,
+            );
         }
         Format::Json => {
             if let Err(code) = print_json(&report(
@@ -1355,7 +1406,20 @@ fn print_out_of_scope_report(
     out: &mut dyn std::io::Write,
     declined: &[impl std::fmt::Debug],
     skipped_oversize_mirs: &[(std::path::PathBuf, u64)],
+    skipped_no_harness: &[NoHarnessTarget],
 ) {
+    if !skipped_no_harness.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "Skipped {} test target(s) built with `harness = false` \
+             (custom `main`, no libtest `--list`); Floyd did not run them:",
+            skipped_no_harness.len()
+        );
+        for t in skipped_no_harness {
+            let _ = writeln!(out, "  {} ({})", t.target, t.package);
+        }
+    }
     if !declined.is_empty() {
         let _ = writeln!(out);
         let _ = writeln!(
@@ -1525,6 +1589,7 @@ mod tests {
             candidates: &candidates,
             out_of_scope: &declined,
             skipped_oversize_mirs: &skipped,
+            skipped_no_harness: &[],
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string_pretty(&report).unwrap()).unwrap();
