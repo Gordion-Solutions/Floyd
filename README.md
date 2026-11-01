@@ -72,7 +72,7 @@ the ground-truth analyses Floyd's output is checked against (see
 | Boolean derived from a `let`-bound expression | `let fast = speed > 50; fast && brake` |
 | **Closures capturing outer booleans** | `let f = \|x: bool\| x && b; f(a)` — works for by-value (`move \|\|`) and by-reference captures; FnMut closures with internal mutation are out of MVP scope |
 | JSON output | `cargo floyd test --format=json` |
-| **JUnit XML output** | `cargo floyd test --format=junit` — one `<testcase>` per condition (pass = exercised, failure = unexercised); rendered natively by Jenkins, GitLab CI, GitHub Actions, Bazel/Buck2, etc. |
+| **JUnit XML output** | `cargo floyd test --format=junit` — one `<testcase>` per condition (pass = exercised, failure = unexercised or unknown (ambiguous)); rendered natively by Jenkins, GitLab CI, GitHub Actions, Bazel/Buck2, etc. |
 
 ### What doesn't (yet)
 
@@ -95,6 +95,42 @@ correctly. The remaining gaps in the "what doesn't" table are
 either explicit Phase 2 deliverables or items that sit in the
 commercial tier per ADR-0004 — the OSS engine's surface is the
 v0.2.x line as listed in "what works" above.
+
+### Tests that evaluate a decision more than once
+
+Floyd reads per-test evidence from `llvm-cov`'s branch counters,
+which count how often each condition was true and how often it was
+false, *summed over every evaluation of the decision in that test*.
+They do not record which values occurred together. For
+`(a && b) || c`, a test that evaluates (T,F,T) and then (F,-,F)
+leaves exactly the same counters (`a = 1 T / 1 F`, `b = 0 T / 1 F`,
+`c = 1 T / 1 F`) as one that evaluates (T,F,F) and then (F,-,T), so
+in general the counters of a multi-evaluation test cannot be
+attributed to condition vectors. Floyd does not guess.
+
+The rule is **one evaluation per test**: Floyd derives a condition
+vector from a test only when
+
+- the test evaluated the decision exactly once (counted from the
+  first condition the decision tests, which runs on every
+  evaluation), or
+- every condition was only ever true or only ever false in that
+  test (every evaluation was then identical), or
+- the decision has a single condition (its true and false counters
+  each prove that outcome occurred, however many evaluations there
+  were).
+
+Any other test is reported as an **ambiguous observation**:
+`--format=json` marks it `"ambiguous": true` with its `evaluations`
+count and raw per-condition `counts`, the text report lists it as
+`AMBIGUOUS`, and it is excluded from independence-pair finding. A
+condition whose only evidence comes from ambiguous observations is
+reported as `unknown (ambiguous)`, not as unexercised, and the MC/DC
+percentage notes how many observations were excluded (JUnit:
+`type="AmbiguousCondition"`). To resolve it, add tests that each
+evaluate the decision once with the inputs you want to demonstrate,
+for example one `#[test]` per input vector instead of a loop over
+all of them.
 
 [cast-10]: https://www.faa.gov/aircraft/air_cert/design_approvals/air_software/cast/cast_papers (CAST-10 — Modified Condition/Decision Coverage)
 
@@ -172,7 +208,9 @@ Floyd's exit code today reports the engine's own success, not
 whether every condition was exercised. To fail a CI run on
 incomplete MC/DC coverage, post-process the JUnit XML — any
 `<failure>` element with `type="UnexercisedCondition"` indicates
-a missing pair. The CI-native test-result steps (`reports: junit:`
+a missing pair, and `type="AmbiguousCondition"` a condition whose
+only evidence came from tests that evaluated the decision more than
+once (see "Tests that evaluate a decision more than once"). The CI-native test-result steps (`reports: junit:`
 on GitLab, `junit '...'` on Jenkins, JUnit-aware actions on GitHub)
 all surface these as failing tests in their respective UIs.
 
