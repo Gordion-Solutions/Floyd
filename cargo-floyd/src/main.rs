@@ -1402,11 +1402,17 @@ fn format_ambiguous_counts(conditions: &[String], obs: &ConditionObservation) ->
     format!("evaluated {evals}x: {}", counts.join("  "))
 }
 
+/// How many ambiguous tests a condition's status line names before
+/// summarising the rest (all of them are in the per-test listing).
+const AMBIGUOUS_TESTS_SHOWN: usize = 3;
+
 /// `t1 (256 evaluations), t2 (3 evaluations)` for the tests behind a
-/// [`ConditionStatus::Ambiguous`].
+/// [`ConditionStatus::Ambiguous`], naming at most
+/// [`AMBIGUOUS_TESTS_SHOWN`] of them.
 fn format_ambiguous_tests(tests: &[String], observations: &[ConditionObservation]) -> String {
-    tests
+    let mut shown: Vec<String> = tests
         .iter()
+        .take(AMBIGUOUS_TESTS_SHOWN)
         .map(|t| {
             let evals = observations
                 .iter()
@@ -1417,8 +1423,14 @@ fn format_ambiguous_tests(tests: &[String], observations: &[ConditionObservation
                 None => t.clone(),
             }
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect();
+    if tests.len() > AMBIGUOUS_TESTS_SHOWN {
+        shown.push(format!(
+            "and {} more (see per-test observations)",
+            tests.len() - AMBIGUOUS_TESTS_SHOWN
+        ));
+    }
+    shown.join(", ")
 }
 
 fn print_truth_table_header(conditions: &[String]) {
@@ -1759,6 +1771,11 @@ mod tests {
                 &observations
             ),
             "symbol_matches_char_for_all_valid_symbols (256 evaluations)"
+        );
+        let many: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
+        assert_eq!(
+            format_ambiguous_tests(&many, &[]),
+            "t0, t1, t2, and 2 more (see per-test observations)"
         );
     }
 
