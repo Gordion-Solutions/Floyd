@@ -1339,8 +1339,10 @@ fn print_runtime_report_body(
             }
             Some(ConditionStatus::Ambiguous { tests }) => {
                 println!(
-                    "  ? {cond}: unknown (ambiguous) — evaluated only in tests that \
-                     evaluated the decision more than once: {}",
+                    "  ? {cond}: unknown (ambiguous) — not demonstrated by attributable \
+                     observations, but evaluated in {} test(s) that evaluated the decision \
+                     more than once: {}",
+                    tests.len(),
                     format_ambiguous_tests(tests, observations)
                 );
             }
@@ -1594,9 +1596,11 @@ fn print_runtime_junit(source: &str, analysis: &RuntimeAnalysis) {
             }
             Some(ConditionStatus::Ambiguous { tests }) => {
                 let message = format!(
-                    "unknown (ambiguous): evaluated only in tests that evaluated the \
-                     decision more than once ({}); aggregate counters cannot attribute \
-                     a condition vector to them. Add single-evaluation tests.",
+                    "unknown (ambiguous): not demonstrated by attributable observations, \
+                     but evaluated in {} test(s) that evaluated the decision more than \
+                     once ({}); aggregate counters cannot attribute a condition vector \
+                     to them. Add single-evaluation tests.",
+                    tests.len(),
                     tests.join(", ")
                 );
                 println!(r#"    <testcase name="{case_name}" classname="floyd.mcdc">"#);
