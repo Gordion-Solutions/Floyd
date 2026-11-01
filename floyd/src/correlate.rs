@@ -134,16 +134,19 @@ pub fn observations_from_coverage(
         return Vec::new();
     };
     let map = correlate(mir, coverage);
-    let mut counts = BTreeMap::new();
+    let mut counts: BTreeMap<String, BranchCounts> = BTreeMap::new();
     for f in &map.functions {
         for (name, runtime) in &f.conditions {
-            counts.insert(
-                name.clone(),
-                BranchCounts {
-                    true_count: runtime.true_count,
-                    false_count: runtime.false_count,
-                },
-            );
+            let joined = BranchCounts {
+                true_count: runtime.true_count,
+                false_count: runtime.false_count,
+            };
+            // A same-named condition in another function that this
+            // test never reached must not mask one it did reach (as
+            // in the pre-ambiguity join, which skipped zero counts).
+            if joined.total() > 0 || !counts.contains_key(name) {
+                counts.insert(name.clone(), joined);
+            }
         }
     }
     observations_from_counts(test_name, decision_node, &counts, None)
