@@ -226,7 +226,7 @@ pub fn decompose_from_block(f: &MirFunction, block_id: BlockId) -> Option<Node> 
 /// `build_decision_from_block` to have returned None, so this
 /// function only runs on genuinely opaque Call-terminated arms.
 fn arms_are_non_panic_calls(f: &MirFunction, else_arm_id: BlockId, then_arm_id: BlockId) -> bool {
-    let is_non_panic_call = |id: BlockId| -> bool {
+    let is_eligible = |id: BlockId| -> bool {
         let Some(block) = f.blocks.iter().find(|b| b.id == id) else {
             return false;
         };
@@ -242,10 +242,25 @@ fn arms_are_non_panic_calls(f: &MirFunction, else_arm_id: BlockId, then_arm_id: 
                     || t.contains("::panic_fmt")
                     || t.contains("::unreachable"))
             }
+            // rustc also emits an `assert(cond, "...") -> [success:
+            // bbN, unwind ...]` terminator for overflow checks
+            // (`a + b` with checked arithmetic) and debug_assert!
+            // expansions. Floyd's current parser classifies this as
+            // `MirTerminator::Other`. The `success:` continuation
+            // IS the normal control-flow path — equivalent in
+            // effect to a non-panic Call for the branch-taken-as-
+            // result reading. Accept it here (narrowed by the
+            // `assert(` prefix + `-> [success:` structure so we
+            // do not sweep in arbitrary `Other` terminators we
+            // have not characterised).
+            MirTerminator::Other { text, .. } => {
+                let t = text.as_str();
+                t.contains("assert(") && t.contains("-> [success:")
+            }
             _ => false,
         }
     };
-    is_non_panic_call(else_arm_id) && is_non_panic_call(then_arm_id)
+    is_eligible(else_arm_id) && is_eligible(then_arm_id)
 }
 
 // Boolean handler: wrap a recognised BoolExpr into a Node::Ite.
@@ -1227,11 +1242,132 @@ pub(crate) fn compare_condition_name(
 /// Render a MIR operand as a human-readable string, or return `None`
 /// if it would be a MIR-internal `_N` placeholder (unnamed local).
 /// See [`compare_condition_name`] for why the None short-circuits.
+///
+/// An unnamed local that is a pure alias of a debug-named one
+/// (`_4 = copy _2; _3 = Gt(move _4, const ..)`, the shape rustc
+/// emits for `while ms > N` on a `mut` argument) renders as the
+/// ancestor's name; see [`resolve_alias_debug_name`].
 fn operand_display(op: &Operand, f: &MirFunction) -> Option<String> {
     match op {
-        Operand::Copy(id) | Operand::Move(id) => f.debug_names.get(id).cloned(),
+        Operand::Copy(id) | Operand::Move(id) => resolve_alias_debug_name(*id, f),
         Operand::Const(_) => Some(op.const_display_value().to_string()),
     }
+}
+
+/// Maximum number of `_N = copy _M` / `_N = move _M` hops
+/// [`resolve_alias_debug_name`] follows before giving up.
+const MAX_ALIAS_HOPS: usize = 4;
+
+/// Return the debug name of `local`, or of the debug-named local it
+/// is a pure alias of.
+///
+/// When `local` has no `debug` annotation, walk backwards through
+/// plain value aliases (`_N = copy _M`, `_N = move _M`) to the first
+/// debug-named ancestor, at most [`MAX_ALIAS_HOPS`] hops and never
+/// revisiting a local. A hop is taken only when every write to the
+/// local in the whole function is a plain alias of one and the same
+/// source (see [`unique_alias_source`]); anything else (a deref
+/// copy, a cast, arithmetic, a field projection, a call result, an
+/// argument's implicit entry value, or two different sources) stops
+/// the walk with `None`, so ambiguity never produces a wrong name.
+fn resolve_alias_debug_name(local: LocalId, f: &MirFunction) -> Option<String> {
+    let mut current = local;
+    let mut visited = vec![local];
+    for _ in 0..MAX_ALIAS_HOPS {
+        if let Some(name) = f.debug_names.get(&current) {
+            return Some(name.clone());
+        }
+        current = unique_alias_source(current, f)?;
+        if visited.contains(&current) {
+            return None;
+        }
+        visited.push(current);
+    }
+    f.debug_names.get(&current).cloned()
+}
+
+/// If every write to `local` in `f` is a plain value alias of the
+/// same source local, return that source. Returns `None` when
+/// `local` is never written, is a function argument (written
+/// implicitly on entry), is written by anything other than a plain
+/// alias, or is aliased from more than one distinct source.
+fn unique_alias_source(local: LocalId, f: &MirFunction) -> Option<LocalId> {
+    if f.args.iter().any(|a| a.local == local) {
+        return None;
+    }
+    let mut source: Option<LocalId> = None;
+    for block in &f.blocks {
+        for stmt in &block.statements {
+            let alias_src = match stmt {
+                MirStatement::AssignCopy {
+                    dst,
+                    src,
+                    deref: false,
+                    ..
+                } if *dst == local => *src,
+                MirStatement::Other { text, .. } => match plain_move_alias(text) {
+                    Some((dst, src)) if dst == local => src,
+                    _ if other_text_writes(text, local) => return None,
+                    _ => continue,
+                },
+                other if statement_writes(other, local) => return None,
+                _ => continue,
+            };
+            match source {
+                None => source = Some(alias_src),
+                Some(prev) if prev == alias_src => {}
+                Some(_) => return None,
+            }
+        }
+        let terminator_writes = match &block.terminator {
+            MirTerminator::Call { dst, .. } => *dst == local,
+            MirTerminator::Other { text, .. } => other_text_writes(text, local),
+            _ => false,
+        };
+        if terminator_writes {
+            return None;
+        }
+    }
+    source
+}
+
+/// Parse an unparsed statement of the exact form `_N = move _M;`
+/// into `(N, M)`. Any other shape (projections, derefs, casts,
+/// operations) returns `None`.
+fn plain_move_alias(text: &str) -> Option<(LocalId, LocalId)> {
+    let s = text.trim();
+    let s = s.strip_suffix(';').unwrap_or(s);
+    let (lhs, rhs) = s.split_once(" = ")?;
+    let dst = parse_plain_local(lhs.trim())?;
+    let src = parse_plain_local(rhs.trim().strip_prefix("move ")?)?;
+    Some((dst, src))
+}
+
+/// Parse exactly `_<digits>` into a [`LocalId`].
+fn parse_plain_local(s: &str) -> Option<LocalId> {
+    let digits = s.strip_prefix('_')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Conservatively decide whether an unparsed statement / terminator
+/// text assigns to `local`: true when its left-hand side (before
+/// ` = `) is `local` itself or a place rooted at it, such as
+/// `(_N.0: T)` or `(*_N)`.
+fn other_text_writes(text: &str, local: LocalId) -> bool {
+    let Some((lhs, _)) = text.trim().split_once(" = ") else {
+        return false;
+    };
+    let root = lhs.trim_start_matches(['(', '*', ' ']);
+    let Some(digits) = root.strip_prefix('_') else {
+        return false;
+    };
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    digits[..end].parse::<LocalId>().ok() == Some(local)
 }
 
 // ---------------------------------------------------------------------------
@@ -2545,6 +2681,194 @@ fn decide(_1: Option<bool>, _2: bool) -> Option<bool> {
         let f = MirFunction::default();
         let op = Operand::Copy(3);
         assert_eq!(operand_display(&op, &f), None);
+    }
+
+    /// `rustc --emit=mir` output for cortex-m's `Delay::delay_ms`
+    /// shape: `while ms > 4294967 { ...; ms -= 4294967; }` on a
+    /// `mut` argument. rustc copies the debug-named `_2` into the
+    /// unnamed temporary `_4` before the comparison.
+    const DELAY_MS_ALIAS_MIR: &str = r#"
+fn <impl at a.rs:2:1: 2:7>::delay_ms(_1: &mut D, _2: u32) -> () {
+    debug self => _1;
+    debug ms => _2;
+    let mut _0: ();
+    let mut _3: bool;
+    let mut _4: u32;
+    let _5: ();
+    let mut _6: (u32, bool);
+    let _7: ();
+    let mut _8: u32;
+    let mut _9: u32;
+    let mut _10: (u32, bool);
+
+    bb0: {
+        goto -> bb1;
+    }
+
+    bb1: {
+        _4 = copy _2;
+        _3 = Gt(move _4, const 4294967_u32);
+        switchInt(move _3) -> [0: bb5, otherwise: bb2];
+    }
+
+    bb2: {
+        _5 = D::delay_us(copy _1, const 4294967000_u32) -> [return: bb3, unwind continue];
+    }
+
+    bb3: {
+        _6 = SubWithOverflow(copy _2, const 4294967_u32);
+        assert(!move (_6.1: bool), "attempt to compute `{} - {}`, which would overflow", copy _2, const 4294967_u32) -> [success: bb4, unwind continue];
+    }
+
+    bb4: {
+        _2 = move (_6.0: u32);
+        goto -> bb1;
+    }
+
+    bb5: {
+        _9 = copy _2;
+        _10 = MulWithOverflow(copy _9, const 1000_u32);
+        assert(!move (_10.1: bool), "attempt to compute `{} * {}`, which would overflow", move _9, const 1000_u32) -> [success: bb6, unwind continue];
+    }
+
+    bb6: {
+        _8 = move (_10.0: u32);
+        _7 = D::delay_us(copy _1, move _8) -> [return: bb7, unwind continue];
+    }
+
+    bb7: {
+        return;
+    }
+}
+"#;
+
+    /// `rustc --emit=mir` output for
+    /// `let x; if c { x = a } else { x = b } x > 5`, with the
+    /// `debug x => _5;` annotation absent (as when debuginfo for the
+    /// binding is not emitted). `_6` aliases `_5`, but `_5` is
+    /// assigned from two different named locals, so no single name
+    /// is correct.
+    const ASSIGNED_TWICE_MIR: &str = r#"
+fn <impl at a.rs:2:1: 2:7>::twice(_1: &mut D, _2: u32, _3: u32, _4: bool) -> bool {
+    debug self => _1;
+    debug a => _2;
+    debug b => _3;
+    debug c => _4;
+    let mut _0: bool;
+    let _5: u32;
+    let mut _6: u32;
+
+    bb0: {
+        switchInt(copy _4) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _5 = copy _2;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _5 = copy _3;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _6 = copy _5;
+        _0 = Gt(move _6, const 5_u32);
+        return;
+    }
+}
+"#;
+
+    /// Find the single `AssignBinaryCompare` in `f` and render its
+    /// condition name.
+    fn first_compare_name(f: &MirFunction) -> Option<String> {
+        let (op, lhs, rhs) = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.statements.iter())
+            .find_map(|s| match s {
+                MirStatement::AssignBinaryCompare { op, lhs, rhs, .. } => Some((*op, lhs, rhs)),
+                _ => None,
+            })
+            .expect("fixture has a compare");
+        compare_condition_name(op, lhs, rhs, f)
+    }
+
+    #[test]
+    fn operand_display_follows_one_hop_copy_alias() {
+        let mir = mir::parse_text(DELAY_MS_ALIAS_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        assert!(!f.debug_names.contains_key(&4), "_4 is unnamed");
+        assert_eq!(
+            operand_display(&Operand::Move(4), f),
+            Some("ms".to_string())
+        );
+        assert_eq!(first_compare_name(f).as_deref(), Some("ms > 4294967"));
+    }
+
+    #[test]
+    fn operand_display_declines_alias_assigned_from_two_sources() {
+        let mir = mir::parse_text(ASSIGNED_TWICE_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        // `_6 = copy _5` is a unique alias, but `_5` is written from
+        // both `a` and `b`: ambiguous, so no name.
+        assert_eq!(operand_display(&Operand::Move(6), f), None);
+        assert_eq!(operand_display(&Operand::Copy(5), f), None);
+        assert_eq!(first_compare_name(f), None);
+    }
+
+    #[test]
+    fn operand_display_does_not_follow_deref_or_projection() {
+        let mut f = MirFunction::default();
+        f.debug_names.insert(2, "p".to_string());
+        f.debug_names.insert(7, "pair".to_string());
+        f.blocks.push(MirBlock {
+            id: 0,
+            statements: vec![
+                // `_4 = copy (*_2)` reads the pointee, not `p`.
+                MirStatement::AssignCopy {
+                    dst: 4,
+                    src: 2,
+                    deref: true,
+                    span: None,
+                },
+                // `_5 = move (_7.0: u32)` is a field projection.
+                MirStatement::Other {
+                    text: "_5 = move (_7.0: u32);".to_string(),
+                    span: None,
+                },
+                // `_6 = move _2` is a plain move alias.
+                MirStatement::Other {
+                    text: "_6 = move _2;".to_string(),
+                    span: None,
+                },
+            ],
+            terminator: MirTerminator::Return { span: None },
+        });
+        assert_eq!(operand_display(&Operand::Copy(4), &f), None);
+        assert_eq!(operand_display(&Operand::Copy(5), &f), None);
+        assert_eq!(
+            operand_display(&Operand::Copy(6), &f),
+            Some("p".to_string())
+        );
+    }
+
+    #[test]
+    fn operand_display_alias_walk_terminates_on_cycle() {
+        let mut f = MirFunction::default();
+        let copy = |dst, src| MirStatement::AssignCopy {
+            dst,
+            src,
+            deref: false,
+            span: None,
+        };
+        f.blocks.push(MirBlock {
+            id: 0,
+            statements: vec![copy(3, 4), copy(4, 3)],
+            terminator: MirTerminator::Return { span: None },
+        });
+        assert_eq!(operand_display(&Operand::Copy(3), &f), None);
     }
 
     #[test]

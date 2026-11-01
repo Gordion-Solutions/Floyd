@@ -160,12 +160,16 @@ pub struct MirBlock {
 /// A non-terminating statement inside a block.
 #[derive(Debug, Clone)]
 pub enum MirStatement {
-    /// `_<dst> = copy _<src>;`
+    /// `_<dst> = copy _<src>;` or `_<dst> = copy (*_<src>);`
     AssignCopy {
         /// Destination local.
         dst: LocalId,
         /// Source local.
         src: LocalId,
+        /// `true` for the dereference form `copy (*_<src>)`: `dst`
+        /// receives the pointee of `src`, not `src`'s own value.
+        /// `false` for a plain `copy _<src>` value alias.
+        deref: bool,
         /// Source span, if present in the MIR.
         span: Option<SourceSpan>,
     },
@@ -1204,7 +1208,12 @@ fn parse_statement(line: &str, span: Option<SourceSpan>) -> Option<MirStatement>
 
     if let Some(src_str) = rhs.strip_prefix("copy _") {
         if let Ok(src) = src_str.parse::<u32>() {
-            return Some(MirStatement::AssignCopy { dst, src, span });
+            return Some(MirStatement::AssignCopy {
+                dst,
+                src,
+                deref: false,
+                span,
+            });
         }
     }
     // `_X = copy (*_Y);` — dereference copy, common when reading
@@ -1215,7 +1224,12 @@ fn parse_statement(line: &str, span: Option<SourceSpan>) -> Option<MirStatement>
     if let Some(inner) = rhs.strip_prefix("copy (*_") {
         if let Some(close) = inner.find(')') {
             if let Ok(src) = inner[..close].parse::<u32>() {
-                return Some(MirStatement::AssignCopy { dst, src, span });
+                return Some(MirStatement::AssignCopy {
+                    dst,
+                    src,
+                    deref: true,
+                    span,
+                });
             }
         }
     }
@@ -2297,6 +2311,7 @@ fn decide(_1: i32, _2: i32) -> bool {
             MirStatement::AssignCopy {
                 dst: 0,
                 src: 2,
+                deref: false,
                 span: Some(s),
             } => {
                 // location of `b` in `a && b`
