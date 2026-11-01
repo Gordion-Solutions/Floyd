@@ -15,3 +15,12 @@ rayon = "1"
 floyd = { path = "../floyd", version = "0.2.9" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+
+[[bin]]
+name = "cargo-floyd"
+path = "src/main.rs"
+
+[[bin]]
+name = "floyd-rustc-shim"
+path = "src/bin/floyd-rustc-shim.rs"

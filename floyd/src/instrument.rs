@@ -150,11 +150,14 @@ pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, I
             stderr: "could not parse workspace_root".to_string(),
         })?;
 
-    // Step 2: cargo build --tests with our RUSTFLAGS.
-    let rustflags = "-Cinstrument-coverage \
-                     -Zcoverage-options=branch,condition \
-                     -Zmir-include-spans \
-                     --emit=mir,link";
+    // Step 2: cargo build --tests. The caller sets
+    // `RUSTC_WRAPPER` to the `floyd-rustc-shim`, which appends
+    // Floyd's instrumentation flags ONLY for the primary package
+    // (via `CARGO_PRIMARY_PACKAGE`). Dep crates compile without
+    // `--emit=mir` and without coverage instrumentation — critical
+    // on real embedded crates like `heapless` where the generic
+    // dep tree would otherwise produce hundreds of gigabytes of
+    // MIR text.
     let build_out = Command::new("cargo")
         .args([
             "+nightly",
@@ -164,7 +167,6 @@ pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, I
             "--manifest-path",
         ])
         .arg(&manifest)
-        .env("RUSTFLAGS", rustflags)
         .output()
         .map_err(|e| InstrumentError {
             stage: "cargo build --tests",

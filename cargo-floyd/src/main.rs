@@ -51,10 +51,68 @@ fn main() -> ExitCode {
         raw.iter().map(String::as_str).collect()
     };
 
-    // Pull `--format=<fmt>` (or `--format <fmt>`) out of the args.
+    // Pull `--format=<fmt>` (or `--format <fmt>`) and
+    // `--only=<pat>` (repeatable) out of the args.
     let mut format = Format::Text;
+    let mut only_patterns: Vec<String> = Vec::new();
+    // --max-mir-size=<N> overrides the per-MIR-file size guard.
+    // The guard protects Floyd's parser from monomorphisation
+    // explosions (bytes' test_bytes_vec_alloc.mir is 349 MB).
+    // Users analysing const-generic libs like fixed (106 MB) can
+    // raise it when they are willing to spend the parse time.
+    let mut max_mir_mb: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
+        if let Some(pat) = args[i].strip_prefix("--only=") {
+            only_patterns.push(pat.to_string());
+            args.remove(i);
+            continue;
+        }
+        if let Some(val) = args[i].strip_prefix("--max-mir-size=") {
+            match val.parse::<u64>() {
+                Ok(mb) => max_mir_mb = Some(mb),
+                Err(_) => {
+                    eprintln!(
+                        "cargo-floyd: --max-mir-size requires a positive \
+                         integer in megabytes (e.g. --max-mir-size=200)"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+            args.remove(i);
+            continue;
+        }
+        if args[i] == "--max-mir-size" {
+            args.remove(i);
+            match args.get(i).copied().and_then(|v| v.parse::<u64>().ok()) {
+                Some(mb) => {
+                    max_mir_mb = Some(mb);
+                    args.remove(i);
+                }
+                None => {
+                    eprintln!(
+                        "cargo-floyd: --max-mir-size requires a positive \
+                         integer in megabytes (e.g. --max-mir-size 200)"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+            continue;
+        }
+        if args[i] == "--only" {
+            args.remove(i);
+            match args.get(i).copied() {
+                Some(v) => {
+                    only_patterns.push(v.to_string());
+                    args.remove(i);
+                }
+                None => {
+                    eprintln!("cargo-floyd: --only requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            continue;
+        }
         if let Some(rest) = args[i].strip_prefix("--format=") {
             format = match parse_format(rest) {
                 Ok(f) => f,
@@ -115,7 +173,9 @@ fn main() -> ExitCode {
     }
 
     match (is_test_mode, source) {
-        (true, Source::Cargo(p)) => run_test_mode_cargo(&p, &workdir, format),
+        (true, Source::Cargo(p)) => {
+            run_test_mode_cargo(&p, &workdir, format, &only_patterns, max_mir_mb)
+        }
         (true, Source::SingleFile(p)) => run_test_mode_single(&p, &workdir, format),
         (false, Source::Cargo(_)) => {
             eprintln!("cargo-floyd: static analysis on a cargo project is not supported yet;");
@@ -216,7 +276,31 @@ fn run_static_mode(source: &Path, workdir: &Path, format: Format) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitCode {
+fn run_test_mode_cargo(
+    manifest: &Path,
+    workdir: &Path,
+    format: Format,
+    only_patterns: &[String],
+    max_mir_mb: Option<u64>,
+) -> ExitCode {
+    // Scope Floyd's `--emit=mir,link -Cinstrument-coverage
+    // -Zcoverage-options=branch,condition -Zmir-include-spans` to
+    // the primary package only, via a RUSTC_WRAPPER shim that
+    // checks CARGO_PRIMARY_PACKAGE. Without this, every dep crate
+    // also dumps MIR and gets instrumented — a heapless build
+    // produced 336 GB virtual memory before rustc OOM'd on a
+    // 30 GB-RAM runner. Finding and setting the shim here (early)
+    // means the cargo build invoked inside `floyd::instrument`
+    // inherits the env var and routes rustc through our shim.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let shim = parent.join("floyd-rustc-shim");
+            if shim.exists() {
+                std::env::set_var("RUSTC_WRAPPER", &shim);
+            }
+        }
+    }
+
     // Build all test artifacts in the cargo project.
     let build = match instrument::compile_cargo_project(manifest) {
         Ok(b) => b,
@@ -285,7 +369,7 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
     // threshold and surface the skip in the honest-scope report,
     // so the user sees exactly which artifacts were elided and
     // why.
-    const MAX_MIR_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
+    let max_mir_bytes: u64 = max_mir_mb.unwrap_or(50) * 1024 * 1024;
     let mut skipped_oversize_mirs: Vec<(std::path::PathBuf, u64)> = Vec::new();
 
     if std::env::var("FLOYD_DIAG").is_ok() {
@@ -294,7 +378,7 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
     // Pass 1: parse MIR, enumerate tests, collect candidates per artifact.
     for artifact in build.test_artifacts.iter() {
         if let Ok(meta) = std::fs::metadata(&artifact.mir_path) {
-            if meta.len() > MAX_MIR_BYTES {
+            if meta.len() > max_mir_bytes {
                 skipped_oversize_mirs.push((artifact.mir_path.clone(), meta.len()));
                 continue;
             }
@@ -337,6 +421,25 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
             if decision::has_switchint(f) {
                 if let Some(node) = decision::decompose_function(f) {
                     let prov = correlate::provenance_for(f);
+                    // `--only=<pattern>` scopes Floyd to the
+                    // functions the user named. On real embedded
+                    // crates the whole-crate scan is both slow and
+                    // noisy — a qualification engineer typically
+                    // has a specific list of safety-critical gates
+                    // they need to prove MC/DC on. If any --only
+                    // pattern is present and this function's name
+                    // doesn't contain any of them, drop it before
+                    // scoring; it will not appear in the verdict
+                    // or in the honest-scope report.
+                    if !only_patterns.is_empty() {
+                        let fn_name = prov.function_name.as_deref().unwrap_or(&f.name);
+                        let hit = only_patterns
+                            .iter()
+                            .any(|pat| fn_name.contains(pat.as_str()));
+                        if !hit {
+                            continue;
+                        }
+                    }
                     // Reject candidates whose decision spans come
                     // from inlined-stdlib macro expansions.
                     // Rustc paths of the form `/rustc/<hash>/library/

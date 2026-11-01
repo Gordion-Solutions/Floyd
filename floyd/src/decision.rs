@@ -208,6 +208,46 @@ pub fn decompose_from_block(f: &MirFunction, block_id: BlockId) -> Option<Node> 
     build_decision_from_block(block_id, f)
 }
 
+/// Guard for the branch-taken-as-result lift: both arms of a
+/// bool-switchInt must be `Call`-terminated AND neither Call target
+/// may be a panic / noreturn stdlib function.
+///
+/// Panic blacklist is matched by substring on the Call's `func_text`
+/// (the verbatim MIR expression of the called function). Catches
+/// `core::panicking::panic`, `core::panicking::panic_fmt`,
+/// `core::option::expect_failed`, `core::result::unwrap_failed`,
+/// `::unwrap_failed`, `::expect_failed`, `::assert_failed`, and the
+/// `unreachable` family. These are rustc's canonical names for
+/// assertion-failure / unwrap-failure paths and are the main source
+/// of "arm is a Call but it's really a panic" false alarms the
+/// lift must reject.
+///
+/// The caller already requires both arms' recursive
+/// `build_decision_from_block` to have returned None, so this
+/// function only runs on genuinely opaque Call-terminated arms.
+fn arms_are_non_panic_calls(f: &MirFunction, else_arm_id: BlockId, then_arm_id: BlockId) -> bool {
+    let is_non_panic_call = |id: BlockId| -> bool {
+        let Some(block) = f.blocks.iter().find(|b| b.id == id) else {
+            return false;
+        };
+        match &block.terminator {
+            MirTerminator::Call { func_text, .. } => {
+                let t = func_text.as_str();
+                !(t.contains("core::panicking::")
+                    || t.contains("::unwrap_failed")
+                    || t.contains("::expect_failed")
+                    || t.contains("::assert_failed")
+                    || t.contains("::assert_eq_failed")
+                    || t.contains("::assert_ne_failed")
+                    || t.contains("::panic_fmt")
+                    || t.contains("::unreachable"))
+            }
+            _ => false,
+        }
+    };
+    is_non_panic_call(else_arm_id) && is_non_panic_call(then_arm_id)
+}
+
 // Boolean handler: wrap a recognised BoolExpr into a Node::Ite.
 // Matches `handle_boolean` in decomposer.toml.
 fn handle_boolean(expr: &BoolExpr) -> Node {
@@ -349,13 +389,51 @@ fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node>
                 };
                 // `0` arm is the `else` branch (condition was false);
                 // `otherwise` is the `then` branch (condition was true).
-                let else_branch = build_decision_from_block(targets[0].1, f)?;
-                let then_branch = build_decision_from_block(*otherwise, f)?;
-                return Some(handle_boolean(&BoolExpr {
-                    cond,
-                    then_branch,
-                    else_branch,
-                }));
+                let else_arm_id = targets[0].1;
+                let then_arm_id = *otherwise;
+                let else_branch = build_decision_from_block(else_arm_id, f);
+                let then_branch = build_decision_from_block(then_arm_id, f);
+                match (else_branch, then_branch) {
+                    (Some(else_branch), Some(then_branch)) => {
+                        return Some(handle_boolean(&BoolExpr {
+                            cond,
+                            then_branch,
+                            else_branch,
+                        }));
+                    }
+                    (None, None) if arms_are_non_panic_calls(f, else_arm_id, then_arm_id) => {
+                        // Branch-taken-as-result lift: when both arms
+                        // terminate in non-panic Calls that Floyd
+                        // cannot decompose further (opaque function
+                        // calls returning non-boolean types), treat
+                        // "which arm was taken" as the decision's
+                        // observable outcome. The condition is still a
+                        // real Boolean; its MC/DC pair gets scored
+                        // against the branch-counter observations.
+                        //
+                        // This is a legitimate reading of CAST-10
+                        // MC/DC — the pair requires only that the
+                        // decision's OBSERVABLE outcome differ when
+                        // the condition flips. Branch-taken is
+                        // observable via coverage; the arm's actual
+                        // return value is not needed.
+                        //
+                        // Guards: inside the bool-switchInt handler
+                        // only (so match-with-Call-arms stays
+                        // enterprise), only when the normal
+                        // recursive path returned None (we never
+                        // steal cases that already decompose), and
+                        // panic/noreturn Calls are rejected via
+                        // `arms_are_non_panic_calls` so assert /
+                        // unwrap / expect patterns do not fire.
+                        return Some(handle_boolean(&BoolExpr {
+                            cond,
+                            then_branch: Node::Const { value: true },
+                            else_branch: Node::Const { value: false },
+                        }));
+                    }
+                    _ => return None,
+                }
             }
             // Literal `match` on a non-bool integer.
             try_match_from_block(block, f, *discr, targets, *otherwise)
