@@ -29,9 +29,116 @@ use floyd::mir;
 use floyd::profile;
 use floyd::runner;
 
+mod harness;
 mod selector;
 use std::path::Path;
 use std::process::ExitCode;
+
+/// How runtime mode resolved candidate selection. Carried in the
+/// JSON report so a consumer can tell a real verdict apart from the
+/// two decline paths without parsing stderr.
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeVerdict {
+    /// A candidate was picked and `analysis` holds its verdict.
+    Analysed,
+    /// No decomposable boolean decision was found.
+    NoCandidates,
+    /// Decomposable decisions were found but no test produced a
+    /// usable observation for any of them.
+    AllUnobserved,
+}
+
+/// A function with a `switchInt`-shaped decision that the engine's
+/// current patterns did not match.
+#[derive(serde::Serialize, Clone, Debug)]
+struct DeclinedFunction {
+    name: String,
+    source_file: Option<String>,
+    line: Option<u32>,
+}
+
+/// One decomposable candidate the engine considered, with whether
+/// any test reached its function at runtime.
+#[derive(serde::Serialize, Clone, Debug)]
+struct CandidateSummary {
+    function_name: Option<String>,
+    source_file: Option<String>,
+    line: Option<u32>,
+    /// True when at least one test's coverage shows the function
+    /// was executed.
+    invoked: bool,
+    /// Number of tests that produced a usable observation.
+    observations: usize,
+}
+
+/// A test-binary MIR file skipped by the size guard.
+#[derive(serde::Serialize, Clone, Debug)]
+struct SkippedMir {
+    path: String,
+    bytes: u64,
+}
+
+/// A test target built with `harness = false`. Floyd does not run
+/// such binaries: they are plain programs that ignore libtest's
+/// `--list` / `--exact` flags and would execute their real `main`.
+#[derive(serde::Serialize, Clone, Debug)]
+struct NoHarnessTarget {
+    package: String,
+    target: String,
+    binary: String,
+}
+
+/// JSON document for `cargo floyd test --format=json` on a cargo
+/// project. Emitted on every exit path, including the two decline
+/// paths, so `out_of_scope` and `candidates` are always obtainable.
+#[derive(serde::Serialize)]
+struct CargoRuntimeReport<'a> {
+    manifest: String,
+    workspace_root: String,
+    test_targets: usize,
+    verdict: RuntimeVerdict,
+    tests_discovered: &'a [String],
+    observations: &'a [ConditionObservation],
+    /// `None` unless `verdict` is `analysed`.
+    analysis: Option<&'a RuntimeAnalysis>,
+    /// Every decomposable candidate considered, before selection.
+    candidates: &'a [CandidateSummary],
+    /// Functions with a `switchInt`-shaped decision that the
+    /// engine's current patterns did not match. The engine declined
+    /// them rather than report a wrong verdict — honest-scope
+    /// evidence for ISO 26262 / DO-178C qualification audits.
+    out_of_scope: &'a [DeclinedFunction],
+    /// MIR files above the size guard that were not analysed.
+    skipped_oversize_mirs: &'a [SkippedMir],
+    /// Test targets with `harness = false` that were not listed or
+    /// run, and so contribute no tests or candidates.
+    skipped_no_harness: &'a [NoHarnessTarget],
+}
+
+/// JSON document for `cargo floyd test --format=json <file.rs>`.
+#[derive(serde::Serialize)]
+struct SingleRuntimeReport<'a> {
+    source: String,
+    verdict: RuntimeVerdict,
+    tests_discovered: &'a [String],
+    observations: &'a [ConditionObservation],
+    /// `None` unless `verdict` is `analysed`.
+    analysis: Option<&'a RuntimeAnalysis>,
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> Result<(), ExitCode> {
+    match serde_json::to_string_pretty(value) {
+        Ok(s) => {
+            println!("{s}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("cargo-floyd: serialize JSON: {e}");
+            Err(ExitCode::from(1))
+        }
+    }
+}
 
 #[derive(Copy, Clone)]
 enum Format {
@@ -51,10 +158,68 @@ fn main() -> ExitCode {
         raw.iter().map(String::as_str).collect()
     };
 
-    // Pull `--format=<fmt>` (or `--format <fmt>`) out of the args.
+    // Pull `--format=<fmt>` (or `--format <fmt>`) and
+    // `--only=<pat>` (repeatable) out of the args.
     let mut format = Format::Text;
+    let mut only_patterns: Vec<String> = Vec::new();
+    // --max-mir-size=<N> overrides the per-MIR-file size guard.
+    // The guard protects Floyd's parser from monomorphisation
+    // explosions (bytes' test_bytes_vec_alloc.mir is 349 MB).
+    // Users analysing const-generic libs like fixed (106 MB) can
+    // raise it when they are willing to spend the parse time.
+    let mut max_mir_mb: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
+        if let Some(pat) = args[i].strip_prefix("--only=") {
+            only_patterns.push(pat.to_string());
+            args.remove(i);
+            continue;
+        }
+        if let Some(val) = args[i].strip_prefix("--max-mir-size=") {
+            match val.parse::<u64>() {
+                Ok(mb) => max_mir_mb = Some(mb),
+                Err(_) => {
+                    eprintln!(
+                        "cargo-floyd: --max-mir-size requires a positive \
+                         integer in megabytes (e.g. --max-mir-size=200)"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+            args.remove(i);
+            continue;
+        }
+        if args[i] == "--max-mir-size" {
+            args.remove(i);
+            match args.get(i).copied().and_then(|v| v.parse::<u64>().ok()) {
+                Some(mb) => {
+                    max_mir_mb = Some(mb);
+                    args.remove(i);
+                }
+                None => {
+                    eprintln!(
+                        "cargo-floyd: --max-mir-size requires a positive \
+                         integer in megabytes (e.g. --max-mir-size 200)"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+            continue;
+        }
+        if args[i] == "--only" {
+            args.remove(i);
+            match args.get(i).copied() {
+                Some(v) => {
+                    only_patterns.push(v.to_string());
+                    args.remove(i);
+                }
+                None => {
+                    eprintln!("cargo-floyd: --only requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            continue;
+        }
         if let Some(rest) = args[i].strip_prefix("--format=") {
             format = match parse_format(rest) {
                 Ok(f) => f,
@@ -115,7 +280,9 @@ fn main() -> ExitCode {
     }
 
     match (is_test_mode, source) {
-        (true, Source::Cargo(p)) => run_test_mode_cargo(&p, &workdir, format),
+        (true, Source::Cargo(p)) => {
+            run_test_mode_cargo(&p, &workdir, format, &only_patterns, max_mir_mb)
+        }
         (true, Source::SingleFile(p)) => run_test_mode_single(&p, &workdir, format),
         (false, Source::Cargo(_)) => {
             eprintln!("cargo-floyd: static analysis on a cargo project is not supported yet;");
@@ -216,7 +383,31 @@ fn run_static_mode(source: &Path, workdir: &Path, format: Format) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitCode {
+fn run_test_mode_cargo(
+    manifest: &Path,
+    workdir: &Path,
+    format: Format,
+    only_patterns: &[String],
+    max_mir_mb: Option<u64>,
+) -> ExitCode {
+    // Scope Floyd's `--emit=mir,link -Cinstrument-coverage
+    // -Zcoverage-options=branch,condition -Zmir-include-spans` to
+    // the primary package only, via a RUSTC_WRAPPER shim that
+    // checks CARGO_PRIMARY_PACKAGE. Without this, every dep crate
+    // also dumps MIR and gets instrumented — a heapless build
+    // produced 336 GB virtual memory before rustc OOM'd on a
+    // 30 GB-RAM runner. Finding and setting the shim here (early)
+    // means the cargo build invoked inside `floyd::instrument`
+    // inherits the env var and routes rustc through our shim.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let shim = parent.join("floyd-rustc-shim");
+            if shim.exists() {
+                std::env::set_var("RUSTC_WRAPPER", &shim);
+            }
+        }
+    }
+
     // Build all test artifacts in the cargo project.
     let build = match instrument::compile_cargo_project(manifest) {
         Ok(b) => b,
@@ -262,14 +453,61 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
         tree: floyd::DecisionTree,
         prov: floyd::DecisionProvenance,
         artifact_idx: usize,
+        fn_idx: usize,
     }
 
     let mut artifacts: Vec<ArtifactInfo> = Vec::new();
     let mut raw_candidates: Vec<RawCandidate> = Vec::new();
     let mut all_tests: Vec<String> = Vec::new();
+    let mut declined: Vec<DeclinedFunction> = Vec::new();
+    // Pragmatic scalability guard: rustc's `--emit=mir` on a test
+    // binary that pulls in deep generic chains can produce MIR
+    // files hundreds of megabytes in size (bytes'
+    // `test_bytes_vec_alloc` is 349 MB — 4.2 million lines).
+    // Parsing those in Floyd's text parser blocks progress on the
+    // whole crate for 10+ minutes. We skip them above a size
+    // threshold and surface the skip in the honest-scope report,
+    // so the user sees exactly which artifacts were elided and
+    // why.
+    let max_mir_bytes: u64 = max_mir_mb.unwrap_or(50) * 1024 * 1024;
+    let mut skipped_oversize_mirs: Vec<(std::path::PathBuf, u64)> = Vec::new();
+    let mut skipped_no_harness: Vec<NoHarnessTarget> = Vec::new();
 
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] starting Pass 1 (parse MIR + enumerate tests)");
+    }
     // Pass 1: parse MIR, enumerate tests, collect candidates per artifact.
     for artifact in build.test_artifacts.iter() {
+        // `harness = false` targets are programs with their own
+        // `main`; `--list` would run them. Decide before invoking.
+        let uses_harness = artifact
+            .manifest_path
+            .as_deref()
+            .and_then(|mp| {
+                let text = std::fs::read_to_string(mp).ok()?;
+                Some(harness::target_uses_harness(
+                    &text,
+                    mp.parent().unwrap_or(Path::new(".")),
+                    &artifact.target_name,
+                    &artifact.target_kinds,
+                    &artifact.src_path,
+                ))
+            })
+            .unwrap_or(true);
+        if !uses_harness {
+            skipped_no_harness.push(NoHarnessTarget {
+                package: artifact.package_name.clone(),
+                target: artifact.target_name.clone(),
+                binary: artifact.binary_path.display().to_string(),
+            });
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(&artifact.mir_path) {
+            if meta.len() > max_mir_bytes {
+                skipped_oversize_mirs.push((artifact.mir_path.clone(), meta.len()));
+                continue;
+            }
+        }
         let mir_text = match std::fs::read_to_string(&artifact.mir_path) {
             Ok(s) => s,
             Err(_) => continue,
@@ -289,14 +527,80 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
             all_tests.push(t.clone());
         }
         let art_idx = artifacts.len();
-        for f in &mir.functions {
-            if let Some(node) = decision::decompose_function(f) {
-                raw_candidates.push(RawCandidate {
-                    tree: floyd::DecisionTree {
-                        decisions: vec![node],
-                    },
-                    prov: correlate::provenance_for(f),
-                    artifact_idx: art_idx,
+        for (fn_idx, f) in mir.functions.iter().enumerate() {
+            // Require BOTH a successful decomposition AND the
+            // presence of at least one `switchInt` in the function.
+            // Without that `switchInt` gate, boolean-passthrough
+            // helpers like `fn f(x: bool) -> bool { x }` register
+            // as candidates — the decomposer produces a
+            // `Node::Condition { name: "x" }`, but the function has
+            // no actual decision in it (no branch), so llvm-cov
+            // emits zero branch regions for it, correlation can't
+            // produce an observation, and the candidate shows up
+            // under the "reached-but-unobserved" bucket as a
+            // false-positive correlation bug. It's not a bug —
+            // there is no decision to measure in the first place.
+            // These passthroughs are not out-of-scope either; they
+            // are "no boolean decision at all", so they do not
+            // belong in the OOS report.
+            if decision::has_switchint(f) {
+                if let Some(node) = decision::decompose_function(f) {
+                    let prov = correlate::provenance_for(f);
+                    // `--only=<pattern>` scopes Floyd to the
+                    // functions the user named. On real embedded
+                    // crates the whole-crate scan is both slow and
+                    // noisy — a qualification engineer typically
+                    // has a specific list of safety-critical gates
+                    // they need to prove MC/DC on. If any --only
+                    // pattern is present and this function's name
+                    // doesn't contain any of them, drop it before
+                    // scoring; it will not appear in the verdict
+                    // or in the honest-scope report.
+                    if !only_patterns.is_empty() {
+                        let fn_name = prov.function_name.as_deref().unwrap_or(&f.name);
+                        let hit = only_patterns
+                            .iter()
+                            .any(|pat| fn_name.contains(pat.as_str()));
+                        if !hit {
+                            continue;
+                        }
+                    }
+                    // Reject candidates whose decision spans come
+                    // from inlined-stdlib macro expansions.
+                    // Rustc paths of the form `/rustc/<hash>/library/
+                    // core/src/macros/mod.rs` are the hygiene
+                    // bindings of `assert_eq!`, `debug_assert!`,
+                    // `panic!`, and friends — not user-written
+                    // decisions. On blake3 and other
+                    // test-heavy crates, every `#[test] fn x() {
+                    // assert_eq!(a, b); }` was being flagged as a
+                    // candidate whose "conditions" `left_val` and
+                    // `right_val` are the macro's own locals,
+                    // producing reached-but-unobserved false
+                    // positives in the AllUnobserved verdict.
+                    if is_stdlib_macro_span(prov.source_file.as_deref()) {
+                        continue;
+                    }
+                    raw_candidates.push(RawCandidate {
+                        tree: floyd::DecisionTree {
+                            decisions: vec![node],
+                        },
+                        prov,
+                        artifact_idx: art_idx,
+                        fn_idx,
+                    });
+                    continue;
+                }
+            }
+            if decision::has_switchint(f) {
+                // Has a switchInt (so some kind of decision) but
+                // the decomposer did not match any supported
+                // pattern. Honest-scope report entry.
+                let prov = correlate::provenance_for(f);
+                declined.push(DeclinedFunction {
+                    name: prov.function_name.unwrap_or_default(),
+                    source_file: prov.source_file,
+                    line: prov.line,
                 });
             }
         }
@@ -307,69 +611,335 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
         });
     }
 
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] Pass 1 complete: {} candidates, {} declined, {} artifacts, {} skipped-oversize",
+        raw_candidates.len(), declined.len(), artifacts.len(), skipped_oversize_mirs.len());
+    }
     // Pass 2: run every test across every artifact once; keep each
     // test's parsed coverage. We intentionally do NOT dedupe test
     // names across artifacts — two artifacts can share a test name.
-    let mut all_coverage: Vec<(String, profile::CoverageReport)> = Vec::new();
-    for (art_idx, info) in artifacts.iter().enumerate() {
-        for (test_idx, test_name) in info.tests.iter().enumerate() {
-            let prof = workdir.join(format!("cov-{art_idx:03}-{test_idx:03}.profraw"));
-            if let Err(e) = runner::run_test_isolated(&info.binary_path, test_name, &prof) {
-                eprintln!("cargo-floyd: {e}");
-                return ExitCode::from(1);
-            }
-            let coverage = match runner::profraw_to_coverage(
+    //
+    // Parallelised across tests via rayon. Each per-test job is
+    // self-contained (unique profraw file per `(art_idx, test_idx)`,
+    // no shared state), and the real wall-clock work is in three
+    // sequential subprocess calls per job (test invocation,
+    // `llvm-profdata merge`, `llvm-cov export`). Serialising those
+    // across every test in every artifact was the scalability
+    // blocker surfaced on real crates: `bytes`, `uuid`, `blake3`,
+    // `base64`, `chrono`, `url` all exceeded 10 minutes before
+    // this pass. On N logical cores, rayon runs min(N, jobs) jobs
+    // in parallel.
+    #[derive(Clone)]
+    struct TestJob {
+        art_idx: usize,
+        test_idx: usize,
+        test_name: String,
+        binary_path: std::path::PathBuf,
+    }
+
+    let jobs: Vec<TestJob> = artifacts
+        .iter()
+        .enumerate()
+        .flat_map(|(art_idx, info)| {
+            let bp = info.binary_path.clone();
+            info.tests
+                .iter()
+                .enumerate()
+                .map(move |(test_idx, test_name)| TestJob {
+                    art_idx,
+                    test_idx,
+                    test_name: test_name.clone(),
+                    binary_path: bp.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!(
+            "[progress] starting Pass 2: {} tests across {} artifacts",
+            jobs.len(),
+            artifacts.len()
+        );
+    }
+    let progress_counter = std::sync::atomic::AtomicUsize::new(0);
+    let progress_total = jobs.len();
+
+    use rayon::prelude::*;
+    let results: Result<Vec<(String, profile::CoverageReport)>, String> = jobs
+        .par_iter()
+        .map(|job| -> Result<(String, profile::CoverageReport), String> {
+            let prof = workdir.join(format!(
+                "cov-{:03}-{:03}.profraw",
+                job.art_idx, job.test_idx
+            ));
+            runner::run_test_isolated(&job.binary_path, &job.test_name, &prof)
+                .map_err(|e| e.to_string())?;
+            let coverage = runner::profraw_to_coverage(
                 &prof,
                 &profdata_tool,
                 &cov_tool,
-                &info.binary_path,
+                &job.binary_path,
                 workdir,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("cargo-floyd: {e}");
-                    return ExitCode::from(1);
-                }
-            };
-            all_coverage.push((test_name.clone(), coverage));
+            )
+            .map_err(|e| e.to_string())?;
+            let n = progress_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if (n.is_multiple_of(10) || n == progress_total) && std::env::var("FLOYD_DIAG").is_ok()
+            {
+                eprintln!("[progress]   {n}/{progress_total}");
+            }
+            Ok((job.test_name.clone(), coverage))
+        })
+        .collect();
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] Pass 2 complete");
+    }
+
+    let all_coverage = match results {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("cargo-floyd: {e}");
+            return ExitCode::from(1);
         }
+    };
+
+    // Pre-compute condition span maps per artifact's MIR. Done
+    // once; reused across every (candidate, test) pair in Pass 3.
+    // This turns Pass 3 from O(candidates × tests × functions ×
+    // blocks) into O(functions × blocks) + O(candidates × tests).
+    // On `bytes` (10 candidates, 1053 tests, ~500 functions per
+    // artifact MIR), that is a factor-of-thousands speedup.
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] starting Pass 3 prep (precompute span maps)");
+    }
+    let prepared: Vec<correlate::PreparedMir<'_>> = artifacts
+        .iter()
+        .map(|a| correlate::prepare_mir(&a.mir))
+        .collect();
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] Pass 3 prep complete");
+    }
+
+    // Pre-compute per-test coverage lookups (one `HashMap` per
+    // test so Pass 3's `find_matching_function` scan becomes O(1)).
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] prepping per-test coverage lookups");
+    }
+    let prepared_covs: Vec<(String, correlate::PreparedCoverage<'_>)> = all_coverage
+        .par_iter()
+        .map(|(name, cov)| (name.clone(), correlate::prepare_coverage_lookup(cov)))
+        .collect();
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!("[progress] coverage lookups ready: {}", prepared_covs.len());
     }
 
     // Pass 3: for each candidate, correlate against every test's
-    // coverage. Use the originating artifact's MIR for debug-name
-    // resolution — the function is defined there even when it's
-    // exercised by another artifact's tests.
-    let mut candidates: Vec<selector::Candidate> = Vec::new();
-    for raw in raw_candidates {
-        let mir = &artifacts[raw.artifact_idx].mir;
-        let mut obs = Vec::new();
-        for (test_name, coverage) in &all_coverage {
-            if let Some(o) = correlate::observation_from_coverage(
-                Some(test_name.clone()),
-                mir,
-                coverage,
-                &raw.tree,
-            ) {
-                obs.push(o);
+    // coverage using the pre-computed span maps and coverage
+    // lookups. Parallelised across candidates — each is
+    // independent.
+    let candidates: Vec<selector::Candidate> = raw_candidates
+        .into_par_iter()
+        .map(|raw| {
+            let prep = &prepared[raw.artifact_idx];
+            let obs: Vec<_> = prepared_covs
+                .iter()
+                .filter_map(|(test_name, prepared_cov)| {
+                    correlate::observation_from_prepared_coverage(
+                        Some(test_name.clone()),
+                        prep,
+                        raw.fn_idx,
+                        prepared_cov,
+                        &raw.tree,
+                    )
+                })
+                .collect();
+            selector::Candidate {
+                tree: raw.tree,
+                provenance: raw.prov,
+                observations: obs,
             }
-        }
-        candidates.push(selector::Candidate {
-            tree: raw.tree,
-            provenance: raw.prov,
-            observations: obs,
-        });
+        })
+        .collect();
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        eprintln!(
+            "[progress] Pass 3 complete: {} candidates",
+            candidates.len()
+        );
     }
 
+    // Classify every candidate by whether its own function was
+    // actually reached at runtime by any test. Lets us split the
+    // AllUnobserved message into (a) candidates the test suite
+    // genuinely never invoked and (b) candidates the suite DID
+    // run through but Floyd's span-match correlation missed —
+    // the latter is a Floyd bug, the former a user gap, and
+    // conflating them hides evidence that matters to a
+    // qualification audit.
+    let candidate_reach: Vec<bool> = candidates
+        .iter()
+        .map(|c| {
+            let fn_name = c.provenance.function_name.as_deref().unwrap_or("");
+            prepared_covs
+                .iter()
+                .any(|(_, pcov)| pcov.find(fn_name).map(|f| f.count > 0).unwrap_or(false))
+        })
+        .collect();
+
+    // FLOYD_DIAG span-mismatch probe: for every candidate that
+    // WAS reached at runtime but produced zero observations,
+    // dump its MIR condition spans alongside the first
+    // reaching test's coverage branch regions. Lets a human
+    // diff the two and see what offset / file-path shift the
+    // span-equality join is tripping on.
+    if std::env::var("FLOYD_DIAG").is_ok() {
+        for (c, reached) in candidates.iter().zip(candidate_reach.iter()) {
+            if !*reached || !c.observations.is_empty() {
+                continue;
+            }
+            let fn_name = c.provenance.function_name.as_deref().unwrap_or("");
+            eprintln!("[span-diag] candidate fn={fn_name}");
+            // MIR condition spans — rebuild for this function via
+            // the correlate helper (prepared.function_spans is
+            // keyed by fn_idx, not reachable from this scope
+            // cleanly; collecting the one function's spans here
+            // is cheap).
+            for (art_idx, info) in artifacts.iter().enumerate() {
+                if let Some((fidx, _)) = info
+                    .mir
+                    .functions
+                    .iter()
+                    .enumerate()
+                    .find(|(_, f)| f.name == fn_name)
+                {
+                    eprintln!("[span-diag]   artifact {art_idx} function_idx={fidx}");
+                    let spans = &prepared[art_idx].function_spans[fidx];
+                    for (name, span) in spans {
+                        eprintln!("[span-diag]     MIR cond '{name}' @ {span:?}");
+                    }
+                    break;
+                }
+            }
+            // Coverage branches from the first reaching test.
+            for (test_name, pcov) in prepared_covs.iter() {
+                if let Some(fc) = pcov.find(fn_name) {
+                    if fc.count > 0 {
+                        eprintln!(
+                            "[span-diag]   test '{test_name}' has {} branches, count={}",
+                            fc.branches.len(),
+                            fc.count
+                        );
+                        for b in fc.branches.iter().take(10) {
+                            eprintln!(
+                                "[span-diag]     COV branch @ {:?} true={} false={}",
+                                b.span, b.true_count, b.false_count
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let reached_count = candidate_reach.iter().filter(|r| **r).count();
+    let unreached_count = candidate_reach.len() - reached_count;
+    let candidate_summaries: Vec<CandidateSummary> = candidates
+        .iter()
+        .zip(candidate_reach.iter())
+        .map(|(c, reached)| CandidateSummary {
+            function_name: c.provenance.function_name.clone(),
+            source_file: c.provenance.source_file.clone(),
+            line: c.provenance.line,
+            invoked: *reached,
+            observations: c.observations.len(),
+        })
+        .collect();
+    let skipped_mirs: Vec<SkippedMir> = skipped_oversize_mirs
+        .iter()
+        .map(|(path, bytes)| SkippedMir {
+            path: path.display().to_string(),
+            bytes: *bytes,
+        })
+        .collect();
+    let manifest_str = manifest.display().to_string();
+    let workspace_root_str = build.workspace_root.display().to_string();
+    let test_targets = build.test_artifacts.len();
+    let report = |verdict, observations, analysis| CargoRuntimeReport {
+        manifest: manifest_str.clone(),
+        workspace_root: workspace_root_str.clone(),
+        test_targets,
+        verdict,
+        tests_discovered: &all_tests,
+        observations,
+        analysis,
+        candidates: &candidate_summaries,
+        out_of_scope: &declined,
+        skipped_oversize_mirs: &skipped_mirs,
+        skipped_no_harness: &skipped_no_harness,
+    };
+    // Decline paths: the human-readable explanation goes to stderr
+    // in every format; stdout carries only the format's document.
+    let emit_decline = |verdict| -> ExitCode {
+        match format {
+            Format::Text => print_out_of_scope_report(
+                &mut std::io::stdout(),
+                &declined,
+                &skipped_oversize_mirs,
+                &skipped_no_harness,
+            ),
+            Format::Json => {
+                if let Err(code) = print_json(&report(verdict, &[], None)) {
+                    return code;
+                }
+            }
+            Format::Junit => print_out_of_scope_report(
+                &mut std::io::stderr(),
+                &declined,
+                &skipped_oversize_mirs,
+                &skipped_no_harness,
+            ),
+        }
+        ExitCode::from(1)
+    };
+
     let chosen = match selector::pick_best(candidates) {
-        Some(c) => c,
-        None => {
+        selector::PickResult::Picked(c) => c,
+        selector::PickResult::AllUnobserved => {
+            eprintln!(
+                "cargo-floyd: Floyd found decomposable boolean \
+                 decisions in your code, but no test produced a \
+                 usable observation for any of them."
+            );
+            if reached_count > 0 {
+                eprintln!(
+                    "  {reached_count} candidate(s) WERE invoked at \
+                     runtime, but Floyd's span-match could not join \
+                     them to a coverage branch region. This is most \
+                     likely a Floyd correlation bug (rustc span \
+                     drift under optimisation); please file an \
+                     issue with --format=json's provenance block."
+                );
+            }
+            if unreached_count > 0 {
+                eprintln!(
+                    "  {unreached_count} candidate(s) were never \
+                     invoked by any test — add a test that calls \
+                     one of your top-level `pub fn` decisions, or \
+                     verify which candidates were considered via \
+                     --format=json's `candidates` list."
+                );
+            }
+            return emit_decline(RuntimeVerdict::AllUnobserved);
+        }
+        selector::PickResult::NoCandidates => {
             eprintln!(
                 "cargo-floyd: no recognised decisions in any test target. \
                  The engine currently supports `&&`, `||`, `!`, and nested \
-                 combinations; `if let`, `?`, and `match` patterns are not \
-                 yet implemented."
+                 combinations; `if let`, `?`, and `match` patterns are \
+                 partially supported (2-arm const-returning shapes); \
+                 non-boolean decisions and arms that end in a function \
+                 call are out of scope."
             );
-            return ExitCode::from(1);
+            return emit_decline(RuntimeVerdict::NoCandidates);
         }
     };
     let all_observations = chosen.observations.clone();
@@ -383,31 +953,20 @@ fn run_test_mode_cargo(manifest: &Path, workdir: &Path, format: Format) -> ExitC
             println!();
             println!("Test targets: {}", build.test_artifacts.len());
             print_runtime_report_body(&all_tests, &all_observations, &analysis);
+            print_out_of_scope_report(
+                &mut std::io::stdout(),
+                &declined,
+                &skipped_oversize_mirs,
+                &skipped_no_harness,
+            );
         }
         Format::Json => {
-            #[derive(serde::Serialize)]
-            struct Report<'a> {
-                manifest: String,
-                workspace_root: String,
-                test_targets: usize,
-                tests_discovered: &'a [String],
-                observations: &'a [ConditionObservation],
-                analysis: &'a RuntimeAnalysis,
-            }
-            let report = Report {
-                manifest: manifest.display().to_string(),
-                workspace_root: build.workspace_root.display().to_string(),
-                test_targets: build.test_artifacts.len(),
-                tests_discovered: &all_tests,
-                observations: &all_observations,
-                analysis: &analysis,
-            };
-            match serde_json::to_string_pretty(&report) {
-                Ok(s) => println!("{s}"),
-                Err(e) => {
-                    eprintln!("cargo-floyd: serialize JSON: {e}");
-                    return ExitCode::from(1);
-                }
+            if let Err(code) = print_json(&report(
+                RuntimeVerdict::Analysed,
+                &all_observations,
+                Some(&analysis),
+            )) {
+                return code;
             }
         }
         Format::Junit => {
@@ -532,14 +1091,42 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     }
 
     // 6. Pick the best candidate, run the analysis.
+    let report = |verdict, observations, analysis| SingleRuntimeReport {
+        source: source.display().to_string(),
+        verdict,
+        tests_discovered: &tests,
+        observations,
+        analysis,
+    };
+    let emit_decline = |verdict| -> ExitCode {
+        if let Format::Json = format {
+            if let Err(code) = print_json(&report(verdict, &[], None)) {
+                return code;
+            }
+        }
+        ExitCode::from(1)
+    };
     let chosen = match selector::pick_best(candidates) {
-        Some(c) => c,
-        None => {
+        selector::PickResult::Picked(c) => c,
+        selector::PickResult::AllUnobserved => {
+            eprintln!(
+                "cargo-floyd: Floyd found decomposable boolean decisions in \
+                 your code, but no test exercised any of them. \
+                 The decisions it recognised live in closures \
+                 or test-adjacent helpers that the test suite \
+                 does not call directly. Add a test that calls \
+                 one of your top-level `pub fn` decisions, or \
+                 verify which candidates Floyd considered via \
+                 `--format=json`'s provenance block."
+            );
+            return emit_decline(RuntimeVerdict::AllUnobserved);
+        }
+        selector::PickResult::NoCandidates => {
             eprintln!(
                 "cargo-floyd: no recognised decisions in {}",
                 source.display()
             );
-            return ExitCode::from(1);
+            return emit_decline(RuntimeVerdict::NoCandidates);
         }
     };
     let observations = chosen.observations.clone();
@@ -549,25 +1136,12 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     match format {
         Format::Text => print_runtime_report(source, &tests, &observations, &analysis),
         Format::Json => {
-            #[derive(serde::Serialize)]
-            struct Report<'a> {
-                source: String,
-                tests_discovered: &'a [String],
-                observations: &'a [ConditionObservation],
-                analysis: &'a RuntimeAnalysis,
-            }
-            let report = Report {
-                source: source.display().to_string(),
-                tests_discovered: &tests,
-                observations: &observations,
-                analysis: &analysis,
-            };
-            match serde_json::to_string_pretty(&report) {
-                Ok(s) => println!("{s}"),
-                Err(e) => {
-                    eprintln!("cargo-floyd: serialize JSON: {e}");
-                    return ExitCode::from(1);
-                }
+            if let Err(code) = print_json(&report(
+                RuntimeVerdict::Analysed,
+                &observations,
+                Some(&analysis),
+            )) {
+                return code;
             }
         }
         Format::Junit => {
@@ -806,6 +1380,82 @@ fn format_inputs(conditions: &[String], row: &TruthTableRow) -> String {
         .join(", ")
 }
 
+/// Does this source-file path belong to the standard-library
+/// macro expansion namespace that rustc stamps at compile time?
+///
+/// The canonical shape is `/rustc/<hash>/library/<crate>/src/...`
+/// where `<crate>` is `core`, `std`, `alloc`, `proc_macro`, or a
+/// test-harness crate. Also catches cargo-registry proc-macro
+/// expansions whose spans point back to the macro definition
+/// site rather than the user call site. Candidates whose
+/// decision lives in those paths are macro hygiene bindings
+/// (`left_val` / `right_val` from `assert_eq!`, etc.), not
+/// user-written decisions, and should not be surfaced as MC/DC
+/// candidates.
+fn is_stdlib_macro_span(file: Option<&str>) -> bool {
+    let Some(f) = file else {
+        return false;
+    };
+    f.starts_with("/rustc/")
+        || f.contains("/library/core/")
+        || f.contains("/library/std/")
+        || f.contains("/library/alloc/")
+}
+
+fn print_out_of_scope_report(
+    out: &mut dyn std::io::Write,
+    declined: &[impl std::fmt::Debug],
+    skipped_oversize_mirs: &[(std::path::PathBuf, u64)],
+    skipped_no_harness: &[NoHarnessTarget],
+) {
+    if !skipped_no_harness.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "Skipped {} test target(s) built with `harness = false` \
+             (custom `main`, no libtest `--list`); Floyd did not run them:",
+            skipped_no_harness.len()
+        );
+        for t in skipped_no_harness {
+            let _ = writeln!(out, "  {} ({})", t.target, t.package);
+        }
+    }
+    if !declined.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "Out of scope: {} function(s) have a decision in a shape \
+             the engine's current patterns do not recognise. The engine \
+             declined them rather than report a wrong verdict. See \
+             --format=json's `out_of_scope` for the full list.",
+            declined.len()
+        );
+    }
+    if !skipped_oversize_mirs.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "Skipped {} MIR file(s) above the 50 MB scalability \
+             threshold (monomorphisation explosion in test \
+             binaries). These artifacts were not analysed — \
+             candidates and tests they would have contributed are \
+             absent from the verdict:",
+            skipped_oversize_mirs.len()
+        );
+        for (path, size) in skipped_oversize_mirs.iter().take(5) {
+            let _ = writeln!(
+                out,
+                "  {}  ({:.0} MB)",
+                path.display(),
+                (*size as f64) / (1024.0 * 1024.0)
+            );
+        }
+        if skipped_oversize_mirs.len() > 5 {
+            let _ = writeln!(out, "  ... and {} more", skipped_oversize_mirs.len() - 5);
+        }
+    }
+}
+
 fn bool_glyph(v: bool) -> &'static str {
     if v {
         "T"
@@ -908,6 +1558,49 @@ mod tests {
         assert_eq!(xml_escape("don't"), "don&apos;t");
         // Ampersand must run first so `&lt;` doesn't become `&amp;lt;`.
         assert_eq!(xml_escape("a < b & c"), "a &lt; b &amp; c");
+    }
+
+    #[test]
+    fn decline_json_report_carries_out_of_scope_and_candidates() {
+        let declined = vec![DeclinedFunction {
+            name: "crate::f".to_string(),
+            source_file: Some("src/lib.rs".to_string()),
+            line: Some(7),
+        }];
+        let candidates = vec![CandidateSummary {
+            function_name: Some("crate::g".to_string()),
+            source_file: Some("src/lib.rs".to_string()),
+            line: Some(12),
+            invoked: false,
+            observations: 0,
+        }];
+        let skipped = vec![SkippedMir {
+            path: "target/x.mir".to_string(),
+            bytes: 1,
+        }];
+        let report = CargoRuntimeReport {
+            manifest: "Cargo.toml".to_string(),
+            workspace_root: ".".to_string(),
+            test_targets: 1,
+            verdict: RuntimeVerdict::AllUnobserved,
+            tests_discovered: &[],
+            observations: &[],
+            analysis: None,
+            candidates: &candidates,
+            out_of_scope: &declined,
+            skipped_oversize_mirs: &skipped,
+            skipped_no_harness: &[],
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string_pretty(&report).unwrap()).unwrap();
+        assert_eq!(v["verdict"], "all_unobserved");
+        assert!(v["analysis"].is_null());
+        assert_eq!(v["observations"].as_array().unwrap().len(), 0);
+        assert_eq!(v["out_of_scope"][0]["name"], "crate::f");
+        assert_eq!(v["out_of_scope"][0]["line"], 7);
+        assert_eq!(v["candidates"][0]["function_name"], "crate::g");
+        assert_eq!(v["candidates"][0]["invoked"], false);
+        assert_eq!(v["skipped_oversize_mirs"][0]["bytes"], 1);
     }
 
     #[test]

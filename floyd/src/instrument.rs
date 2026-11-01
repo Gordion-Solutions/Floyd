@@ -77,6 +77,17 @@ pub struct TestArtifact {
     pub mir_path: PathBuf,
     /// Cargo package name the artifact came from (for diagnostics).
     pub package_name: String,
+    /// Cargo target name (`target.name` in cargo's artifact message).
+    pub target_name: String,
+    /// Cargo target kinds (`target.kind`, e.g. `["lib"]`, `["test"]`).
+    pub target_kinds: Vec<String>,
+    /// Root source file of the target (`target.src_path`).
+    pub src_path: PathBuf,
+    /// `Cargo.toml` of the package that owns the target, from
+    /// `cargo metadata`. `None` if the package id was not listed.
+    /// Callers read target settings cargo does not report in its JSON
+    /// (notably `harness = false`) from this manifest.
+    pub manifest_path: Option<PathBuf>,
 }
 
 /// Result of a successful [`compile_cargo_project`] invocation.
@@ -138,8 +149,23 @@ pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, I
             stderr: String::from_utf8_lossy(&metadata_out.stderr).into_owned(),
         });
     }
-    let workspace_root: PathBuf = serde_json::from_slice::<serde_json::Value>(&metadata_out.stdout)
-        .ok()
+    let metadata: Option<serde_json::Value> = serde_json::from_slice(&metadata_out.stdout).ok();
+    let package_manifests: std::collections::HashMap<String, PathBuf> = metadata
+        .as_ref()
+        .and_then(|v| v.get("packages"))
+        .and_then(|p| p.as_array())
+        .map(|pkgs| {
+            pkgs.iter()
+                .filter_map(|p| {
+                    let id = p.get("id")?.as_str()?.to_string();
+                    let mp = p.get("manifest_path")?.as_str()?;
+                    Some((id, PathBuf::from(mp)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let workspace_root: PathBuf = metadata
+        .as_ref()
         .and_then(|v| {
             v.get("workspace_root")
                 .and_then(|w| w.as_str())
@@ -150,11 +176,14 @@ pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, I
             stderr: "could not parse workspace_root".to_string(),
         })?;
 
-    // Step 2: cargo build --tests with our RUSTFLAGS.
-    let rustflags = "-Cinstrument-coverage \
-                     -Zcoverage-options=branch,condition \
-                     -Zmir-include-spans \
-                     --emit=mir,link";
+    // Step 2: cargo build --tests. The caller sets
+    // `RUSTC_WRAPPER` to the `floyd-rustc-shim`, which appends
+    // Floyd's instrumentation flags ONLY for the primary package
+    // (via `CARGO_PRIMARY_PACKAGE`). Dep crates compile without
+    // `--emit=mir` and without coverage instrumentation — critical
+    // on real embedded crates like `heapless` where the generic
+    // dep tree would otherwise produce hundreds of gigabytes of
+    // MIR text.
     let build_out = Command::new("cargo")
         .args([
             "+nightly",
@@ -164,7 +193,6 @@ pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, I
             "--manifest-path",
         ])
         .arg(&manifest)
-        .env("RUSTFLAGS", rustflags)
         .output()
         .map_err(|e| InstrumentError {
             stage: "cargo build --tests",
@@ -190,11 +218,8 @@ pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, I
         if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
             continue;
         }
-        let is_test = msg
-            .get("target")
-            .and_then(|t| t.get("test"))
-            .and_then(|b| b.as_bool())
-            == Some(true);
+        let target = msg.get("target");
+        let is_test = target.and_then(|t| t.get("test")).and_then(|b| b.as_bool()) == Some(true);
         if !is_test {
             continue;
         }
@@ -215,10 +240,34 @@ pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, I
                 // the test target wasn't compiled with our flags.
                 continue;
             }
+            let target_name = target
+                .and_then(|t| t.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let target_kinds = target
+                .and_then(|t| t.get("kind"))
+                .and_then(|k| k.as_array())
+                .map(|ks| {
+                    ks.iter()
+                        .filter_map(|k| k.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let src_path = target
+                .and_then(|t| t.get("src_path"))
+                .and_then(|p| p.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            let manifest_path = package_manifests.get(&package_name).cloned();
             test_artifacts.push(TestArtifact {
                 binary_path: bin,
                 mir_path: mir,
                 package_name,
+                target_name,
+                target_kinds,
+                src_path,
+                manifest_path,
             });
         }
     }

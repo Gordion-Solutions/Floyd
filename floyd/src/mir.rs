@@ -59,6 +59,24 @@ pub struct SourceSpan {
 pub struct Mir {
     /// Top-level functions in source order.
     pub functions: Vec<MirFunction>,
+    /// Count of function definitions in the input text whose fn
+    /// header the parser could not recognise. The function body is
+    /// skipped (brace-balanced); the count surfaces that something
+    /// was elided so the honest-scope report can tell a reader
+    /// "Floyd parsed M of M+N functions in this MIR, N were in
+    /// shapes the engine's grammar does not yet model (HRTB
+    /// signatures, complex trait objects, ...)".
+    pub unparseable_functions: usize,
+    /// Count of function definitions whose body contained no
+    /// `switchInt` terminator at all and were therefore
+    /// brace-skipped before the parser ever walked them. These are
+    /// straight-line / pure-call-delegation / constant-returning
+    /// functions — the engine cannot analyse a decision in them
+    /// because there is no decision. Dropping them before the main
+    /// parse walk is a scalability win on real crates (heapless'
+    /// const-generic monomorphisation produces hundreds of such
+    /// bodies, each thousands of lines of MIR).
+    pub decisionless_functions: usize,
 }
 
 /// One function's MIR.
@@ -142,12 +160,16 @@ pub struct MirBlock {
 /// A non-terminating statement inside a block.
 #[derive(Debug, Clone)]
 pub enum MirStatement {
-    /// `_<dst> = copy _<src>;`
+    /// `_<dst> = copy _<src>;` or `_<dst> = copy (*_<src>);`
     AssignCopy {
         /// Destination local.
         dst: LocalId,
         /// Source local.
         src: LocalId,
+        /// `true` for the dereference form `copy (*_<src>)`: `dst`
+        /// receives the pointee of `src`, not `src`'s own value.
+        /// `false` for a plain `copy _<src>` value alias.
+        deref: bool,
         /// Source span, if present in the MIR.
         span: Option<SourceSpan>,
     },
@@ -235,6 +257,22 @@ pub enum MirStatement {
         lhs: Operand,
         /// Right-hand operand.
         rhs: Operand,
+        /// Source span, if present in the MIR.
+        span: Option<SourceSpan>,
+    },
+    /// `_<dst> = Not(copy _<src>);` (or `move _<src>`).
+    ///
+    /// Boolean unary negation. Emitted by rustc when
+    /// `-Cinstrument-coverage` runs with
+    /// `-Zcoverage-options=branch,condition` — the Not operation's
+    /// two outcomes need their own branch counter, so rustc
+    /// materialises it as a distinct statement instead of folding
+    /// the `!` into a switchInt arm swap (the fallback shape).
+    AssignUnaryNot {
+        /// Destination local (bool-typed).
+        dst: LocalId,
+        /// Source local being negated.
+        src: LocalId,
         /// Source span, if present in the MIR.
         span: Option<SourceSpan>,
     },
@@ -420,20 +458,171 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// First-pass filter that brace-strips function bodies with no
+/// `switchInt` terminator.
+///
+/// Walks the input line by line, tracking brace depth. At depth 0,
+/// when a line that looks like a function header (`fn ... {`) is
+/// seen, scan ahead to the matching close brace and check whether
+/// the body contains the string `switchInt`. If not, emit the fn
+/// header followed by a minimal `bb0: { return; }` stub body and
+/// skip the real body. If yes, emit the function verbatim. Any
+/// non-function top-level item (static, const, impl block, scope,
+/// etc.) is emitted verbatim.
+///
+/// Returns the filtered input and the count of stripped functions.
+fn strip_switchintless_fn_bodies(input: &str) -> (String, usize) {
+    let lines: Vec<&str> = input.lines().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut skipped: usize = 0;
+    let mut top_depth: u32 = 0;
+    let mut i: usize = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        // At depth 0: detect function headers. These start with
+        // `fn ` after trimming leading whitespace and end with
+        // `{`. Non-fn top-level items (static X = {, const FOO =
+        // {, scope ... {) are left untouched; the main parser's
+        // own skip_depth / scope_nest machinery handles them.
+        if top_depth == 0 && is_fn_header_line(trimmed) {
+            // Scan ahead for the matching close brace, tracking
+            // local depth. We only consider `switchInt` occurrences
+            // within THIS function's body (so a nested fn in a
+            // scope would still have its own switchInt check if
+            // we ever hit one, though in practice MIR dumps do
+            // not nest fns inside bodies).
+            let mut local_depth: u32 = 1;
+            let mut j = i + 1;
+            let mut has_decision_marker = false;
+            while j < lines.len() && local_depth > 0 {
+                let tl = lines[j].trim();
+                if !has_decision_marker && line_has_decision_marker(tl) {
+                    has_decision_marker = true;
+                }
+                if tl.ends_with('{') {
+                    local_depth += 1;
+                } else if tl == "}" {
+                    local_depth -= 1;
+                }
+                j += 1;
+            }
+            // j now points one past the function's closing brace.
+            //
+            // Size threshold: the strip pass is a scalability
+            // optimisation for crates whose per-function MIR is
+            // thousands of lines each (heapless' const-generic
+            // monomorphisation). For small bodies (hand-written
+            // test fixtures, tiny real functions) the parser's
+            // own walk is already cheap and stripping would elide
+            // legitimate `debug` / `let` metadata the parser-level
+            // tests depend on. Keep anything under the threshold
+            // verbatim; apply the strip only when it actually
+            // moves the needle.
+            let body_lines = j.saturating_sub(i);
+            let worth_stripping = body_lines >= 50;
+            if has_decision_marker || !worth_stripping {
+                for body_line in &lines[i..j] {
+                    out.push_str(body_line);
+                    out.push('\n');
+                }
+            } else {
+                // Keep the fn header (first line) + stub body.
+                out.push_str(lines[i]);
+                out.push('\n');
+                out.push_str("    bb0: {\n");
+                out.push_str("        return;\n");
+                out.push_str("    }\n");
+                out.push_str("}\n");
+                skipped += 1;
+            }
+            i = j;
+            continue;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+        if trimmed.ends_with('{') {
+            top_depth = top_depth.saturating_add(1);
+        } else if trimmed == "}" {
+            top_depth = top_depth.saturating_sub(1);
+        }
+        i += 1;
+    }
+    (out, skipped)
+}
+
+/// Does this body line contain a MIR syntactic marker that could
+/// let Floyd's decomposer produce a candidate decision?
+///
+/// Keeps the strip pass's positive-list conservative: any `switchInt`
+/// terminator (branching); any inline-compare rvalue (`= Eq(`,
+/// `= Ne(`, `= Lt(`, `= Le(`, `= Gt(`, `= Ge(`); any unary negation
+/// (`= Not(`); or a constant assignment to the return place
+/// (`_0 = const `) which `extract_terminal_value` recovers as
+/// `Node::Const`. Bodies with none of these markers cannot
+/// produce a candidate, so they are safe to drop.
+fn line_has_decision_marker(line: &str) -> bool {
+    line.contains("switchInt")
+        || line.contains(" = Eq(")
+        || line.contains(" = Ne(")
+        || line.contains(" = Lt(")
+        || line.contains(" = Le(")
+        || line.contains(" = Gt(")
+        || line.contains(" = Ge(")
+        || line.contains(" = Not(")
+        || line.contains("_0 = const ")
+}
+
+/// Does this line look like a top-level MIR function header? E.g.
+/// `fn make_input(_1: &[u8]) -> bool {`. Matched conservatively —
+/// we only strip bodies when we are confident the line is a fn
+/// header and not something else (nested fns inside bodies,
+/// closures, scope declarations).
+fn is_fn_header_line(line: &str) -> bool {
+    line.starts_with("fn ") && line.ends_with('{')
+}
+
 /// Parse an `--emit=mir` text dump into a [`Mir`].
 ///
-/// Phase 0 scope: function headers, `debug` annotations, `let` locals,
-/// blocks with `copy`/`const bool` assignments, and `return` / `goto` /
-/// `switchInt` terminators. Other shapes pass through as
-/// [`MirStatement::Other`] / [`MirTerminator::Other`].
+/// Phase 0 scope: function headers, `debug` annotations, `let`
+/// locals, blocks with `copy`/`const bool` assignments, and
+/// `return` / `goto` / `switchInt` terminators. Other shapes pass
+/// through as [`MirStatement::Other`] / [`MirTerminator::Other`].
 ///
 /// When the MIR was emitted with `-Zmir-include-spans`, the parser
 /// also captures inline source-span comments of the form
 /// `// scope <N> at <file>:<line>:<col>: <line>:<col>` and attaches
-/// them to the corresponding statement / terminator. Span-less MIR is
-/// also accepted; the `span` fields are then `None`.
+/// them to the corresponding statement / terminator. Span-less MIR
+/// is also accepted; the `span` fields are then `None`.
+///
+/// Runs `strip_switchintless_fn_bodies` first, so functions whose
+/// bodies carry no `switchInt` terminator are brace-stripped before
+/// the main parse walk. The stripped count is surfaced via
+/// [`Mir::decisionless_functions`].
 pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
-    let mut mir = Mir::default();
+    // Lazy skip pass: brace-strip any function body that contains
+    // no `switchInt` terminator. These functions carry no decision
+    // Floyd can analyse (straight-line code, pure-call delegation,
+    // constant returns) so there is no analytical cost to dropping
+    // them before the main parse walk. The win is scalability:
+    // heapless' const-generic monomorphisation produces hundreds
+    // of such bodies, each thousands of lines of MIR text; parsing
+    // them in full was the single biggest contributor to Pass 1
+    // wall-clock on real embedded crates. The brace-stripped body
+    // is replaced with a minimal `bb0: { return; }` stub so the
+    // existing parser still sees a well-formed function header
+    // and records it for the per-crate function count (both the
+    // function and its emptiness are user-visible in the report
+    // via `decisionless_functions`).
+    let (input, decisionless) = strip_switchintless_fn_bodies(input);
+    let mut mir = Mir {
+        decisionless_functions: decisionless,
+        ..Mir::default()
+    };
+    let input = input.as_str();
     let mut depth: u8 = 0;
     // Counter for "skip this block" regions outside any function —
     // top-level non-`fn` items like
@@ -500,13 +689,30 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
         // Open a brace: either a function or a basic block header.
         if code.ends_with('{') {
             if depth == 0 {
-                let f = parse_fn_header(code).ok_or_else(|| ParseError {
-                    line: line_no,
-                    message: format!("expected fn header, got: {code}"),
-                })?;
-                current_fn = Some(f);
-                depth = 1;
-                continue;
+                match parse_fn_header(code) {
+                    Some(f) => {
+                        current_fn = Some(f);
+                        depth = 1;
+                        continue;
+                    }
+                    None => {
+                        // Error-tolerant: an unparseable fn header
+                        // (complex HRTB generics, trait object
+                        // return types the current grammar does
+                        // not model) skips the whole function body
+                        // via the `skip_depth` mechanism. One
+                        // unparseable function must not kill the
+                        // whole MIR parse — a 2.9MB MIR with 360
+                        // functions should surface the 359 that
+                        // DO parse. The count is tracked so the
+                        // honest-scope reporter can say "N
+                        // functions could not be parsed by this
+                        // engine's MIR grammar".
+                        mir.unparseable_functions += 1;
+                        skip_depth = 1;
+                        continue;
+                    }
+                }
             } else if depth == 1 {
                 let id = parse_bb_header(code).ok_or_else(|| ParseError {
                     line: line_no,
@@ -1002,7 +1208,12 @@ fn parse_statement(line: &str, span: Option<SourceSpan>) -> Option<MirStatement>
 
     if let Some(src_str) = rhs.strip_prefix("copy _") {
         if let Ok(src) = src_str.parse::<u32>() {
-            return Some(MirStatement::AssignCopy { dst, src, span });
+            return Some(MirStatement::AssignCopy {
+                dst,
+                src,
+                deref: false,
+                span,
+            });
         }
     }
     // `_X = copy (*_Y);` — dereference copy, common when reading
@@ -1013,7 +1224,12 @@ fn parse_statement(line: &str, span: Option<SourceSpan>) -> Option<MirStatement>
     if let Some(inner) = rhs.strip_prefix("copy (*_") {
         if let Some(close) = inner.find(')') {
             if let Ok(src) = inner[..close].parse::<u32>() {
-                return Some(MirStatement::AssignCopy { dst, src, span });
+                return Some(MirStatement::AssignCopy {
+                    dst,
+                    src,
+                    deref: true,
+                    span,
+                });
             }
         }
     }
@@ -1073,6 +1289,15 @@ fn parse_statement(line: &str, span: Option<SourceSpan>) -> Option<MirStatement>
             rhs: cmp.rhs,
             span,
         });
+    }
+    // `_X = Not(copy _Y);` / `_X = Not(move _Y);` — boolean unary
+    // negation. See `MirStatement::AssignUnaryNot` for context.
+    if let Some(inner) = rhs.strip_prefix("Not(") {
+        if let Some(arg) = inner.strip_suffix(')') {
+            if let Some(src) = parse_local_token(arg.trim()) {
+                return Some(MirStatement::AssignUnaryNot { dst, src, span });
+            }
+        }
     }
     None
 }
@@ -2086,6 +2311,7 @@ fn decide(_1: i32, _2: i32) -> bool {
             MirStatement::AssignCopy {
                 dst: 0,
                 src: 2,
+                deref: false,
                 span: Some(s),
             } => {
                 // location of `b` in `a && b`
