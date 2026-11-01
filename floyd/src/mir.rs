@@ -432,6 +432,25 @@ pub enum MirTerminator {
         /// Source span, if present in the MIR.
         span: Option<SourceSpan>,
     },
+    /// `_<dst> = <func-expr>(<args>) -> unwind <action>;` or
+    /// `_<dst> = <func-expr>(<args>) -> bb<cleanup>;`
+    ///
+    /// A call with no `return` edge: the callee returns `!`
+    /// (`core::panicking::panic`, `std::rt::panic_fmt`,
+    /// `std::rt::begin_panic`, `core::panicking::assert_failed`,
+    /// `std::process::exit`, ..). Control never continues past it, so
+    /// a path that reaches one diverges. This is how rustc lowers the
+    /// failure arm of `assert!`, `assert_eq!`, `panic!`, `unwrap()`
+    /// and friends.
+    NoReturnCall {
+        /// Local named as the (never-written) destination.
+        dst: LocalId,
+        /// Verbatim text of the function expression, as for
+        /// [`MirTerminator::Call::func_text`].
+        func_text: String,
+        /// Source span, if present in the MIR.
+        span: Option<SourceSpan>,
+    },
     /// `assert(<cond>, "<msg>", <args>..) -> [success: bb<target>, unwind ..];`
     ///
     /// rustc's checked-operation terminator: overflow checks on
@@ -1397,15 +1416,7 @@ fn parse_call_terminator(s: &str) -> Option<CallTerminator> {
     let lhs = &s[..=arrow_idx]; // up to and including the `)`
     let arms_str = s[arrow_idx + 6..].strip_suffix(']')?;
 
-    let eq = lhs.find(" = ")?;
-    let dst = lhs[..eq].trim().strip_prefix('_')?.parse::<u32>().ok()?;
-    let call_expr = lhs[eq + 3..].trim();
-    // Capture the function expression text (everything up to the
-    // opening `(` of the argument list). Used by the `?` detector.
-    let func_text = match call_expr.find('(') {
-        Some(p) => call_expr[..p].trim().to_string(),
-        None => call_expr.to_string(),
-    };
+    let (dst, func_text) = parse_call_lhs(lhs)?;
 
     // Find the `return: bb<N>` arm. Other arms (unwind continue,
     // unwind: bb20, etc.) are ignored — Floyd does not follow
@@ -1480,6 +1491,40 @@ fn first_string_literal(s: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Split `_<dst> = <func-expr>(<args>)` into the destination local
+/// and the function expression text (everything up to the opening
+/// `(` of the argument list; used by the `?` detector and the panic
+/// filter).
+fn parse_call_lhs(lhs: &str) -> Option<(LocalId, String)> {
+    let eq = lhs.find(" = ")?;
+    let dst = lhs[..eq].trim().strip_prefix('_')?.parse::<u32>().ok()?;
+    let call_expr = lhs[eq + 3..].trim();
+    let func_text = match call_expr.find('(') {
+        Some(p) => call_expr[..p].trim().to_string(),
+        None => call_expr.to_string(),
+    };
+    Some((dst, func_text))
+}
+
+/// Parse a call terminator with no return edge,
+/// `_<dst> = <func-expr>(<args>) -> unwind <action>` or
+/// `_<dst> = <func-expr>(<args>) -> bb<cleanup>` (the trailing `;`
+/// has already been stripped). Returns `None` for any other shape,
+/// including calls that do return (`-> [return: ..]`).
+fn parse_noreturn_call_terminator(s: &str) -> Option<(LocalId, String)> {
+    let arrow_idx = s.rfind(") -> ")?;
+    let edge = &s[arrow_idx + 5..];
+    let is_unwind_only = edge.starts_with("unwind ")
+        || edge.starts_with("unwind:")
+        || edge
+            .strip_prefix("bb")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    if !is_unwind_only {
+        return None;
+    }
+    parse_call_lhs(&s[..=arrow_idx])
 }
 
 /// Parse a local token that may carry a `copy`/`move` prefix, returning
@@ -1567,6 +1612,14 @@ fn parse_terminator(line: &str, span: Option<SourceSpan>) -> Option<MirTerminato
             dst: call.dst,
             func_text: call.func_text,
             target: call.target,
+            span,
+        });
+    }
+
+    if let Some((dst, func_text)) = parse_noreturn_call_terminator(s) {
+        return Some(MirTerminator::NoReturnCall {
+            dst,
+            func_text,
             span,
         });
     }
@@ -2337,6 +2390,41 @@ fn idx(_1: Vec<u32>, _2: usize) -> u32 {
         assert_eq!(a.success, 7);
         assert_eq!(a.unwind, None);
         assert_eq!(a.msg, "a \\\"b\\\", c");
+    }
+
+    #[test]
+    fn parses_noreturn_call_terminators() {
+        // `-> unwind continue`: the `debug_assert!` failure call.
+        let mir = parse_text(ASSERT_OVERFLOW_MIR).expect("parse ok");
+        match &block(&mir.functions[0], 1).terminator {
+            MirTerminator::NoReturnCall { dst, func_text, .. } => {
+                assert_eq!(*dst, 4);
+                assert_eq!(func_text, "core::panicking::panic");
+            }
+            other => panic!("expected NoReturnCall, got {other:?}"),
+        }
+        // `-> bb<cleanup>`: `panic!("big")` in a fn holding a `String`
+        // (rustc nightly 1.101 output).
+        let t = parse_terminator(
+            "_4 = std::rt::begin_panic::<&str>(const \"big\") -> bb5;",
+            None,
+        );
+        assert!(
+            matches!(
+                &t,
+                Some(MirTerminator::NoReturnCall { dst: 4, func_text, .. })
+                    if func_text == "std::rt::begin_panic::<&str>"
+            ),
+            "got {t:?}"
+        );
+        // A returning call is still a `Call`, not a `NoReturnCall`.
+        assert!(matches!(
+            parse_terminator(
+                "_7 = Vec::<u32>::len(move _8) -> [return: bb2, unwind: bb5];",
+                None
+            ),
+            Some(MirTerminator::Call { target: 2, .. })
+        ));
     }
 
     #[test]
