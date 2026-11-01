@@ -68,7 +68,8 @@ struct CandidateSummary {
     /// True when at least one test's coverage shows the function
     /// was executed.
     invoked: bool,
-    /// Number of tests that produced a usable observation.
+    /// Number of tests that produced an observation (a condition
+    /// vector or an ambiguous record).
     observations: usize,
 }
 
@@ -850,7 +851,7 @@ fn run_test_mode_cargo(
             source_file: c.provenance.source_file.clone(),
             line: c.provenance.line,
             invoked: *reached,
-            observations: c.observations.len(),
+            observations: selector::observed_tests(c),
         })
         .collect();
     let skipped_mirs: Vec<SkippedMir> = skipped_oversize_mirs
@@ -1256,8 +1257,13 @@ fn print_runtime_report_body(
     observations: &[ConditionObservation],
     analysis: &RuntimeAnalysis,
 ) {
+    let ambiguous = observations.iter().filter(|o| o.ambiguous).count();
     println!("Tests discovered: {}", tests.len());
-    println!("Observations:     {}", observations.len());
+    println!(
+        "Observations:     {} ({} used, {ambiguous} ambiguous)",
+        observations.len(),
+        observations.len() - ambiguous,
+    );
     println!(
         "Conditions:       {}",
         if analysis.matrix.conditions.is_empty() {
@@ -1290,6 +1296,14 @@ fn print_runtime_report_body(
     if !observations.is_empty() {
         println!("Per-test observations:");
         for obs in observations {
+            let label = obs.test_name.as_deref().unwrap_or("?");
+            if obs.ambiguous {
+                println!(
+                    "  {label:30}  AMBIGUOUS  {}",
+                    format_ambiguous_counts(&analysis.matrix.conditions, obs)
+                );
+                continue;
+            }
             let mut parts: Vec<String> = analysis
                 .matrix
                 .conditions
@@ -1301,7 +1315,9 @@ fn print_runtime_report_body(
                 })
                 .collect();
             parts.push(format!("result={}", obs.result.map_or("?", bool_glyph)));
-            let label = obs.test_name.as_deref().unwrap_or("?");
+            if let Some(n) = obs.evaluations.filter(|n| *n > 1) {
+                parts.push(format!("({n} evaluations)"));
+            }
             println!("  {label:30}  {}", parts.join("  "));
         }
         println!();
@@ -1321,7 +1337,14 @@ fn print_runtime_report_body(
                     bool_glyph(pair.test_2.result),
                 );
             }
-            Some(ConditionStatus::Unexercised | ConditionStatus::Ambiguous { .. }) => {
+            Some(ConditionStatus::Ambiguous { tests }) => {
+                println!(
+                    "  ? {cond}: unknown (ambiguous) — evaluated only in tests that \
+                     evaluated the decision more than once: {}",
+                    format_ambiguous_tests(tests, observations)
+                );
+            }
+            Some(ConditionStatus::Unexercised) => {
                 let missing = analysis
                     .matrix
                     .independence_pairs
@@ -1344,8 +1367,58 @@ fn print_runtime_report_body(
     if total > 0 {
         let pct = (exercised as f64 / total as f64) * 100.0;
         println!();
-        println!("MC/DC coverage: {exercised} of {total} conditions exercised ({pct:.0}%)",);
+        if analysis.ambiguous_observations == 0 {
+            println!("MC/DC coverage: {exercised} of {total} conditions exercised ({pct:.0}%)",);
+        } else {
+            let unknown = analysis
+                .condition_status
+                .values()
+                .filter(|s| matches!(s, ConditionStatus::Ambiguous { .. }))
+                .count();
+            println!(
+                "MC/DC coverage: {exercised} of {total} conditions exercised ({pct:.0}%; \
+                 {unknown} unknown, {} ambiguous observation(s) excluded; add \
+                 single-evaluation tests or see the README section \
+                 \"Tests that evaluate a decision more than once\")",
+                analysis.ambiguous_observations
+            );
+        }
     }
+}
+
+/// `evaluated 256x: c1=224T/32F  c2=95T/129F` for an ambiguous
+/// observation, in the decision's condition order.
+fn format_ambiguous_counts(conditions: &[String], obs: &ConditionObservation) -> String {
+    let counts: Vec<String> = conditions
+        .iter()
+        .map(|c| match obs.counts.get(c) {
+            Some(n) => format!("{c}={}T/{}F", n.true_count, n.false_count),
+            None => format!("{c}=-"),
+        })
+        .collect();
+    let evals = obs
+        .evaluations
+        .map_or_else(|| "?".to_string(), |n| n.to_string());
+    format!("evaluated {evals}x: {}", counts.join("  "))
+}
+
+/// `t1 (256 evaluations), t2 (3 evaluations)` for the tests behind a
+/// [`ConditionStatus::Ambiguous`].
+fn format_ambiguous_tests(tests: &[String], observations: &[ConditionObservation]) -> String {
+    tests
+        .iter()
+        .map(|t| {
+            let evals = observations
+                .iter()
+                .find(|o| o.ambiguous && o.test_name.as_deref() == Some(t.as_str()))
+                .and_then(|o| o.evaluations);
+            match evals {
+                Some(n) => format!("{t} ({n} evaluations)"),
+                None => t.clone(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn print_truth_table_header(conditions: &[String]) {
@@ -1473,8 +1546,11 @@ fn bool_glyph(v: bool) -> &'static str {
 /// `<testsuite>` per analysis context (typically one per
 /// invocation today), one `<testcase>` per recovered condition.
 /// Exercised conditions pass (empty body); unexercised conditions
-/// emit a `<failure>` with the required independence-pair inputs
-/// in the message.
+/// emit a `<failure type="UnexercisedCondition">` with the required
+/// independence-pair inputs in the message; conditions whose only
+/// evidence is ambiguous emit a `<failure type="AmbiguousCondition">`
+/// naming the multi-evaluation tests (not demonstrated, so not a
+/// pass).
 ///
 /// The format is the de-facto JUnit XML that Jenkins, GitLab CI,
 /// GitHub Actions, Bazel/Buck2, and the other CIs the automotive
@@ -1485,9 +1561,9 @@ fn print_runtime_junit(source: &str, analysis: &RuntimeAnalysis) {
     let failures = conditions
         .iter()
         .filter(|c| {
-            matches!(
+            !matches!(
                 analysis.condition_status.get(c.as_str()),
-                Some(ConditionStatus::Unexercised | ConditionStatus::Ambiguous { .. }) | None
+                Some(ConditionStatus::Exercised(_))
             )
         })
         .count();
@@ -1504,7 +1580,21 @@ fn print_runtime_junit(source: &str, analysis: &RuntimeAnalysis) {
             Some(ConditionStatus::Exercised(_)) => {
                 println!(r#"    <testcase name="{case_name}" classname="floyd.mcdc"/>"#);
             }
-            Some(ConditionStatus::Unexercised | ConditionStatus::Ambiguous { .. }) | None => {
+            Some(ConditionStatus::Ambiguous { tests }) => {
+                let message = format!(
+                    "unknown (ambiguous): evaluated only in tests that evaluated the \
+                     decision more than once ({}); aggregate counters cannot attribute \
+                     a condition vector to them. Add single-evaluation tests.",
+                    tests.join(", ")
+                );
+                println!(r#"    <testcase name="{case_name}" classname="floyd.mcdc">"#);
+                println!(
+                    r#"      <failure message="{}" type="AmbiguousCondition"/>"#,
+                    xml_escape(&message)
+                );
+                println!(r#"    </testcase>"#);
+            }
+            Some(ConditionStatus::Unexercised) | None => {
                 let required = analysis
                     .matrix
                     .independence_pairs
@@ -1602,6 +1692,74 @@ mod tests {
         assert_eq!(v["candidates"][0]["function_name"], "crate::g");
         assert_eq!(v["candidates"][0]["invoked"], false);
         assert_eq!(v["skipped_oversize_mirs"][0]["bytes"], 1);
+    }
+
+    #[test]
+    fn json_observations_carry_ambiguity_evaluations_and_raw_counts() {
+        use floyd::BranchCounts;
+        let mut vector = ConditionObservation::vector(
+            Some("detects_unprintable".to_string()),
+            [("byte >= 32".to_string(), false)].into_iter().collect(),
+            false,
+        );
+        vector.evaluations = Some(1);
+        let ambiguous = ConditionObservation::ambiguous(
+            Some("symbol_matches_char_for_all_valid_symbols".to_string()),
+            256,
+            [
+                (
+                    "byte >= 32".to_string(),
+                    BranchCounts {
+                        true_count: 224,
+                        false_count: 32,
+                    },
+                ),
+                (
+                    "byte <= 126".to_string(),
+                    BranchCounts {
+                        true_count: 95,
+                        false_count: 129,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let observations = [vector, ambiguous];
+        let report = SingleRuntimeReport {
+            source: "lib.rs".to_string(),
+            verdict: RuntimeVerdict::Analysed,
+            tests_discovered: &[],
+            observations: &observations,
+            analysis: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        let o = &v["observations"];
+        assert_eq!(o[0]["ambiguous"], false);
+        assert_eq!(o[0]["evaluations"], 1);
+        assert_eq!(o[0]["result"], false);
+        assert!(o[0].get("counts").is_none());
+        assert_eq!(o[1]["ambiguous"], true);
+        assert_eq!(o[1]["evaluations"], 256);
+        assert!(o[1]["result"].is_null());
+        assert_eq!(o[1]["counts"]["byte >= 32"]["true_count"], 224);
+        assert_eq!(o[1]["counts"]["byte >= 32"]["false_count"], 32);
+        assert_eq!(o[1]["counts"]["byte <= 126"]["true_count"], 95);
+        assert_eq!(o[1]["counts"]["byte <= 126"]["false_count"], 129);
+
+        let conditions = ["byte <= 126".to_string(), "byte >= 32".to_string()];
+        assert_eq!(
+            format_ambiguous_counts(&conditions, &observations[1]),
+            "evaluated 256x: byte <= 126=95T/129F  byte >= 32=224T/32F"
+        );
+        assert_eq!(
+            format_ambiguous_tests(
+                &["symbol_matches_char_for_all_valid_symbols".to_string()],
+                &observations
+            ),
+            "symbol_matches_char_for_all_valid_symbols (256 evaluations)"
+        );
     }
 
     #[test]
