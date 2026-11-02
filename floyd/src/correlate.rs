@@ -1584,6 +1584,16 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -
             .find(|f| f.name.contains("east_opt"))
             .expect("function in fixture");
         assert_eq!(decision::decompose_function(f), None);
+        // It is the `// MIR FOR CTFE` body, so it is declined as a
+        // candidate before decomposition; the two runtime bodies
+        // before it are not tagged.
+        assert!(f.is_ctfe);
+        assert_eq!(
+            decision::try_decompose_candidate(f),
+            Err(decision::DeclineReason::CtfeBody)
+        );
+        let tagged: Vec<bool> = mir.functions.iter().map(|f| f.is_ctfe).collect();
+        assert_eq!(tagged, [false, false, true]);
     }
 
     #[test]

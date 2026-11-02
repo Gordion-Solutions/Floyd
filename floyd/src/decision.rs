@@ -40,7 +40,7 @@ use crate::Mir;
 /// Why the decomposer declined a function that has a `switchInt`.
 ///
 /// Serialised in snake case (`unsupported_shape`, `non_bool_leaf`,
-/// `no_conditions`)
+/// `no_conditions`, `ctfe_body`)
 /// as the `reason` of each `out_of_scope` entry in
 /// `cargo floyd test --format=json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -60,6 +60,11 @@ pub enum DeclineReason {
     /// tree comes from a body whose entry block reaches a constant
     /// without branching, not from a Boolean decision.
     NoConditions,
+    /// The body is the `// MIR FOR CTFE` rendering of a `const fn`
+    /// ([`MirFunction::is_ctfe`]). It is not decomposed: it never
+    /// runs at runtime, and the function's runtime body, parsed
+    /// separately under the same name, is the candidate.
+    CtfeBody,
 }
 
 thread_local! {
@@ -275,10 +280,14 @@ pub fn try_decompose_from_block(f: &MirFunction, block_id: BlockId) -> Result<No
     })
 }
 
-/// Decompose `f` as an MC/DC candidate: [`try_decompose_function`],
-/// then decline a tree that tests no condition
-/// ([`DeclineReason::NoConditions`]).
+/// Decompose `f` as an MC/DC candidate: decline a CTFE body
+/// ([`DeclineReason::CtfeBody`]) without decomposing it, otherwise
+/// [`try_decompose_function`], then decline a tree that tests no
+/// condition ([`DeclineReason::NoConditions`]).
 pub fn try_decompose_candidate(f: &MirFunction) -> Result<Node, DeclineReason> {
+    if f.is_ctfe {
+        return Err(DeclineReason::CtfeBody);
+    }
     let node = try_decompose_function(f)?;
     if crate::masking::collect_conditions(&node).is_empty() {
         return Err(DeclineReason::NoConditions);
@@ -4958,5 +4967,760 @@ fn f(_1: bool) -> bool {
         // A tree with a condition is still a candidate.
         let mir = crate::mir::parse_text(ARM_LOCAL_FLOWS_TO_RETURN_MIR).expect("MIR parses");
         assert!(try_decompose_candidate(&mir.functions[0]).is_ok());
+    }
+
+    /// rust-url `idna/src/uts46.rs`, `cargo floyd test` MIR
+    /// (comment-only lines other than the CTFE marker stripped):
+    /// the runtime body and the `// MIR FOR CTFE` body of
+    ///
+    /// ```text
+    /// pub const fn new(deny_glyphless: bool, deny_list: &str) -> Self {
+    ///     let mut bits = UPPER_CASE_MASK;
+    ///     if deny_glyphless {
+    ///         bits |= GLYPHLESS_MASK;
+    ///     }
+    ///     .. // a loop of assert!s over deny_list
+    /// }
+    /// ```
+    ///
+    /// The CTFE body keeps `_5 = copy _1; switchInt(move _5)` in bb0.
+    const ASCII_DENY_LIST_NEW_MIR: &str = r#"
+fn uts46::<impl at idna/src/uts46.rs:276:1: 276:19>::new(_1: bool, _2: &str) -> uts46::AsciiDenyList {
+    debug deny_glyphless => _1;          // in scope 0 at idna/src/uts46.rs:294:22: 294:36
+    debug deny_list => _2;               // in scope 0 at idna/src/uts46.rs:294:44: 294:53
+    let mut _0: uts46::AsciiDenyList;    // return place in scope 0 at idna/src/uts46.rs:294:64: 294:68
+    let mut _3: u128;                    // in scope 0 at idna/src/uts46.rs:295:13: 295:21
+    let mut _6: bool;                    // in scope 0 at idna/src/uts46.rs:301:15: 301:30
+    let mut _7: usize;                   // in scope 0 at idna/src/uts46.rs:301:15: 301:16
+    let mut _8: usize;                   // in scope 0 at idna/src/uts46.rs:301:19: 301:30
+    let _10: usize;                      // in scope 0 at idna/src/uts46.rs:302:27: 302:28
+    let mut _11: usize;                  // in scope 0 at idna/src/uts46.rs:302:21: 302:29
+    let mut _12: bool;                   // in scope 0 at idna/src/uts46.rs:302:21: 302:29
+    let mut _13: bool;                   // in scope 0 at idna/src/uts46.rs:303:21: 303:29
+    let mut _14: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _15: bool;                   // in scope 0 at idna/src/uts46.rs:305:21: 305:30
+    let mut _16: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _17: bool;                   // in scope 0 at idna/src/uts46.rs:306:21: 306:30
+    let mut _18: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _19: bool;                   // in scope 0 at idna/src/uts46.rs:308:19: 308:30
+    let mut _20: bool;                   // in scope 0 at idna/src/uts46.rs:308:34: 308:45
+    let mut _21: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _22: bool;                   // in scope 0 at idna/src/uts46.rs:312:19: 312:30
+    let mut _23: bool;                   // in scope 0 at idna/src/uts46.rs:312:34: 312:45
+    let mut _24: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _25: bool;                   // in scope 0 at idna/src/uts46.rs:316:19: 316:30
+    let mut _26: bool;                   // in scope 0 at idna/src/uts46.rs:316:34: 316:45
+    let mut _27: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _28: u128;                   // in scope 0 at idna/src/uts46.rs:319:21: 319:31
+    let mut _29: bool;                   // in scope 0 at idna/src/uts46.rs:319:21: 319:31
+    let mut _30: (usize, bool);          // in scope 0 at idna/src/uts46.rs:320:13: 320:19
+    let mut _31: u128;                   // in scope 0 at idna/src/uts46.rs:322:16: 322:20
+    scope 1 {
+        debug bits => _3;                // in scope 1 at idna/src/uts46.rs:295:13: 295:21
+        let mut _4: usize;               // in scope 1 at idna/src/uts46.rs:299:13: 299:18
+        scope 2 {
+            debug i => _4;               // in scope 2 at idna/src/uts46.rs:299:13: 299:18
+            let _5: &[u8];               // in scope 2 at idna/src/uts46.rs:300:13: 300:18
+            scope 3 {
+                debug bytes => _5;       // in scope 3 at idna/src/uts46.rs:300:13: 300:18
+                let _9: u8;              // in scope 3 at idna/src/uts46.rs:302:17: 302:18
+                scope 4 {
+                    debug b => _9;       // in scope 4 at idna/src/uts46.rs:302:17: 302:18
+                }
+            }
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => idna/src/uts46.rs:296:12: 296:26 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => idna/src/uts46.rs:301:15: 301:30 (#0)
+    coverage branch { true: BlockMarkerId(4), false: BlockMarkerId(5) } => idna/src/uts46.rs:303:13: 303:64 (#44)
+    coverage branch { true: BlockMarkerId(6), false: BlockMarkerId(7) } => idna/src/uts46.rs:305:13: 305:76 (#48)
+    coverage branch { true: BlockMarkerId(8), false: BlockMarkerId(9) } => idna/src/uts46.rs:306:13: 306:79 (#52)
+    coverage branch { true: BlockMarkerId(10), false: BlockMarkerId(11) } => idna/src/uts46.rs:308:19: 308:30 (#0)
+    coverage branch { true: BlockMarkerId(12), false: BlockMarkerId(13) } => idna/src/uts46.rs:308:34: 308:45 (#0)
+    coverage branch { true: BlockMarkerId(14), false: BlockMarkerId(15) } => idna/src/uts46.rs:312:19: 312:30 (#0)
+    coverage branch { true: BlockMarkerId(16), false: BlockMarkerId(17) } => idna/src/uts46.rs:312:34: 312:45 (#0)
+    coverage branch { true: BlockMarkerId(18), false: BlockMarkerId(19) } => idna/src/uts46.rs:316:19: 316:30 (#0)
+    coverage branch { true: BlockMarkerId(20), false: BlockMarkerId(21) } => idna/src/uts46.rs:316:34: 316:45 (#0)
+
+    coverage Code { bcb: bcb0 } => idna/src/uts46.rs:294:5: 294:68 (#0);
+    coverage Code { bcb: bcb0 } => idna/src/uts46.rs:295:24: 295:39 (#0);
+    coverage Code { bcb: bcb0 } => idna/src/uts46.rs:296:12: 296:26 (#0);
+    coverage Code { bcb: bcb1 } => idna/src/uts46.rs:297:13: 297:35 (#0);
+    coverage Code { bcb: bcb27 } => idna/src/uts46.rs:298:9: 298:10 (#0);
+    coverage Code { bcb: bcb2 } => idna/src/uts46.rs:299:21: 299:22 (#0);
+    coverage Code { bcb: bcb2 } => idna/src/uts46.rs:300:21: 300:41 (#0);
+    coverage Code { bcb: bcb3 } => idna/src/uts46.rs:301:15: 301:30 (#0);
+    coverage Code { bcb: bcb4 } => idna/src/uts46.rs:302:21: 302:29 (#0);
+    coverage Code { bcb: bcb4 } => idna/src/uts46.rs:303:13: 303:20 (#0);
+    coverage Code { bcb: bcb4 } => idna/src/uts46.rs:303:21: 303:29 (#0);
+    coverage Code { bcb: bcb5 } => idna/src/uts46.rs:305:13: 305:20 (#0);
+    coverage Code { bcb: bcb5 } => idna/src/uts46.rs:305:21: 305:30 (#0);
+    coverage Code { bcb: bcb6 } => idna/src/uts46.rs:306:13: 306:20 (#0);
+    coverage Code { bcb: bcb6 } => idna/src/uts46.rs:306:21: 306:30 (#0);
+    coverage Code { bcb: bcb7 } => idna/src/uts46.rs:307:13: 307:20 (#0);
+    coverage Code { bcb: bcb7 } => idna/src/uts46.rs:308:19: 308:30 (#0);
+    coverage Code { bcb: bcb8 } => idna/src/uts46.rs:308:34: 308:45 (#0);
+    coverage Code { bcb: bcb11 } => idna/src/uts46.rs:311:13: 311:20 (#0);
+    coverage Code { bcb: bcb11 } => idna/src/uts46.rs:312:19: 312:30 (#0);
+    coverage Code { bcb: bcb12 } => idna/src/uts46.rs:312:34: 312:45 (#0);
+    coverage Code { bcb: bcb15 } => idna/src/uts46.rs:315:13: 315:20 (#0);
+    coverage Code { bcb: bcb15 } => idna/src/uts46.rs:316:19: 316:30 (#0);
+    coverage Code { bcb: bcb16 } => idna/src/uts46.rs:316:34: 316:45 (#0);
+    coverage Code { bcb: bcb19 } => idna/src/uts46.rs:319:13: 319:17 (#0);
+    coverage Code { bcb: bcb19 } => idna/src/uts46.rs:319:13: 319:31 (#0);
+    coverage Code { bcb: bcb19 } => idna/src/uts46.rs:320:13: 320:19 (#0);
+    coverage Code { bcb: bcb26 } => idna/src/uts46.rs:322:9: 322:22 (#0);
+    coverage Code { bcb: bcb26 } => idna/src/uts46.rs:323:5: 323:6 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb27 } => idna/src/uts46.rs:296:12: 296:26 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb26 } => idna/src/uts46.rs:301:15: 301:30 (#0);
+    coverage Branch { true_bcb: bcb8, false_bcb: bcb22 } => idna/src/uts46.rs:308:19: 308:30 (#0);
+    coverage Branch { true_bcb: bcb9, false_bcb: bcb10 } => idna/src/uts46.rs:308:34: 308:45 (#0);
+    coverage Branch { true_bcb: bcb12, false_bcb: bcb21 } => idna/src/uts46.rs:312:19: 312:30 (#0);
+    coverage Branch { true_bcb: bcb13, false_bcb: bcb14 } => idna/src/uts46.rs:312:34: 312:45 (#0);
+    coverage Branch { true_bcb: bcb16, false_bcb: bcb20 } => idna/src/uts46.rs:316:19: 316:30 (#0);
+    coverage Branch { true_bcb: bcb17, false_bcb: bcb18 } => idna/src/uts46.rs:316:34: 316:45 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 1 at idna/src/uts46.rs:296:12: 296:26
+        _3 = const uts46::UPPER_CASE_MASK; // scope 0 at idna/src/uts46.rs:295:24: 295:39
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 1 at idna/src/uts46.rs:296:12: 296:26
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 1 at idna/src/uts46.rs:296:9: 298:10
+        _3 = BitOr(copy _3, const uts46::GLYPHLESS_MASK); // scope 1 at idna/src/uts46.rs:297:13: 297:35
+        goto -> bb3;                     // scope 1 at idna/src/uts46.rs:296:9: 298:10
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb27); // scope 1 at idna/src/uts46.rs:296:9: 298:10
+        goto -> bb3;                     // scope 1 at idna/src/uts46.rs:296:9: 298:10
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 2 at idna/src/uts46.rs:300:21: 300:41
+        _4 = const 0_usize;              // scope 1 at idna/src/uts46.rs:299:21: 299:22
+        _5 = core::str::<impl str>::as_bytes(copy _2) -> [return: bb4, unwind continue]; // scope 2 at idna/src/uts46.rs:300:21: 300:41
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb3);  // scope 3 at idna/src/uts46.rs:301:9: 321:10
+        _7 = copy _4;                    // scope 3 at idna/src/uts46.rs:301:15: 301:16
+        _8 = PtrMetadata(copy _5);       // scope 3 at idna/src/uts46.rs:301:19: 301:30
+        _6 = Lt(move _7, move _8);       // scope 3 at idna/src/uts46.rs:301:15: 301:30
+        switchInt(move _6) -> [0: bb6, otherwise: bb5]; // scope 3 at idna/src/uts46.rs:301:15: 301:30
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb4);  // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        _10 = copy _4;                   // scope 3 at idna/src/uts46.rs:302:27: 302:28
+        _11 = PtrMetadata(copy _5);      // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        _12 = Lt(copy _10, copy _11);    // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        assert(move _12, "index out of bounds: the length is {} but the index is {}", move _11, copy _10) -> [success: bb7, unwind continue]; // scope 3 at idna/src/uts46.rs:302:21: 302:29
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb26); // scope 0 at idna/src/uts46.rs:323:6: 323:6
+        _31 = copy _3;                   // scope 3 at idna/src/uts46.rs:322:16: 322:20
+        _0 = uts46::AsciiDenyList { bits: move _31 }; // scope 3 at idna/src/uts46.rs:322:9: 322:22
+        return;                          // scope 0 at idna/src/uts46.rs:323:6: 323:6
+    }
+
+    bb7: {
+        _9 = copy (*_5)[_10];            // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        _13 = Lt(copy _9, const 128_u8); // scope 4 at idna/src/uts46.rs:303:21: 303:29
+        switchInt(move _13) -> [0: bb9, otherwise: bb8]; // scope 4 at idna/src/uts46.rs:303:21: 303:29
+    }
+
+    bb8: {
+        Coverage::VirtualCounter(bcb5);  // scope 4 at idna/src/uts46.rs:305:21: 305:30
+        _15 = Ne(copy _9, const 46_u8);  // scope 4 at idna/src/uts46.rs:305:21: 305:30
+        switchInt(move _15) -> [0: bb11, otherwise: bb10]; // scope 4 at idna/src/uts46.rs:305:21: 305:30
+    }
+
+    bb9: {
+        Coverage::VirtualCounter(bcb25); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _14 = panic(const "ASCII deny list must be ASCII.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb10: {
+        Coverage::VirtualCounter(bcb6);  // scope 4 at idna/src/uts46.rs:306:21: 306:30
+        _17 = Ne(copy _9, const 45_u8);  // scope 4 at idna/src/uts46.rs:306:21: 306:30
+        switchInt(move _17) -> [0: bb13, otherwise: bb12]; // scope 4 at idna/src/uts46.rs:306:21: 306:30
+    }
+
+    bb11: {
+        Coverage::VirtualCounter(bcb24); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _16 = panic(const "ASCII deny list must not contain the dot.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb12: {
+        Coverage::VirtualCounter(bcb7);  // scope 4 at idna/src/uts46.rs:308:19: 308:30
+        _19 = Ge(copy _9, const 48_u8);  // scope 4 at idna/src/uts46.rs:308:19: 308:30
+        switchInt(move _19) -> [0: bb15, otherwise: bb14]; // scope 4 at idna/src/uts46.rs:308:19: 308:30
+    }
+
+    bb13: {
+        Coverage::VirtualCounter(bcb23); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _18 = panic(const "ASCII deny list must not contain the hyphen.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb14: {
+        Coverage::VirtualCounter(bcb8);  // scope 4 at idna/src/uts46.rs:308:34: 308:45
+        _20 = Le(copy _9, const 57_u8);  // scope 4 at idna/src/uts46.rs:308:34: 308:45
+        switchInt(move _20) -> [0: bb17, otherwise: bb16]; // scope 4 at idna/src/uts46.rs:308:34: 308:45
+    }
+
+    bb15: {
+        Coverage::VirtualCounter(bcb22); // scope 4 at no-location
+        goto -> bb18;                    // scope 4 at no-location
+    }
+
+    bb16: {
+        Coverage::VirtualCounter(bcb9);  // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _21 = panic(const "ASCII deny list must not contain digits.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb17: {
+        Coverage::VirtualCounter(bcb10); // scope 4 at no-location
+        goto -> bb18;                    // scope 4 at no-location
+    }
+
+    bb18: {
+        Coverage::VirtualCounter(bcb11); // scope 4 at idna/src/uts46.rs:312:19: 312:30
+        _22 = Ge(copy _9, const 97_u8);  // scope 4 at idna/src/uts46.rs:312:19: 312:30
+        switchInt(move _22) -> [0: bb20, otherwise: bb19]; // scope 4 at idna/src/uts46.rs:312:19: 312:30
+    }
+
+    bb19: {
+        Coverage::VirtualCounter(bcb12); // scope 4 at idna/src/uts46.rs:312:34: 312:45
+        _23 = Le(copy _9, const 122_u8); // scope 4 at idna/src/uts46.rs:312:34: 312:45
+        switchInt(move _23) -> [0: bb22, otherwise: bb21]; // scope 4 at idna/src/uts46.rs:312:34: 312:45
+    }
+
+    bb20: {
+        Coverage::VirtualCounter(bcb21); // scope 4 at no-location
+        goto -> bb23;                    // scope 4 at no-location
+    }
+
+    bb21: {
+        Coverage::VirtualCounter(bcb13); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _24 = panic(const "ASCII deny list must not contain letters.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb22: {
+        Coverage::VirtualCounter(bcb14); // scope 4 at no-location
+        goto -> bb23;                    // scope 4 at no-location
+    }
+
+    bb23: {
+        Coverage::VirtualCounter(bcb15); // scope 4 at idna/src/uts46.rs:316:19: 316:30
+        _25 = Ge(copy _9, const 65_u8);  // scope 4 at idna/src/uts46.rs:316:19: 316:30
+        switchInt(move _25) -> [0: bb25, otherwise: bb24]; // scope 4 at idna/src/uts46.rs:316:19: 316:30
+    }
+
+    bb24: {
+        Coverage::VirtualCounter(bcb16); // scope 4 at idna/src/uts46.rs:316:34: 316:45
+        _26 = Le(copy _9, const 90_u8);  // scope 4 at idna/src/uts46.rs:316:34: 316:45
+        switchInt(move _26) -> [0: bb27, otherwise: bb26]; // scope 4 at idna/src/uts46.rs:316:34: 316:45
+    }
+
+    bb25: {
+        Coverage::VirtualCounter(bcb20); // scope 4 at no-location
+        goto -> bb28;                    // scope 4 at no-location
+    }
+
+    bb26: {
+        Coverage::VirtualCounter(bcb17); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _27 = panic(const "ASCII deny list must not contain letters.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb27: {
+        Coverage::VirtualCounter(bcb18); // scope 4 at no-location
+        goto -> bb28;                    // scope 4 at no-location
+    }
+
+    bb28: {
+        Coverage::VirtualCounter(bcb19); // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        _29 = Lt(copy _9, const 128_u8); // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        assert(move _29, "attempt to shift left by `{}`, which would overflow", copy _9) -> [success: bb29, unwind continue]; // scope 4 at idna/src/uts46.rs:319:21: 319:31
+    }
+
+    bb29: {
+        _28 = Shl(const 1_u128, copy _9); // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        _3 = BitOr(copy _3, move _28);   // scope 4 at idna/src/uts46.rs:319:13: 319:31
+        _30 = AddWithOverflow(copy _4, const 1_usize); // scope 4 at idna/src/uts46.rs:320:13: 320:19
+        assert(!move (_30.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _4, const 1_usize) -> [success: bb30, unwind continue]; // scope 4 at idna/src/uts46.rs:320:13: 320:19
+    }
+
+    bb30: {
+        _4 = move (_30.0: usize);        // scope 4 at idna/src/uts46.rs:320:13: 320:19
+        goto -> bb4;                     // scope 3 at idna/src/uts46.rs:301:9: 321:10
+    }
+}
+
+// MIR FOR CTFE
+fn uts46::<impl at idna/src/uts46.rs:276:1: 276:19>::new(_1: bool, _2: &str) -> uts46::AsciiDenyList {
+    debug deny_glyphless => _1;          // in scope 0 at idna/src/uts46.rs:294:22: 294:36
+    debug deny_list => _2;               // in scope 0 at idna/src/uts46.rs:294:44: 294:53
+    let mut _0: uts46::AsciiDenyList;    // return place in scope 0 at idna/src/uts46.rs:294:64: 294:68
+    let mut _3: u128;                    // in scope 0 at idna/src/uts46.rs:295:13: 295:21
+    let _4: ();                          // in scope 0 at idna/src/uts46.rs:296:9: 298:10
+    let mut _5: bool;                    // in scope 0 at idna/src/uts46.rs:296:12: 296:26
+    let mut _8: &str;                    // in scope 0 at idna/src/uts46.rs:300:21: 300:30
+    let _9: ();                          // in scope 0 at idna/src/uts46.rs:301:9: 321:10
+    let mut _10: ();                     // in scope 0 at idna/src/uts46.rs:294:5: 323:6
+    let mut _11: bool;                   // in scope 0 at idna/src/uts46.rs:301:15: 301:30
+    let mut _12: usize;                  // in scope 0 at idna/src/uts46.rs:301:15: 301:16
+    let mut _13: usize;                  // in scope 0 at idna/src/uts46.rs:301:19: 301:30
+    let mut _14: &[u8];                  // in scope 0 at idna/src/uts46.rs:301:19: 301:24
+    let _16: usize;                      // in scope 0 at idna/src/uts46.rs:302:27: 302:28
+    let mut _17: usize;                  // in scope 0 at idna/src/uts46.rs:302:21: 302:29
+    let mut _18: bool;                   // in scope 0 at idna/src/uts46.rs:302:21: 302:29
+    let _19: ();                         // in scope 0 at idna/src/uts46.rs:303:13: 303:64
+    let mut _20: bool;                   // in scope 0 at idna/src/uts46.rs:303:21: 303:29
+    let mut _21: u8;                     // in scope 0 at idna/src/uts46.rs:303:21: 303:22
+    let mut _22: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let _23: ();                         // in scope 0 at idna/src/uts46.rs:305:13: 305:76
+    let mut _24: bool;                   // in scope 0 at idna/src/uts46.rs:305:21: 305:30
+    let mut _25: u8;                     // in scope 0 at idna/src/uts46.rs:305:21: 305:22
+    let mut _26: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let _27: ();                         // in scope 0 at idna/src/uts46.rs:306:13: 306:79
+    let mut _28: bool;                   // in scope 0 at idna/src/uts46.rs:306:21: 306:30
+    let mut _29: u8;                     // in scope 0 at idna/src/uts46.rs:306:21: 306:22
+    let mut _30: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let _31: ();                         // in scope 0 at idna/src/uts46.rs:307:13: 310:14
+    let mut _32: bool;                   // in scope 0 at idna/src/uts46.rs:308:19: 308:30
+    let mut _33: u8;                     // in scope 0 at idna/src/uts46.rs:308:20: 308:21
+    let mut _34: bool;                   // in scope 0 at idna/src/uts46.rs:308:34: 308:45
+    let mut _35: u8;                     // in scope 0 at idna/src/uts46.rs:308:35: 308:36
+    let mut _36: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let _37: ();                         // in scope 0 at idna/src/uts46.rs:311:13: 314:14
+    let mut _38: bool;                   // in scope 0 at idna/src/uts46.rs:312:19: 312:30
+    let mut _39: u8;                     // in scope 0 at idna/src/uts46.rs:312:20: 312:21
+    let mut _40: bool;                   // in scope 0 at idna/src/uts46.rs:312:34: 312:45
+    let mut _41: u8;                     // in scope 0 at idna/src/uts46.rs:312:35: 312:36
+    let mut _42: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let _43: ();                         // in scope 0 at idna/src/uts46.rs:315:13: 318:14
+    let mut _44: bool;                   // in scope 0 at idna/src/uts46.rs:316:19: 316:30
+    let mut _45: u8;                     // in scope 0 at idna/src/uts46.rs:316:20: 316:21
+    let mut _46: bool;                   // in scope 0 at idna/src/uts46.rs:316:34: 316:45
+    let mut _47: u8;                     // in scope 0 at idna/src/uts46.rs:316:35: 316:36
+    let mut _48: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _49: u128;                   // in scope 0 at idna/src/uts46.rs:319:21: 319:31
+    let mut _50: u8;                     // in scope 0 at idna/src/uts46.rs:319:30: 319:31
+    let mut _51: bool;                   // in scope 0 at idna/src/uts46.rs:319:21: 319:31
+    let mut _52: (usize, bool);          // in scope 0 at idna/src/uts46.rs:320:13: 320:19
+    let mut _53: !;                      // in scope 0 at idna/src/uts46.rs:301:9: 321:10
+    let _54: ();                         // in scope 0 at idna/src/uts46.rs:301:9: 321:10
+    let mut _55: !;                      // in scope 0 at idna/src/uts46.rs:301:9: 321:10
+    let mut _56: u128;                   // in scope 0 at idna/src/uts46.rs:322:16: 322:20
+    scope 1 {
+        debug bits => _3;                // in scope 1 at idna/src/uts46.rs:295:13: 295:21
+        let mut _6: usize;               // in scope 1 at idna/src/uts46.rs:299:13: 299:18
+        scope 2 {
+            debug i => _6;               // in scope 2 at idna/src/uts46.rs:299:13: 299:18
+            let _7: &[u8];               // in scope 2 at idna/src/uts46.rs:300:13: 300:18
+            scope 3 {
+                debug bytes => _7;       // in scope 3 at idna/src/uts46.rs:300:13: 300:18
+                let _15: u8;             // in scope 3 at idna/src/uts46.rs:302:17: 302:18
+                scope 4 {
+                    debug b => _15;      // in scope 4 at idna/src/uts46.rs:302:17: 302:18
+                }
+            }
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => idna/src/uts46.rs:296:12: 296:26 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => idna/src/uts46.rs:301:15: 301:30 (#0)
+    coverage branch { true: BlockMarkerId(4), false: BlockMarkerId(5) } => idna/src/uts46.rs:303:13: 303:64 (#44)
+    coverage branch { true: BlockMarkerId(6), false: BlockMarkerId(7) } => idna/src/uts46.rs:305:13: 305:76 (#48)
+    coverage branch { true: BlockMarkerId(8), false: BlockMarkerId(9) } => idna/src/uts46.rs:306:13: 306:79 (#52)
+    coverage branch { true: BlockMarkerId(10), false: BlockMarkerId(11) } => idna/src/uts46.rs:308:19: 308:30 (#0)
+    coverage branch { true: BlockMarkerId(12), false: BlockMarkerId(13) } => idna/src/uts46.rs:308:34: 308:45 (#0)
+    coverage branch { true: BlockMarkerId(14), false: BlockMarkerId(15) } => idna/src/uts46.rs:312:19: 312:30 (#0)
+    coverage branch { true: BlockMarkerId(16), false: BlockMarkerId(17) } => idna/src/uts46.rs:312:34: 312:45 (#0)
+    coverage branch { true: BlockMarkerId(18), false: BlockMarkerId(19) } => idna/src/uts46.rs:316:19: 316:30 (#0)
+    coverage branch { true: BlockMarkerId(20), false: BlockMarkerId(21) } => idna/src/uts46.rs:316:34: 316:45 (#0)
+
+    coverage Code { bcb: bcb0 } => idna/src/uts46.rs:294:5: 294:68 (#0);
+    coverage Code { bcb: bcb0 } => idna/src/uts46.rs:295:24: 295:39 (#0);
+    coverage Code { bcb: bcb0 } => idna/src/uts46.rs:296:12: 296:26 (#0);
+    coverage Code { bcb: bcb1 } => idna/src/uts46.rs:297:13: 297:35 (#0);
+    coverage Code { bcb: bcb27 } => idna/src/uts46.rs:298:9: 298:10 (#0);
+    coverage Code { bcb: bcb2 } => idna/src/uts46.rs:299:21: 299:22 (#0);
+    coverage Code { bcb: bcb2 } => idna/src/uts46.rs:300:21: 300:41 (#0);
+    coverage Code { bcb: bcb3 } => idna/src/uts46.rs:301:15: 301:30 (#0);
+    coverage Code { bcb: bcb4 } => idna/src/uts46.rs:302:21: 302:29 (#0);
+    coverage Code { bcb: bcb4 } => idna/src/uts46.rs:303:13: 303:20 (#0);
+    coverage Code { bcb: bcb4 } => idna/src/uts46.rs:303:21: 303:29 (#0);
+    coverage Code { bcb: bcb5 } => idna/src/uts46.rs:305:13: 305:20 (#0);
+    coverage Code { bcb: bcb5 } => idna/src/uts46.rs:305:21: 305:30 (#0);
+    coverage Code { bcb: bcb6 } => idna/src/uts46.rs:306:13: 306:20 (#0);
+    coverage Code { bcb: bcb6 } => idna/src/uts46.rs:306:21: 306:30 (#0);
+    coverage Code { bcb: bcb7 } => idna/src/uts46.rs:307:13: 307:20 (#0);
+    coverage Code { bcb: bcb7 } => idna/src/uts46.rs:308:19: 308:30 (#0);
+    coverage Code { bcb: bcb8 } => idna/src/uts46.rs:308:34: 308:45 (#0);
+    coverage Code { bcb: bcb11 } => idna/src/uts46.rs:311:13: 311:20 (#0);
+    coverage Code { bcb: bcb11 } => idna/src/uts46.rs:312:19: 312:30 (#0);
+    coverage Code { bcb: bcb12 } => idna/src/uts46.rs:312:34: 312:45 (#0);
+    coverage Code { bcb: bcb15 } => idna/src/uts46.rs:315:13: 315:20 (#0);
+    coverage Code { bcb: bcb15 } => idna/src/uts46.rs:316:19: 316:30 (#0);
+    coverage Code { bcb: bcb16 } => idna/src/uts46.rs:316:34: 316:45 (#0);
+    coverage Code { bcb: bcb19 } => idna/src/uts46.rs:319:13: 319:17 (#0);
+    coverage Code { bcb: bcb19 } => idna/src/uts46.rs:319:13: 319:31 (#0);
+    coverage Code { bcb: bcb19 } => idna/src/uts46.rs:320:13: 320:19 (#0);
+    coverage Code { bcb: bcb26 } => idna/src/uts46.rs:322:9: 322:22 (#0);
+    coverage Code { bcb: bcb26 } => idna/src/uts46.rs:323:5: 323:6 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb27 } => idna/src/uts46.rs:296:12: 296:26 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb26 } => idna/src/uts46.rs:301:15: 301:30 (#0);
+    coverage Branch { true_bcb: bcb8, false_bcb: bcb22 } => idna/src/uts46.rs:308:19: 308:30 (#0);
+    coverage Branch { true_bcb: bcb9, false_bcb: bcb10 } => idna/src/uts46.rs:308:34: 308:45 (#0);
+    coverage Branch { true_bcb: bcb12, false_bcb: bcb21 } => idna/src/uts46.rs:312:19: 312:30 (#0);
+    coverage Branch { true_bcb: bcb13, false_bcb: bcb14 } => idna/src/uts46.rs:312:34: 312:45 (#0);
+    coverage Branch { true_bcb: bcb16, false_bcb: bcb20 } => idna/src/uts46.rs:316:19: 316:30 (#0);
+    coverage Branch { true_bcb: bcb17, false_bcb: bcb18 } => idna/src/uts46.rs:316:34: 316:45 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 1 at idna/src/uts46.rs:296:12: 296:26
+        StorageLive(_3);                 // scope 0 at idna/src/uts46.rs:295:13: 295:21
+        _3 = const uts46::UPPER_CASE_MASK; // scope 0 at idna/src/uts46.rs:295:24: 295:39
+        StorageLive(_4);                 // scope 1 at idna/src/uts46.rs:296:9: 298:10
+        StorageLive(_5);                 // scope 1 at idna/src/uts46.rs:296:12: 296:26
+        _5 = copy _1;                    // scope 1 at idna/src/uts46.rs:296:12: 296:26
+        switchInt(move _5) -> [0: bb2, otherwise: bb1]; // scope 1 at idna/src/uts46.rs:296:12: 296:26
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 1 at idna/src/uts46.rs:296:9: 298:10
+        _3 = BitOr(copy _3, const uts46::GLYPHLESS_MASK); // scope 1 at idna/src/uts46.rs:297:13: 297:35
+        _4 = const ();                   // scope 1 at idna/src/uts46.rs:296:27: 298:10
+        goto -> bb3;                     // scope 1 at idna/src/uts46.rs:296:9: 298:10
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb27); // scope 1 at idna/src/uts46.rs:296:9: 298:10
+        _4 = const ();                   // scope 1 at idna/src/uts46.rs:298:10: 298:10
+        goto -> bb3;                     // scope 1 at idna/src/uts46.rs:296:9: 298:10
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 2 at idna/src/uts46.rs:300:21: 300:41
+        StorageDead(_5);                 // scope 1 at idna/src/uts46.rs:298:9: 298:10
+        StorageDead(_4);                 // scope 1 at idna/src/uts46.rs:298:9: 298:10
+        StorageLive(_6);                 // scope 1 at idna/src/uts46.rs:299:13: 299:18
+        _6 = const 0_usize;              // scope 1 at idna/src/uts46.rs:299:21: 299:22
+        StorageLive(_7);                 // scope 2 at idna/src/uts46.rs:300:13: 300:18
+        StorageLive(_8);                 // scope 2 at idna/src/uts46.rs:300:21: 300:30
+        _8 = &(*_2);                     // scope 2 at idna/src/uts46.rs:300:21: 300:30
+        ConstEvalCounter;                // scope 2 at idna/src/uts46.rs:300:21: 300:41
+        _7 = core::str::<impl str>::as_bytes(move _8) -> [return: bb4, unwind continue]; // scope 2 at idna/src/uts46.rs:300:21: 300:41
+    }
+
+    bb4: {
+        StorageDead(_8);                 // scope 2 at idna/src/uts46.rs:300:40: 300:41
+        StorageLive(_9);                 // scope 3 at idna/src/uts46.rs:301:9: 321:10
+        goto -> bb5;                     // scope 3 at idna/src/uts46.rs:301:9: 321:10
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb3);  // scope 3 at idna/src/uts46.rs:301:9: 321:10
+        StorageLive(_11);                // scope 3 at idna/src/uts46.rs:301:15: 301:30
+        StorageLive(_12);                // scope 3 at idna/src/uts46.rs:301:15: 301:16
+        _12 = copy _6;                   // scope 3 at idna/src/uts46.rs:301:15: 301:16
+        StorageLive(_13);                // scope 3 at idna/src/uts46.rs:301:19: 301:30
+        StorageLive(_14);                // scope 3 at idna/src/uts46.rs:301:19: 301:24
+        _14 = &(*_7);                    // scope 3 at idna/src/uts46.rs:301:19: 301:24
+        ConstEvalCounter;                // scope 3 at idna/src/uts46.rs:301:19: 301:30
+        _13 = core::slice::<impl [u8]>::len(move _14) -> [return: bb6, unwind continue]; // scope 3 at idna/src/uts46.rs:301:19: 301:30
+    }
+
+    bb6: {
+        StorageDead(_14);                // scope 3 at idna/src/uts46.rs:301:29: 301:30
+        _11 = Lt(move _12, move _13);    // scope 3 at idna/src/uts46.rs:301:15: 301:30
+        switchInt(move _11) -> [0: bb8, otherwise: bb7]; // scope 3 at idna/src/uts46.rs:301:15: 301:30
+    }
+
+    bb7: {
+        Coverage::VirtualCounter(bcb4);  // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        StorageDead(_13);                // scope 3 at idna/src/uts46.rs:301:29: 301:30
+        StorageDead(_12);                // scope 3 at idna/src/uts46.rs:301:29: 301:30
+        StorageLive(_15);                // scope 3 at idna/src/uts46.rs:302:17: 302:18
+        StorageLive(_16);                // scope 3 at idna/src/uts46.rs:302:27: 302:28
+        _16 = copy _6;                   // scope 3 at idna/src/uts46.rs:302:27: 302:28
+        _17 = PtrMetadata(copy _7);      // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        _18 = Lt(copy _16, copy _17);    // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        assert(move _18, "index out of bounds: the length is {} but the index is {}", move _17, copy _16) -> [success: bb9, unwind continue]; // scope 3 at idna/src/uts46.rs:302:21: 302:29
+    }
+
+    bb8: {
+        Coverage::VirtualCounter(bcb26); // scope 0 at idna/src/uts46.rs:323:6: 323:6
+        StorageDead(_13);                // scope 3 at idna/src/uts46.rs:301:29: 301:30
+        StorageDead(_12);                // scope 3 at idna/src/uts46.rs:301:29: 301:30
+        StorageLive(_54);                // scope 3 at idna/src/uts46.rs:301:9: 321:10
+        _9 = const ();                   // scope 3 at idna/src/uts46.rs:301:9: 321:10
+        StorageDead(_54);                // scope 3 at idna/src/uts46.rs:321:9: 321:10
+        StorageDead(_11);                // scope 3 at idna/src/uts46.rs:321:9: 321:10
+        StorageDead(_9);                 // scope 3 at idna/src/uts46.rs:321:9: 321:10
+        StorageLive(_56);                // scope 3 at idna/src/uts46.rs:322:16: 322:20
+        _56 = copy _3;                   // scope 3 at idna/src/uts46.rs:322:16: 322:20
+        _0 = uts46::AsciiDenyList { bits: move _56 }; // scope 3 at idna/src/uts46.rs:322:9: 322:22
+        StorageDead(_56);                // scope 3 at idna/src/uts46.rs:322:21: 322:22
+        StorageDead(_7);                 // scope 2 at idna/src/uts46.rs:323:5: 323:6
+        StorageDead(_6);                 // scope 1 at idna/src/uts46.rs:323:5: 323:6
+        StorageDead(_3);                 // scope 0 at idna/src/uts46.rs:323:5: 323:6
+        return;                          // scope 0 at idna/src/uts46.rs:323:6: 323:6
+    }
+
+    bb9: {
+        _15 = copy (*_7)[_16];           // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        StorageDead(_16);                // scope 3 at idna/src/uts46.rs:302:29: 302:30
+        StorageLive(_19);                // scope 4 at idna/src/uts46.rs:303:13: 303:64
+        StorageLive(_20);                // scope 4 at idna/src/uts46.rs:303:21: 303:29
+        StorageLive(_21);                // scope 4 at idna/src/uts46.rs:303:21: 303:22
+        _21 = copy _15;                  // scope 4 at idna/src/uts46.rs:303:21: 303:22
+        _20 = Lt(move _21, const 128_u8); // scope 4 at idna/src/uts46.rs:303:21: 303:29
+        switchInt(move _20) -> [0: bb11, otherwise: bb10]; // scope 4 at idna/src/uts46.rs:303:21: 303:29
+    }
+
+    bb10: {
+        Coverage::VirtualCounter(bcb5);  // scope 4 at idna/src/uts46.rs:305:21: 305:30
+        StorageDead(_21);                // scope 4 at idna/src/uts46.rs:303:28: 303:29
+        _19 = const ();                  // scope 4 at idna/src/uts46.rs:303:64: 303:64
+        StorageDead(_20);                // scope 4 at idna/src/uts46.rs:303:63: 303:64
+        StorageDead(_19);                // scope 4 at idna/src/uts46.rs:303:63: 303:64
+        StorageLive(_23);                // scope 4 at idna/src/uts46.rs:305:13: 305:76
+        StorageLive(_24);                // scope 4 at idna/src/uts46.rs:305:21: 305:30
+        StorageLive(_25);                // scope 4 at idna/src/uts46.rs:305:21: 305:22
+        _25 = copy _15;                  // scope 4 at idna/src/uts46.rs:305:21: 305:22
+        _24 = Ne(move _25, const 46_u8); // scope 4 at idna/src/uts46.rs:305:21: 305:30
+        switchInt(move _24) -> [0: bb13, otherwise: bb12]; // scope 4 at idna/src/uts46.rs:305:21: 305:30
+    }
+
+    bb11: {
+        Coverage::VirtualCounter(bcb25); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        StorageDead(_21);                // scope 4 at idna/src/uts46.rs:303:28: 303:29
+        StorageLive(_22);                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        ConstEvalCounter;                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _22 = panic(const "ASCII deny list must be ASCII.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb12: {
+        Coverage::VirtualCounter(bcb6);  // scope 4 at idna/src/uts46.rs:306:21: 306:30
+        StorageDead(_25);                // scope 4 at idna/src/uts46.rs:305:29: 305:30
+        _23 = const ();                  // scope 4 at idna/src/uts46.rs:305:76: 305:76
+        StorageDead(_24);                // scope 4 at idna/src/uts46.rs:305:75: 305:76
+        StorageDead(_23);                // scope 4 at idna/src/uts46.rs:305:75: 305:76
+        StorageLive(_27);                // scope 4 at idna/src/uts46.rs:306:13: 306:79
+        StorageLive(_28);                // scope 4 at idna/src/uts46.rs:306:21: 306:30
+        StorageLive(_29);                // scope 4 at idna/src/uts46.rs:306:21: 306:22
+        _29 = copy _15;                  // scope 4 at idna/src/uts46.rs:306:21: 306:22
+        _28 = Ne(move _29, const 45_u8); // scope 4 at idna/src/uts46.rs:306:21: 306:30
+        switchInt(move _28) -> [0: bb15, otherwise: bb14]; // scope 4 at idna/src/uts46.rs:306:21: 306:30
+    }
+
+    bb13: {
+        Coverage::VirtualCounter(bcb24); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        StorageDead(_25);                // scope 4 at idna/src/uts46.rs:305:29: 305:30
+        StorageLive(_26);                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        ConstEvalCounter;                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _26 = panic(const "ASCII deny list must not contain the dot.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb14: {
+        Coverage::VirtualCounter(bcb7);  // scope 4 at idna/src/uts46.rs:308:19: 308:30
+        StorageDead(_29);                // scope 4 at idna/src/uts46.rs:306:29: 306:30
+        _27 = const ();                  // scope 4 at idna/src/uts46.rs:306:79: 306:79
+        StorageDead(_28);                // scope 4 at idna/src/uts46.rs:306:78: 306:79
+        StorageDead(_27);                // scope 4 at idna/src/uts46.rs:306:78: 306:79
+        StorageLive(_31);                // scope 4 at idna/src/uts46.rs:307:13: 310:14
+        StorageLive(_32);                // scope 4 at idna/src/uts46.rs:308:19: 308:30
+        StorageLive(_33);                // scope 4 at idna/src/uts46.rs:308:20: 308:21
+        _33 = copy _15;                  // scope 4 at idna/src/uts46.rs:308:20: 308:21
+        _32 = Ge(move _33, const 48_u8); // scope 4 at idna/src/uts46.rs:308:19: 308:30
+        switchInt(move _32) -> [0: bb17, otherwise: bb16]; // scope 4 at idna/src/uts46.rs:308:19: 308:30
+    }
+
+    bb15: {
+        Coverage::VirtualCounter(bcb23); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        StorageDead(_29);                // scope 4 at idna/src/uts46.rs:306:29: 306:30
+        StorageLive(_30);                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        ConstEvalCounter;                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _30 = panic(const "ASCII deny list must not contain the hyphen.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb16: {
+        Coverage::VirtualCounter(bcb8);  // scope 4 at idna/src/uts46.rs:308:34: 308:45
+        StorageDead(_33);                // scope 4 at idna/src/uts46.rs:308:29: 308:30
+        StorageLive(_34);                // scope 4 at idna/src/uts46.rs:308:34: 308:45
+        StorageLive(_35);                // scope 4 at idna/src/uts46.rs:308:35: 308:36
+        _35 = copy _15;                  // scope 4 at idna/src/uts46.rs:308:35: 308:36
+        _34 = Le(move _35, const 57_u8); // scope 4 at idna/src/uts46.rs:308:34: 308:45
+        switchInt(move _34) -> [0: bb19, otherwise: bb18]; // scope 4 at idna/src/uts46.rs:308:34: 308:45
+    }
+
+    bb17: {
+        Coverage::VirtualCounter(bcb22); // scope 4 at no-location
+        StorageDead(_33);                // scope 4 at idna/src/uts46.rs:308:29: 308:30
+        goto -> bb20;                    // scope 4 at no-location
+    }
+
+    bb18: {
+        Coverage::VirtualCounter(bcb9);  // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        StorageDead(_35);                // scope 4 at idna/src/uts46.rs:308:44: 308:45
+        StorageLive(_36);                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        ConstEvalCounter;                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _36 = panic(const "ASCII deny list must not contain digits.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb19: {
+        Coverage::VirtualCounter(bcb10); // scope 4 at no-location
+        StorageDead(_35);                // scope 4 at idna/src/uts46.rs:308:44: 308:45
+        goto -> bb20;                    // scope 4 at no-location
+    }
+
+    bb20: {
+        Coverage::VirtualCounter(bcb11); // scope 4 at idna/src/uts46.rs:312:19: 312:30
+        _31 = const ();                  // scope 4 at idna/src/uts46.rs:310:14: 310:14
+        StorageDead(_34);                // scope 4 at idna/src/uts46.rs:310:13: 310:14
+        StorageDead(_32);                // scope 4 at idna/src/uts46.rs:310:13: 310:14
+        StorageDead(_31);                // scope 4 at idna/src/uts46.rs:310:13: 310:14
+        StorageLive(_37);                // scope 4 at idna/src/uts46.rs:311:13: 314:14
+        StorageLive(_38);                // scope 4 at idna/src/uts46.rs:312:19: 312:30
+        StorageLive(_39);                // scope 4 at idna/src/uts46.rs:312:20: 312:21
+        _39 = copy _15;                  // scope 4 at idna/src/uts46.rs:312:20: 312:21
+        _38 = Ge(move _39, const 97_u8); // scope 4 at idna/src/uts46.rs:312:19: 312:30
+        switchInt(move _38) -> [0: bb22, otherwise: bb21]; // scope 4 at idna/src/uts46.rs:312:19: 312:30
+    }
+
+    bb21: {
+        Coverage::VirtualCounter(bcb12); // scope 4 at idna/src/uts46.rs:312:34: 312:45
+        StorageDead(_39);                // scope 4 at idna/src/uts46.rs:312:29: 312:30
+        StorageLive(_40);                // scope 4 at idna/src/uts46.rs:312:34: 312:45
+        StorageLive(_41);                // scope 4 at idna/src/uts46.rs:312:35: 312:36
+        _41 = copy _15;                  // scope 4 at idna/src/uts46.rs:312:35: 312:36
+        _40 = Le(move _41, const 122_u8); // scope 4 at idna/src/uts46.rs:312:34: 312:45
+        switchInt(move _40) -> [0: bb24, otherwise: bb23]; // scope 4 at idna/src/uts46.rs:312:34: 312:45
+    }
+
+    bb22: {
+        Coverage::VirtualCounter(bcb21); // scope 4 at no-location
+        StorageDead(_39);                // scope 4 at idna/src/uts46.rs:312:29: 312:30
+        goto -> bb25;                    // scope 4 at no-location
+    }
+
+    bb23: {
+        Coverage::VirtualCounter(bcb13); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        StorageDead(_41);                // scope 4 at idna/src/uts46.rs:312:44: 312:45
+        StorageLive(_42);                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        ConstEvalCounter;                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _42 = panic(const "ASCII deny list must not contain letters.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb24: {
+        Coverage::VirtualCounter(bcb14); // scope 4 at no-location
+        StorageDead(_41);                // scope 4 at idna/src/uts46.rs:312:44: 312:45
+        goto -> bb25;                    // scope 4 at no-location
+    }
+
+    bb25: {
+        Coverage::VirtualCounter(bcb15); // scope 4 at idna/src/uts46.rs:316:19: 316:30
+        _37 = const ();                  // scope 4 at idna/src/uts46.rs:314:14: 314:14
+        StorageDead(_40);                // scope 4 at idna/src/uts46.rs:314:13: 314:14
+        StorageDead(_38);                // scope 4 at idna/src/uts46.rs:314:13: 314:14
+        StorageDead(_37);                // scope 4 at idna/src/uts46.rs:314:13: 314:14
+        StorageLive(_43);                // scope 4 at idna/src/uts46.rs:315:13: 318:14
+        StorageLive(_44);                // scope 4 at idna/src/uts46.rs:316:19: 316:30
+        StorageLive(_45);                // scope 4 at idna/src/uts46.rs:316:20: 316:21
+        _45 = copy _15;                  // scope 4 at idna/src/uts46.rs:316:20: 316:21
+        _44 = Ge(move _45, const 65_u8); // scope 4 at idna/src/uts46.rs:316:19: 316:30
+        switchInt(move _44) -> [0: bb27, otherwise: bb26]; // scope 4 at idna/src/uts46.rs:316:19: 316:30
+    }
+
+    bb26: {
+        Coverage::VirtualCounter(bcb16); // scope 4 at idna/src/uts46.rs:316:34: 316:45
+        StorageDead(_45);                // scope 4 at idna/src/uts46.rs:316:29: 316:30
+        StorageLive(_46);                // scope 4 at idna/src/uts46.rs:316:34: 316:45
+        StorageLive(_47);                // scope 4 at idna/src/uts46.rs:316:35: 316:36
+        _47 = copy _15;                  // scope 4 at idna/src/uts46.rs:316:35: 316:36
+        _46 = Le(move _47, const 90_u8); // scope 4 at idna/src/uts46.rs:316:34: 316:45
+        switchInt(move _46) -> [0: bb29, otherwise: bb28]; // scope 4 at idna/src/uts46.rs:316:34: 316:45
+    }
+
+    bb27: {
+        Coverage::VirtualCounter(bcb20); // scope 4 at no-location
+        StorageDead(_45);                // scope 4 at idna/src/uts46.rs:316:29: 316:30
+        goto -> bb30;                    // scope 4 at no-location
+    }
+
+    bb28: {
+        Coverage::VirtualCounter(bcb17); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        StorageDead(_47);                // scope 4 at idna/src/uts46.rs:316:44: 316:45
+        StorageLive(_48);                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        ConstEvalCounter;                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _48 = panic(const "ASCII deny list must not contain letters.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb29: {
+        Coverage::VirtualCounter(bcb18); // scope 4 at no-location
+        StorageDead(_47);                // scope 4 at idna/src/uts46.rs:316:44: 316:45
+        goto -> bb30;                    // scope 4 at no-location
+    }
+
+    bb30: {
+        Coverage::VirtualCounter(bcb19); // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        _43 = const ();                  // scope 4 at idna/src/uts46.rs:318:14: 318:14
+        StorageDead(_46);                // scope 4 at idna/src/uts46.rs:318:13: 318:14
+        StorageDead(_44);                // scope 4 at idna/src/uts46.rs:318:13: 318:14
+        StorageDead(_43);                // scope 4 at idna/src/uts46.rs:318:13: 318:14
+        StorageLive(_49);                // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        StorageLive(_50);                // scope 4 at idna/src/uts46.rs:319:30: 319:31
+        _50 = copy _15;                  // scope 4 at idna/src/uts46.rs:319:30: 319:31
+        _51 = Lt(copy _50, const 128_u8); // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        assert(move _51, "attempt to shift left by `{}`, which would overflow", copy _50) -> [success: bb31, unwind continue]; // scope 4 at idna/src/uts46.rs:319:21: 319:31
+    }
+
+    bb31: {
+        _49 = Shl(const 1_u128, move _50); // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        StorageDead(_50);                // scope 4 at idna/src/uts46.rs:319:30: 319:31
+        _3 = BitOr(copy _3, move _49);   // scope 4 at idna/src/uts46.rs:319:13: 319:31
+        StorageDead(_49);                // scope 4 at idna/src/uts46.rs:319:30: 319:31
+        _52 = AddWithOverflow(copy _6, const 1_usize); // scope 4 at idna/src/uts46.rs:320:13: 320:19
+        assert(!move (_52.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _6, const 1_usize) -> [success: bb32, unwind continue]; // scope 4 at idna/src/uts46.rs:320:13: 320:19
+    }
+
+    bb32: {
+        _6 = move (_52.0: usize);        // scope 4 at idna/src/uts46.rs:320:13: 320:19
+        _10 = const ();                  // scope 3 at idna/src/uts46.rs:301:31: 321:10
+        StorageDead(_15);                // scope 3 at idna/src/uts46.rs:321:9: 321:10
+        StorageDead(_11);                // scope 3 at idna/src/uts46.rs:321:9: 321:10
+        ConstEvalCounter;                // scope 3 at idna/src/uts46.rs:301:9: 321:10
+        goto -> bb5;                     // scope 3 at idna/src/uts46.rs:301:9: 321:10
+    }
+}
+"#;
+
+    #[test]
+    fn ctfe_body_is_never_a_candidate() {
+        let mir = crate::mir::parse_text(ASCII_DENY_LIST_NEW_MIR).expect("MIR parses");
+        assert_eq!(mir.functions.len(), 2, "runtime and CTFE bodies");
+        let (runtime, ctfe) = (&mir.functions[0], &mir.functions[1]);
+        assert_eq!(runtime.name, ctfe.name);
+        assert!(!runtime.is_ctfe);
+        assert!(ctfe.is_ctfe);
+        // The CTFE body has a decision shape of its own; it is
+        // declined before decomposition.
+        assert_eq!(try_decompose_function(ctfe), Ok(cond("deny_glyphless")));
+        assert_eq!(try_decompose_candidate(ctfe), Err(DeclineReason::CtfeBody));
+        assert_eq!(
+            serde_json::to_value(DeclineReason::CtfeBody).unwrap(),
+            "ctfe_body"
+        );
+        assert!(try_decompose_candidate(runtime).is_err());
+        assert_ne!(
+            try_decompose_candidate(runtime),
+            Err(DeclineReason::CtfeBody)
+        );
     }
 }

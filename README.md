@@ -280,7 +280,9 @@ Functions that have a decision the engine declined are listed in
 value is a named local that is not `bool` (for example a branch that
 returns a struct or an integer, which is not a Boolean condition),
 `no_conditions` when the recovered tree is a bare constant that
-tests no condition, otherwise `unsupported_shape`.
+tests no condition, `ctfe_body` for the `// MIR FOR CTFE` rendering
+of a `const fn` (never run at runtime; the function's runtime body
+is considered instead), otherwise `unsupported_shape`.
 
 ## Why MC/DC, why this engine
 

@@ -60,8 +60,8 @@ struct DeclinedFunction {
     line: Option<u32>,
     /// Why the decomposer declined it: `unsupported_shape`,
     /// `non_bool_leaf` when an arm's value is a named local that is
-    /// not `bool`, or `no_conditions` when the tree tests no
-    /// condition.
+    /// not `bool`, `no_conditions` when the tree tests no condition,
+    /// or `ctfe_body` for a `const fn`'s `MIR FOR CTFE` body.
     reason: decision::DeclineReason,
 }
 
