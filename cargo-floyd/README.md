@@ -19,6 +19,9 @@ test should evaluate each decision once; a test that evaluates it
 several times with differing values is reported as ambiguous rather
 than guessed at (see [Tests that evaluate a decision more than
 once](https://github.com/Gordion-Solutions/Floyd#tests-that-evaluate-a-decision-more-than-once)).
+A condition left unknown that way gets no percentage in the summary
+and, like an unexercised condition, makes the run exit with code 2
+(0: every condition exercised; 1: error or no decision analysed).
 
 Requires the nightly toolchain plus the LLVM coverage tools:
 

@@ -30,8 +30,9 @@ Each test contributes one observation per decision it evaluates.
 An observation is *used* when the test evaluated the decision once
 (or its counters otherwise identify the condition vector); a test
 that evaluated it several times with differing values is reported
-as *ambiguous* and can leave a condition `unknown (ambiguous)`
-rather than exercised or unexercised. See
+as *ambiguous* and can leave a condition `UNKNOWN` rather than
+exercised or unexercised. When any condition is unknown, Floyd
+prints no percentage. See
 [Tests that evaluate a decision more than once](#tests-that-evaluate-a-decision-more-than-once).
 
 ## Install
@@ -79,8 +80,8 @@ the ground-truth analyses Floyd's output is checked against (see
 | **Enum `match` without binding** | `match state { State::Idle => ..., State::Running => ... }` — condition names use the rustc discriminant index (e.g. `state == State::variant_0`); use `if let` with a binding to get source variant names instead |
 | Boolean derived from a `let`-bound expression | `let fast = speed > 50; fast && brake` |
 | **Closures capturing outer booleans** | `let f = \|x: bool\| x && b; f(a)` — works for by-value (`move \|\|`) and by-reference captures; FnMut closures with internal mutation are out of MVP scope |
-| JSON output | `cargo floyd test --format=json` |
-| **JUnit XML output** | `cargo floyd test --format=junit` — one `<testcase>` per condition (pass = exercised, failure = unexercised or unknown (ambiguous)); rendered natively by Jenkins, GitLab CI, GitHub Actions, Bazel/Buck2, etc. |
+| JSON output | `cargo floyd test --format=json` — includes a `summary` object (see [JSON summary](#json-summary)) |
+| **JUnit XML output** | `cargo floyd test --format=junit` — one `<testcase>` per condition (pass = exercised, failure = unexercised or unknown); rendered natively by Jenkins, GitLab CI, GitHub Actions, Bazel/Buck2, etc. |
 
 ### What doesn't (yet)
 
@@ -133,12 +134,28 @@ Any other test is reported as an **ambiguous observation**:
 count and raw per-condition `counts`, the text report lists it as
 `AMBIGUOUS`, and it is excluded from independence-pair finding. A
 condition whose only evidence comes from ambiguous observations is
-reported as `unknown (ambiguous)`, not as unexercised, and the MC/DC
-percentage notes how many observations were excluded (JUnit:
-`type="AmbiguousCondition"`). To resolve it, add tests that each
-evaluate the decision once with the inputs you want to demonstrate,
-for example one `#[test]` per input vector instead of a loop over
-all of them.
+reported as `UNKNOWN`, not as unexercised, with the tests that
+evaluated it (the first three by name, then `(+N more)`; JUnit:
+`type="AmbiguousCondition"`).
+
+Floyd does not state a percentage it cannot stand behind. With no
+unknown conditions the summary line is unchanged
+(`MC/DC coverage: 2 of 3 conditions exercised (67%)`); with any
+unknown condition it gives counts only:
+
+```
+MC/DC coverage: 1 exercised, 0 not exercised, 1 unknown of 2 conditions (no percentage: 1 condition could not be determined)
+```
+
+The JSON `summary.percentage` is then `null`, and the JUnit suite
+omits its `floyd.percentage` property.
+
+**Unknown conditions block a pass.** The run did not demonstrate
+MC/DC for them, so they produce the same non-zero exit code as
+unexercised conditions (see [Exit codes](#exit-codes)). To resolve
+an unknown condition, write a test that evaluates the decision
+exactly once with the inputs you want to demonstrate, for example
+one `#[test]` per input vector instead of a loop over all of them.
 
 [cast-10]: https://www.faa.gov/aircraft/air_cert/design_approvals/air_software/cast/cast_papers (CAST-10 — Modified Condition/Decision Coverage)
 
@@ -210,19 +227,53 @@ in a stage and add `junit 'floyd-mcdc.xml'` in `post { always
 `junit-annotate` plugin (or call `buildkite-agent artifact
 upload floyd-mcdc.xml`).
 
-### Failing the build on unexercised conditions
+### Exit codes
 
-Floyd's exit code today reports the engine's own success, not
-whether every condition was exercised. To fail a CI run on
-incomplete MC/DC coverage, post-process the JUnit XML — any
-`<failure>` element with `type="UnexercisedCondition"` indicates
-a missing pair, and `type="AmbiguousCondition"` a condition whose
-only evidence came from tests that evaluated the decision more than
-once (see [Tests that evaluate a decision more than
-once](#tests-that-evaluate-a-decision-more-than-once)). The
-CI-native test-result steps (`reports: junit:` on GitLab,
-`junit '...'` on Jenkins, JUnit-aware actions on GitHub) all surface
-these as failing tests in their respective UIs.
+| Code | Meaning |
+|------|---------|
+| 0 | A decision was analysed and every condition was exercised. |
+| 1 | Error, or no decision was analysed (no recognised decision, or no test produced a usable observation). |
+| 2 | A decision was analysed but MC/DC was not demonstrated: at least one condition is unexercised or unknown. |
+
+So `cargo floyd test` fails a CI step on incomplete MC/DC coverage
+in every format. Unknown conditions count as failures: the run did
+not demonstrate MC/DC for them (see [Tests that evaluate a decision
+more than once](#tests-that-evaluate-a-decision-more-than-once)).
+Not-measurable candidates (below) do not affect the exit code. In
+the JUnit XML, `type="UnexercisedCondition"` marks a missing pair
+and `type="AmbiguousCondition"` an unknown condition; the CI-native
+test-result steps (`reports: junit:` on GitLab, `junit '...'` on
+Jenkins, JUnit-aware actions on GitHub) surface both as failing
+tests. To publish the report even when the step fails, keep the
+`if: always()` / `when: always` settings shown above.
+
+### JSON summary
+
+`--format=json` carries a `summary` object alongside the existing
+fields:
+
+```json
+"summary": {
+  "conditions_total": 2,
+  "exercised": 1,
+  "not_exercised": 0,
+  "unknown": 1,
+  "not_measurable": 0,
+  "percentage": null
+}
+```
+
+`conditions_total` counts the conditions of the analysed decision.
+`percentage` is `exercised / conditions_total * 100`, and is `null`
+whenever `unknown > 0` (or there are no conditions, on the decline
+paths). `not_measurable` counts candidates whose execution coverage
+cannot measure (code rustc does not instrument, such as derive
+output; decisions expanded from a dependency's macro; spans no
+coverage record covers or that several records share). They are
+listed with their reason in `candidates[].not_measurable`, are never
+part of `conditions_total`, and are reported in the text summary as
+a count per reason. The JUnit suite carries the same counts as
+`floyd.*` `<properties>`.
 
 ## Why MC/DC, why this engine
 
