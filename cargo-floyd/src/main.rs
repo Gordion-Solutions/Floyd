@@ -58,9 +58,10 @@ struct DeclinedFunction {
     name: String,
     source_file: Option<String>,
     line: Option<u32>,
-    /// Why the decomposer declined it: `unsupported_shape`, or
+    /// Why the decomposer declined it: `unsupported_shape`,
     /// `non_bool_leaf` when an arm's value is a named local that is
-    /// not `bool`.
+    /// not `bool`, or `no_conditions` when the tree tests no
+    /// condition.
     reason: decision::DeclineReason,
 }
 
@@ -592,7 +593,7 @@ fn run_test_mode_cargo(
             // are "no boolean decision at all", so they do not
             // belong in the OOS report.
             if decision::has_switchint(f) {
-                let node = match decision::try_decompose_function(f) {
+                let node = match decision::try_decompose_candidate(f) {
                     Ok(node) => node,
                     Err(reason) => {
                         // Has a switchInt (so some kind of decision)
@@ -1103,7 +1104,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     let mut artifact_candidates: Vec<(floyd::DecisionTree, floyd::DecisionProvenance, usize)> =
         Vec::new();
     for (fn_idx, f) in mir.functions.iter().enumerate() {
-        if let Some(node) = decision::decompose_function(f) {
+        if let Ok(node) = decision::try_decompose_candidate(f) {
             artifact_candidates.push((
                 floyd::DecisionTree {
                     decisions: vec![node],

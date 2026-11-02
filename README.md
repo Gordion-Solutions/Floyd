@@ -279,7 +279,8 @@ Functions that have a decision the engine declined are listed in
 `out_of_scope`, each with a `reason`: `non_bool_leaf` when an arm's
 value is a named local that is not `bool` (for example a branch that
 returns a struct or an integer, which is not a Boolean condition),
-otherwise `unsupported_shape`.
+`no_conditions` when the recovered tree is a bare constant that
+tests no condition, otherwise `unsupported_shape`.
 
 ## Why MC/DC, why this engine
 

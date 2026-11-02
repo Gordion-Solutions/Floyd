@@ -39,7 +39,8 @@ use crate::Mir;
 
 /// Why the decomposer declined a function that has a `switchInt`.
 ///
-/// Serialised in snake case (`unsupported_shape`, `non_bool_leaf`)
+/// Serialised in snake case (`unsupported_shape`, `non_bool_leaf`,
+/// `no_conditions`)
 /// as the `reason` of each `out_of_scope` entry in
 /// `cargo floyd test --format=json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -54,6 +55,11 @@ pub enum DeclineReason {
     /// arm, and with it the decision, is declined instead of
     /// reporting the local as a condition.
     NonBoolLeaf,
+    /// The function decomposed, but the tree tests no condition (a
+    /// bare `Const`). There is nothing for MC/DC to measure; such a
+    /// tree comes from a body whose entry block reaches a constant
+    /// without branching, not from a Boolean decision.
+    NoConditions,
 }
 
 thread_local! {
@@ -267,6 +273,17 @@ pub fn try_decompose_from_block(f: &MirFunction, block_id: BlockId) -> Result<No
     } else {
         DeclineReason::UnsupportedShape
     })
+}
+
+/// Decompose `f` as an MC/DC candidate: [`try_decompose_function`],
+/// then decline a tree that tests no condition
+/// ([`DeclineReason::NoConditions`]).
+pub fn try_decompose_candidate(f: &MirFunction) -> Result<Node, DeclineReason> {
+    let node = try_decompose_function(f)?;
+    if crate::masking::collect_conditions(&node).is_empty() {
+        return Err(DeclineReason::NoConditions);
+    }
+    Ok(node)
 }
 
 /// Guard for the branch-taken-as-result lift: both arms of a
@@ -4899,5 +4916,47 @@ fn decide(_1: bool, _2: bool) -> Option<bool> {
         let text = ARM_LOCAL_FLOWS_TO_RETURN_MIR.replace("_4 = move _3;", "_4 = const true;");
         let mir = crate::mir::parse_text(&text).expect("MIR parses");
         assert_eq!(decompose_function(&mir.functions[0]), None);
+    }
+
+    /// A body whose entry block sets the return place to a constant
+    /// and only then branches (on something that does not change the
+    /// result): the entry-block decomposer yields `Const false`.
+    const CONST_ENTRY_MIR: &str = r#"
+fn f(_1: bool) -> bool {
+    debug flag => _1;
+    let mut _0: bool;
+
+    bb0: {
+        _0 = const false;
+        goto -> bb1;
+    }
+
+    bb1: {
+        switchInt(copy _1) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn zero_condition_tree_is_not_a_candidate() {
+        let mir = crate::mir::parse_text(CONST_ENTRY_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        assert_eq!(try_decompose_function(f), Ok(const_(false)));
+        assert_eq!(try_decompose_candidate(f), Err(DeclineReason::NoConditions));
+        assert_eq!(
+            serde_json::to_value(DeclineReason::NoConditions).unwrap(),
+            "no_conditions"
+        );
+        // A tree with a condition is still a candidate.
+        let mir = crate::mir::parse_text(ARM_LOCAL_FLOWS_TO_RETURN_MIR).expect("MIR parses");
+        assert!(try_decompose_candidate(&mir.functions[0]).is_ok());
     }
 }
