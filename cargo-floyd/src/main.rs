@@ -286,10 +286,32 @@ fn harness_free_note(
     }
     Some(format!(
         "no test Floyd ran entered this function; it may be exercised by the \
-         `harness = false` test target(s) {} of package `{package}`, which Floyd \
+         `harness = false` test target(s) {} of package `{}`, which Floyd \
          does not run",
-        targets.join(", ")
+        targets.join(", "),
+        package_display_name(package)
     ))
+}
+
+/// The package name in a cargo package id: `data-url` for
+/// `path+file:///w/data-url#0.3.2`, `serde` for
+/// `registry+https://..#serde@1.0.0`, `foo` for the legacy
+/// `foo 0.1.0 (path+file:///w)`. Anything else is returned as is.
+fn package_display_name(id: &str) -> &str {
+    if let Some((name, _)) = id.split_once(' ') {
+        return name;
+    }
+    let Some((url, fragment)) = id.rsplit_once('#') else {
+        return id;
+    };
+    match fragment.split_once('@') {
+        Some((name, _)) => name,
+        None => url
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(id),
+    }
 }
 
 /// A test-binary MIR file skipped by the size guard.
@@ -2085,6 +2107,18 @@ mod tests {
         let note = harness_free_note(&no_branch(false), "data-url", &skipped).expect("a note");
         assert!(note.contains("`wpt`"), "{note}");
         assert!(note.contains("`data-url`"), "{note}");
+        assert_eq!(
+            package_display_name("path+file:///w/rust-url/data-url#0.3.2"),
+            "data-url"
+        );
+        assert_eq!(
+            package_display_name(
+                "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0"
+            ),
+            "serde"
+        );
+        assert_eq!(package_display_name("foo 0.1.0 (path+file:///w)"), "foo");
+        assert_eq!(package_display_name("data-url"), "data-url");
         assert!(!note.contains("bench"), "{note}");
         let never = coverage(CoverageStatus::NeverInvoked, false);
         assert!(harness_free_note(&never, "data-url", &skipped).is_some());
