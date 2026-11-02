@@ -278,6 +278,13 @@ part of `conditions_total`, and are reported in the text summary as
 a count per reason. The JUnit suite carries the same counts as
 `floyd.*` `<properties>`.
 
+Floyd does not run test targets built with `harness = false` (they
+are listed in `skipped_no_harness`). When no test Floyd ran entered
+a candidate's function and its package has such a target, the
+candidate carries a `note` naming the skipped target(s), which may be
+what exercises it; the text explanation of an all-unobserved verdict
+prints the same note.
+
 Functions that have a decision the engine declined are listed in
 `out_of_scope`, each with a `reason`: `non_bool_leaf` when an arm's
 value is a named local that is not `bool` (for example a branch that

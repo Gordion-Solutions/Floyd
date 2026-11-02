@@ -93,6 +93,12 @@ struct CandidateSummary {
     /// never-invoked.
     #[serde(skip_serializing_if = "Option::is_none")]
     not_measurable: Option<correlate::NotMeasurable>,
+    /// Present when no test Floyd ran entered the function and its
+    /// package has `harness = false` test targets Floyd skipped
+    /// (see `skipped_no_harness`): names those targets, which may
+    /// be what exercises it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 impl CandidateSummary {
@@ -111,8 +117,69 @@ impl CandidateSummary {
                 correlate::CoverageStatus::NotMeasurable(nm) => Some(nm.clone()),
                 _ => None,
             },
+            note: None,
         }
     }
+
+    /// `display_name (file:line)` for report lines.
+    fn label(&self) -> String {
+        let name = self
+            .display_name
+            .as_deref()
+            .or(self.function_name.as_deref())
+            .unwrap_or("<unknown>");
+        match (&self.source_file, self.line) {
+            (Some(file), Some(line)) => format!("`{name}` ({file}:{line})"),
+            _ => format!("`{name}`"),
+        }
+    }
+}
+
+/// The note for a candidate that no test Floyd ran entered, when
+/// `package` (the package whose MIR the candidate came from) has
+/// `harness = false` test targets that Floyd skipped: such a target
+/// may be the only code that exercises it (rust-url's `valid_value`
+/// runs only from `data-url/tests/wpt.rs`).
+///
+/// Applies to a never-invoked candidate and to a not-measurable one
+/// whose record was not found or has no branch region, provided no
+/// test entered the function. `None` otherwise.
+fn harness_free_note(
+    join: &correlate::CandidateCoverage,
+    package: &str,
+    skipped_no_harness: &[NoHarnessTarget],
+) -> Option<String> {
+    use correlate::{CoverageStatus, NotMeasurableReason};
+    if join.entered {
+        return None;
+    }
+    let eligible = match &join.status {
+        CoverageStatus::NeverInvoked => true,
+        CoverageStatus::NotMeasurable(nm) => matches!(
+            nm.reason,
+            NotMeasurableReason::NoBranchRegion | NotMeasurableReason::NoCoverageRecord
+        ),
+        CoverageStatus::Invoked => false,
+    };
+    if !eligible {
+        return None;
+    }
+    let mut targets: Vec<String> = skipped_no_harness
+        .iter()
+        .filter(|t| t.package == package)
+        .map(|t| format!("`{}`", t.target))
+        .collect();
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "no test Floyd ran entered this function; it may be exercised by the \
+         `harness = false` test target(s) {} of package `{package}`, which Floyd \
+         does not run",
+        targets.join(", ")
+    ))
 }
 
 /// A test-binary MIR file skipped by the size guard.
@@ -496,6 +563,7 @@ fn run_test_mode_cargo(
         mir: floyd::Mir,
         binary_path: std::path::PathBuf,
         tests: Vec<String>,
+        package: String,
     }
 
     struct RawCandidate {
@@ -659,6 +727,7 @@ fn run_test_mode_cargo(
             mir,
             binary_path: artifact.binary_path.clone(),
             tests,
+            package: artifact.package_name.clone(),
         });
     }
 
@@ -870,8 +939,24 @@ fn run_test_mode_cargo(
     let candidate_summaries: Vec<CandidateSummary> = raw_candidates
         .iter()
         .zip(&joins)
-        .map(|(raw, join)| CandidateSummary::new(&raw.prov, join))
+        .map(|(raw, join)| CandidateSummary {
+            note: harness_free_note(
+                join,
+                &artifacts[raw.artifact_idx].package,
+                &skipped_no_harness,
+            ),
+            ..CandidateSummary::new(&raw.prov, join)
+        })
         .collect();
+    // The harness-free notes, printed under the never-invoked and
+    // not-measurable lines of the all-unobserved explanation.
+    let print_notes = |want: fn(&CandidateSummary) -> bool| {
+        for c in candidate_summaries.iter().filter(|c| want(c)) {
+            if let Some(note) = &c.note {
+                eprintln!("    {}: {note}", c.label());
+            }
+        }
+    };
     let candidates: Vec<selector::Candidate> = raw_candidates
         .into_iter()
         .zip(joins)
@@ -970,6 +1055,7 @@ fn run_test_mode_cargo(
                      verify which candidates were considered via \
                      --format=json's `candidates` list."
                 );
+                print_notes(|c| !c.invoked && c.not_measurable.is_none());
             }
             if not_measurable_count > 0 {
                 eprintln!(
@@ -980,6 +1066,7 @@ fn run_test_mode_cargo(
                      they ran is unknown, not a test gap. See \
                      `not_measurable` in --format=json's `candidates` list."
                 );
+                print_notes(|c| c.not_measurable.is_some());
             }
             return emit_decline(RuntimeVerdict::AllUnobserved);
         }
@@ -1778,6 +1865,7 @@ mod tests {
                 invoked: false,
                 observations: 0,
                 not_measurable: None,
+                note: Some("may be exercised by `wpt`".to_string()),
             },
             CandidateSummary {
                 function_name: Some(
@@ -1796,6 +1884,7 @@ mod tests {
                     reason: correlate::NotMeasurableReason::Uninstrumented,
                     detail: "no coverage mapping".to_string(),
                 }),
+                note: None,
             },
         ];
         let skipped = vec![SkippedMir {
@@ -1828,6 +1917,8 @@ mod tests {
         assert_eq!(v["candidates"][0]["invoked"], false);
         assert_eq!(v["candidates"][0]["display_name"], "crate::g");
         assert!(v["candidates"][0].get("not_measurable").is_none());
+        assert_eq!(v["candidates"][0]["note"], "may be exercised by `wpt`");
+        assert!(v["candidates"][1].get("note").is_none());
         assert_eq!(v["candidates"][1]["invoked"], false);
         assert_eq!(
             v["candidates"][1]["not_measurable"]["reason"],
@@ -1837,6 +1928,69 @@ mod tests {
         assert_eq!(v["summary"]["conditions_total"], 0);
         assert_eq!(v["summary"]["not_measurable"], 1);
         assert!(v["summary"]["percentage"].is_null());
+    }
+
+    fn coverage(status: correlate::CoverageStatus, entered: bool) -> correlate::CandidateCoverage {
+        correlate::CandidateCoverage {
+            status,
+            observations: Vec::new(),
+            display_name: None,
+            function_keys: Vec::new(),
+            entered,
+            conditions_without_branch_region: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn harness_free_note_names_the_skipped_targets_of_the_package() {
+        use correlate::{CoverageStatus, NotMeasurable, NotMeasurableReason};
+        let skipped = vec![
+            NoHarnessTarget {
+                package: "data-url".to_string(),
+                target: "wpt".to_string(),
+                binary: "target/debug/deps/wpt-1".to_string(),
+            },
+            NoHarnessTarget {
+                package: "idna".to_string(),
+                target: "bench".to_string(),
+                binary: "target/debug/deps/bench-1".to_string(),
+            },
+        ];
+        let no_branch = |entered| {
+            coverage(
+                CoverageStatus::NotMeasurable(NotMeasurable {
+                    reason: NotMeasurableReason::NoBranchRegion,
+                    detail: String::new(),
+                }),
+                entered,
+            )
+        };
+        let note = harness_free_note(&no_branch(false), "data-url", &skipped).expect("a note");
+        assert!(note.contains("`wpt`"), "{note}");
+        assert!(note.contains("`data-url`"), "{note}");
+        assert!(!note.contains("bench"), "{note}");
+        let never = coverage(CoverageStatus::NeverInvoked, false);
+        assert!(harness_free_note(&never, "data-url", &skipped).is_some());
+        // Entered by a test Floyd ran, another package, or a reason
+        // unrelated to whether it ran: no note.
+        assert_eq!(
+            harness_free_note(&no_branch(true), "data-url", &skipped),
+            None
+        );
+        assert_eq!(harness_free_note(&never, "url", &skipped), None);
+        let invoked = coverage(CoverageStatus::Invoked, true);
+        assert_eq!(harness_free_note(&invoked, "data-url", &skipped), None);
+        let uninstrumented = coverage(
+            CoverageStatus::NotMeasurable(NotMeasurable {
+                reason: NotMeasurableReason::Uninstrumented,
+                detail: String::new(),
+            }),
+            false,
+        );
+        assert_eq!(
+            harness_free_note(&uninstrumented, "data-url", &skipped),
+            None
+        );
     }
 
     #[test]
