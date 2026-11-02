@@ -151,7 +151,7 @@ pub fn not_measurable_line<'a>(
 }
 
 /// The JSON spelling of a [`NotMeasurableReason`].
-fn reason_label(reason: &NotMeasurableReason) -> &'static str {
+pub fn reason_label(reason: &NotMeasurableReason) -> &'static str {
     match reason {
         NotMeasurableReason::Uninstrumented => "uninstrumented",
         NotMeasurableReason::ExternalMacro => "external_macro",

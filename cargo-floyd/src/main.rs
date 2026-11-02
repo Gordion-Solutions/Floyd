@@ -99,6 +99,11 @@ struct CandidateSummary {
     /// be what exercises it.
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    /// Conditions of the decision with no branch region in the
+    /// coverage record the join found (their span has none, or they
+    /// have no span). Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conditions_without_branch_region: Vec<String>,
 }
 
 impl CandidateSummary {
@@ -118,6 +123,7 @@ impl CandidateSummary {
                 _ => None,
             },
             note: None,
+            conditions_without_branch_region: join.conditions_without_branch_region.clone(),
         }
     }
 
@@ -133,6 +139,110 @@ impl CandidateSummary {
             _ => format!("`{name}`"),
         }
     }
+}
+
+/// The stderr explanation of an all-unobserved verdict, one line per
+/// element: what each group of candidates is and why it produced no
+/// observation.
+///
+/// An invoked candidate is blamed on Floyd's span correlation only
+/// when its record has branch regions for some of the decision's
+/// conditions and none at the span of another
+/// (`conditions_without_branch_region` non-empty). A record without
+/// any branch region for the decision is `no_branch_region`, not
+/// measurable, and is explained as such; an invoked candidate whose
+/// condition spans all have branch regions was entered but its
+/// decision never evaluated.
+fn all_unobserved_explanation(candidates: &[CandidateSummary]) -> Vec<String> {
+    let mut lines = vec![
+        "cargo-floyd: Floyd found decomposable boolean decisions in your code, but no \
+         test produced a usable observation for any of them."
+            .to_string(),
+    ];
+    let notes = |lines: &mut Vec<String>, group: &[&CandidateSummary]| {
+        for c in group {
+            if let Some(note) = &c.note {
+                lines.push(format!("    {}: {note}", c.label()));
+            }
+        }
+    };
+    let (drift, unevaluated): (Vec<&CandidateSummary>, Vec<&CandidateSummary>) = candidates
+        .iter()
+        .filter(|c| c.invoked)
+        .partition(|c| !c.conditions_without_branch_region.is_empty());
+    if !drift.is_empty() {
+        lines.push(format!(
+            "  {} candidate(s) WERE invoked at runtime, and their coverage record has \
+             branch regions for some of the decision's conditions but none at the span of \
+             others. This is most likely a Floyd correlation bug (rustc span drift); please \
+             file an issue with --format=json's `candidates` list.",
+            drift.len()
+        ));
+        for c in &drift {
+            let conds: Vec<String> = c
+                .conditions_without_branch_region
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect();
+            lines.push(format!(
+                "    {}: no branch region for {}",
+                c.label(),
+                conds.join(", ")
+            ));
+        }
+    }
+    if !unevaluated.is_empty() {
+        lines.push(format!(
+            "  {} candidate(s) WERE invoked at runtime, and coverage has a branch region \
+             for every condition of their decision, but no test that entered the function \
+             evaluated the decision (its branch counters are zero), or the counters are \
+             inconsistent with the decision.",
+            unevaluated.len()
+        ));
+        for c in &unevaluated {
+            lines.push(format!("    {}", c.label()));
+        }
+    }
+    let never: Vec<&CandidateSummary> = candidates
+        .iter()
+        .filter(|c| !c.invoked && c.not_measurable.is_none())
+        .collect();
+    if !never.is_empty() {
+        lines.push(format!(
+            "  {} candidate(s) were never invoked by any test — add a test that calls one \
+             of your top-level `pub fn` decisions, or verify which candidates were \
+             considered via --format=json's `candidates` list.",
+            never.len()
+        ));
+        notes(&mut lines, &never);
+    }
+    let not_measurable: Vec<&CandidateSummary> = candidates
+        .iter()
+        .filter(|c| c.not_measurable.is_some())
+        .collect();
+    if !not_measurable.is_empty() {
+        let mut reasons: std::collections::BTreeMap<&str, usize> = Default::default();
+        for nm in not_measurable
+            .iter()
+            .filter_map(|c| c.not_measurable.as_ref())
+        {
+            *reasons
+                .entry(summary::reason_label(&nm.reason))
+                .or_default() += 1;
+        }
+        let reasons: Vec<String> = reasons.iter().map(|(r, n)| format!("{r}: {n}")).collect();
+        lines.push(format!(
+            "  {} candidate(s) are not measurable by coverage ({}): code rustc does not \
+             instrument (such as derive output), code expanded from a dependency's macro, \
+             or decisions rustc emits no branch region for (such as a `match` on an enum). \
+             Whether their decision was evaluated is unknown, not a test gap. See \
+             `not_measurable` in --format=json's `candidates` list.",
+            not_measurable.len(),
+            reasons.join(", ")
+        ));
+        notes(&mut lines, &not_measurable);
+    }
+    lines
 }
 
 /// The note for a candidate that no test Floyd ran entered, when
@@ -948,15 +1058,6 @@ fn run_test_mode_cargo(
             ..CandidateSummary::new(&raw.prov, join)
         })
         .collect();
-    // The harness-free notes, printed under the never-invoked and
-    // not-measurable lines of the all-unobserved explanation.
-    let print_notes = |want: fn(&CandidateSummary) -> bool| {
-        for c in candidate_summaries.iter().filter(|c| want(c)) {
-            if let Some(note) = &c.note {
-                eprintln!("    {}: {note}", c.label());
-            }
-        }
-    };
     let candidates: Vec<selector::Candidate> = raw_candidates
         .into_iter()
         .zip(joins)
@@ -970,16 +1071,11 @@ fn run_test_mode_cargo(
             }
         })
         .collect();
-    let count_status = |want: fn(&CandidateSummary) -> bool| {
-        candidate_summaries.iter().filter(|c| want(c)).count()
-    };
-    let reached_count = count_status(|c| c.invoked);
     let not_measurable: Vec<&correlate::NotMeasurable> = candidate_summaries
         .iter()
         .filter_map(|c| c.not_measurable.as_ref())
         .collect();
-    let not_measurable_count = count_status(|c| c.not_measurable.is_some());
-    let unreached_count = candidate_summaries.len() - reached_count - not_measurable_count;
+    let not_measurable_count = not_measurable.len();
     let skipped_mirs: Vec<SkippedMir> = skipped_oversize_mirs
         .iter()
         .map(|(path, bytes)| SkippedMir {
@@ -1032,41 +1128,8 @@ fn run_test_mode_cargo(
     let chosen = match selector::pick_best(candidates) {
         selector::PickResult::Picked(c) => c,
         selector::PickResult::AllUnobserved => {
-            eprintln!(
-                "cargo-floyd: Floyd found decomposable boolean \
-                 decisions in your code, but no test produced a \
-                 usable observation for any of them."
-            );
-            if reached_count > 0 {
-                eprintln!(
-                    "  {reached_count} candidate(s) WERE invoked at \
-                     runtime, but Floyd's span-match could not join \
-                     them to a coverage branch region. This is most \
-                     likely a Floyd correlation bug (rustc span \
-                     drift under optimisation); please file an \
-                     issue with --format=json's provenance block."
-                );
-            }
-            if unreached_count > 0 {
-                eprintln!(
-                    "  {unreached_count} candidate(s) were never \
-                     invoked by any test — add a test that calls \
-                     one of your top-level `pub fn` decisions, or \
-                     verify which candidates were considered via \
-                     --format=json's `candidates` list."
-                );
-                print_notes(|c| !c.invoked && c.not_measurable.is_none());
-            }
-            if not_measurable_count > 0 {
-                eprintln!(
-                    "  {not_measurable_count} candidate(s) are not \
-                     measurable by coverage (code rustc does not \
-                     instrument, such as derive output, or code \
-                     expanded from a dependency's macro); whether \
-                     they ran is unknown, not a test gap. See \
-                     `not_measurable` in --format=json's `candidates` list."
-                );
-                print_notes(|c| c.not_measurable.is_some());
+            for line in all_unobserved_explanation(&candidate_summaries) {
+                eprintln!("{line}");
             }
             return emit_decline(RuntimeVerdict::AllUnobserved);
         }
@@ -1866,6 +1929,7 @@ mod tests {
                 observations: 0,
                 not_measurable: None,
                 note: Some("may be exercised by `wpt`".to_string()),
+                conditions_without_branch_region: Vec::new(),
             },
             CandidateSummary {
                 function_name: Some(
@@ -1885,6 +1949,7 @@ mod tests {
                     detail: "no coverage mapping".to_string(),
                 }),
                 note: None,
+                conditions_without_branch_region: Vec::new(),
             },
         ];
         let skipped = vec![SkippedMir {
@@ -1939,6 +2004,58 @@ mod tests {
             entered,
             conditions_without_branch_region: Vec::new(),
         }
+    }
+
+    fn cand_summary(
+        name: &str,
+        invoked: bool,
+        not_measurable: Option<correlate::NotMeasurableReason>,
+        missing: &[&str],
+    ) -> CandidateSummary {
+        CandidateSummary {
+            function_name: Some(name.to_string()),
+            display_name: Some(name.to_string()),
+            source_file: Some("src/lib.rs".to_string()),
+            line: Some(1),
+            invoked,
+            observations: 0,
+            not_measurable: not_measurable.map(|reason| correlate::NotMeasurable {
+                reason,
+                detail: String::new(),
+            }),
+            note: None,
+            conditions_without_branch_region: missing.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn correlation_bug_wording_needs_a_condition_missing_beside_present_ones() {
+        use correlate::NotMeasurableReason::NoBranchRegion;
+        let bug = "most likely a Floyd correlation bug";
+        // Invoked, every condition span has a branch region: the
+        // decision was never evaluated; not blamed on Floyd.
+        let text = all_unobserved_explanation(&[cand_summary("f", true, None, &[])]).join("\n");
+        assert!(!text.contains(bug), "{text}");
+        assert!(text.contains("no test that entered the function evaluated the decision"));
+        // No branch region for the decision at all: not measurable,
+        // named by reason.
+        let mut c = cand_summary("g", false, Some(NoBranchRegion), &["x"]);
+        c.note = Some("may be exercised by `wpt`".to_string());
+        let text = all_unobserved_explanation(&[c]).join("\n");
+        assert!(!text.contains(bug), "{text}");
+        assert!(text.contains("(no_branch_region: 1)"), "{text}");
+        assert!(
+            text.contains("    `g` (src/lib.rs:1): may be exercised by `wpt`"),
+            "{text}"
+        );
+        // One condition span missing from a record that has branch
+        // regions for the others: the only correlation-bug case.
+        let text = all_unobserved_explanation(&[cand_summary("h", true, None, &["b"])]).join("\n");
+        assert!(text.contains(bug), "{text}");
+        assert!(
+            text.contains("`h` (src/lib.rs:1): no branch region for `b`"),
+            "{text}"
+        );
     }
 
     #[test]
