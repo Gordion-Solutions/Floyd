@@ -23,14 +23,51 @@
 //! Phase 0 recovers arbitrarily-nested combinations of `&&`, `||`,
 //! and `!` from rustc-emitted MIR — anything that lowers to a CFG
 //! of `switchInt`-on-boolean blocks terminating at `const true /
-//! const false / copy <debug-named-local>` leaves. The remaining
+//! const false / copy <debug-named-local>` leaves. A copied leaf is a
+//! condition only when its local is declared `bool` (or, for a
+//! dereference copy, a reference or pointer to `bool`); see
+//! [`DeclineReason::NonBoolLeaf`]. The remaining
 //! handlers (`if let`, `match`, match guards, `?`) are stubs that
 //! graduate alongside their corpus patterns.
+
+use std::cell::Cell;
 
 use crate::mir::{
     BlockId, CompareOp, LocalId, MirBlock, MirFunction, MirStatement, MirTerminator, Operand,
 };
 use crate::Mir;
+
+/// Why the decomposer declined a function that has a `switchInt`.
+///
+/// Serialised in snake case (`unsupported_shape`, `non_bool_leaf`)
+/// as the `reason` of each `out_of_scope` entry in
+/// `cargo floyd test --format=json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclineReason {
+    /// The control flow does not match any decision shape the
+    /// engine's handlers recognise.
+    UnsupportedShape,
+    /// An arm's value is a debug-named local that is not `bool`
+    /// (for example `if sh == 0 { a } else { .. }` returning a
+    /// struct `a`). The value is not a Boolean condition, so the
+    /// arm, and with it the decision, is declined instead of
+    /// reporting the local as a condition.
+    NonBoolLeaf,
+}
+
+thread_local! {
+    /// Set when [`extract_terminal_value`] rejects a non-`bool` leaf
+    /// during the current [`try_decompose_from_block`] call. Read
+    /// only when that call declines, to report
+    /// [`DeclineReason::NonBoolLeaf`].
+    static NON_BOOL_LEAF_SEEN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Record that a leaf was declined because its local is not `bool`.
+fn note_non_bool_leaf() {
+    NON_BOOL_LEAF_SEEN.with(|seen| seen.set(true));
+}
 
 /// A set of per-decision condition trees recovered from a single
 /// translation unit's MIR.
@@ -206,6 +243,30 @@ pub fn decompose_from_block(f: &MirFunction, block_id: BlockId) -> Option<Node> 
         return None;
     }
     build_decision_from_block(block_id, f)
+}
+
+/// [`decompose_function`], with the reason when it declines.
+pub fn try_decompose_function(f: &MirFunction) -> Result<Node, DeclineReason> {
+    match f.blocks.first() {
+        Some(entry) => try_decompose_from_block(f, entry.id),
+        None => Err(DeclineReason::UnsupportedShape),
+    }
+}
+
+/// [`decompose_from_block`], with the reason when it declines.
+///
+/// The reason is [`DeclineReason::NonBoolLeaf`] when a leaf on the
+/// attempted decomposition was rejected because its local is not
+/// `bool`, otherwise [`DeclineReason::UnsupportedShape`].
+pub fn try_decompose_from_block(f: &MirFunction, block_id: BlockId) -> Result<Node, DeclineReason> {
+    NON_BOOL_LEAF_SEEN.with(|seen| seen.set(false));
+    let node = decompose_from_block(f, block_id);
+    let non_bool_leaf = NON_BOOL_LEAF_SEEN.with(|seen| seen.replace(false));
+    node.ok_or(if non_bool_leaf {
+        DeclineReason::NonBoolLeaf
+    } else {
+        DeclineReason::UnsupportedShape
+    })
 }
 
 /// Guard for the branch-taken-as-result lift: both arms of a
@@ -532,8 +593,9 @@ fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node>
 }
 
 /// Type of a local as declared in the function header or `let`
-/// declarations. Returns `None` for synthetic locals (return place,
-/// temporaries) that don't appear in either list.
+/// declarations. rustc declares every local it uses, the return
+/// place `_0` and temporaries included, so `None` means the local
+/// is not part of `f`.
 pub(crate) fn local_type(f: &MirFunction, local: LocalId) -> Option<&str> {
     f.args
         .iter()
@@ -545,6 +607,43 @@ pub(crate) fn local_type(f: &MirFunction, local: LocalId) -> Option<&str> {
                 .find(|l| l.local == local)
                 .map(|l| l.ty.as_str())
         })
+}
+
+/// Is the MIR type text `ty` exactly `bool`?
+fn is_bool_type(ty: &str) -> bool {
+    ty.trim() == "bool"
+}
+
+/// The pointee of a reference or raw-pointer type as MIR prints it
+/// (`&T`, `&mut T`, `&'a T`, `&'a mut T`, `*const T`, `*mut T`), or
+/// `None` for any other type. Only one level is removed, so the
+/// pointee of `&&bool` is `&bool`.
+fn pointee_type(ty: &str) -> Option<&str> {
+    let ty = ty.trim();
+    let pointee = if let Some(rest) = ty.strip_prefix('&') {
+        let rest = rest.trim_start();
+        let rest = match rest.strip_prefix('\'') {
+            Some(lifetime) => lifetime.split_once(' ')?.1,
+            None => rest,
+        };
+        rest.strip_prefix("mut ").unwrap_or(rest)
+    } else if let Some(rest) = ty.strip_prefix("*const ") {
+        rest
+    } else {
+        ty.strip_prefix("*mut ")?
+    };
+    Some(pointee.trim())
+}
+
+/// Does reading `local` (its pointee when `deref`) produce a `bool`?
+/// False when the local's type is not declared in `f`: a leaf of
+/// unknown type is never assumed to be Boolean.
+fn reads_bool(f: &MirFunction, local: LocalId, deref: bool) -> bool {
+    match local_type(f, local) {
+        Some(ty) if deref => pointee_type(ty).is_some_and(is_bool_type),
+        Some(ty) => is_bool_type(ty),
+        None => false,
+    }
 }
 
 /// Recover a literal `match` decision rooted at `block`.
@@ -1123,6 +1222,15 @@ const RETURN_PLACE: LocalId = 0;
 /// Writes to an intermediate local that flow out through a `goto`
 /// (`_6 = copy _2; goto -> bb7` with `bb7: _0 = Some(move _6)`)
 /// remain values.
+///
+/// A leaf read from a debug-named local (a copy, a dereference copy,
+/// a `Not`, a by-value closure capture) is a [`Node::Condition`]
+/// only when the value read is declared `bool`. Otherwise the block's
+/// value is not Boolean (`_0 = copy _1` with `_1: I256`, `_0 =
+/// Not(copy _2)` on an integer, a call result of type `u32`): the
+/// block yields `None`, so the arm and the decision decline, and the
+/// decline is recorded as [`DeclineReason::NonBoolLeaf`]. Comparisons
+/// produce `bool` by construction and need no check.
 fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
     // An assignment is a terminal value only if its destination
     // doesn't feed a `switchInt` — either this block's own terminator
@@ -1232,8 +1340,14 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
             MirStatement::AssignConstBool { dst, value, .. } if !feeds_switchint(*dst) => {
                 return Some(Node::Const { value: *value });
             }
-            MirStatement::AssignCopy { dst, src, .. } if !feeds_switchint(*dst) => {
+            MirStatement::AssignCopy {
+                dst, src, deref, ..
+            } if !feeds_switchint(*dst) => {
                 if let Some(name) = f.debug_names.get(src) {
+                    if !reads_bool(f, *src, *deref) {
+                        note_non_bool_leaf();
+                        return None;
+                    }
                     return Some(Node::Condition { name: name.clone() });
                 }
             }
@@ -1249,7 +1363,13 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
                 // inversion, per-test observations would display
                 // the Not's output under the raw-input name,
                 // confusing the reader.)
+                // On an integer, `Not` is bitwise complement, not a
+                // Boolean negation.
                 if let Some(name) = f.debug_names.get(src) {
+                    if !reads_bool(f, *src, false) {
+                        note_non_bool_leaf();
+                        return None;
+                    }
                     return Some(Node::Condition {
                         name: format!("!{name}"),
                     });
@@ -1275,6 +1395,10 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
                 // source-level name, so this dst is the terminal
                 // Condition leaf.
                 if let Some(name) = f.debug_names.get(dst) {
+                    if !reads_bool(f, *dst, false) {
+                        note_non_bool_leaf();
+                        return None;
+                    }
                     return Some(Node::Condition { name: name.clone() });
                 }
             }
@@ -3474,6 +3598,717 @@ fn check(_1: usize, _2: &[u8]) -> Vec<u8> {
         let mir = mir::parse_text(ASSERT_MSG_GUARD_MIR).expect("MIR parses");
         let f = &mir.functions[0];
         assert_eq!(decompose_function(f), None);
+    }
+
+    /// `cargo floyd test` MIR (rustc nightly 1.101, coverage flags,
+    /// comment-only lines stripped) for `fixed` 1.x
+    /// `src/int256.rs`:
+    ///
+    /// ```text
+    /// pub const fn shl_i256_max_128(a: I256, sh: u32) -> I256 {
+    ///     if sh == 0 {
+    ///         a
+    ///     } else if sh == 128 {
+    ///         I256 { lo: a.hi as u128, hi: a.hi >> 127 }
+    ///     } else {
+    ///         I256 {
+    ///             lo: (a.lo >> sh) | (a.hi << (128 - sh)) as u128,
+    ///             hi: a.hi >> sh,
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Both renderings rustc prints for a `const fn`: the runtime
+    /// body, then the `// MIR FOR CTFE` body. The `sh == 0` arm is
+    /// `_0 = copy _1` with `_1: int256::I256`.
+    const SHL_I256_MAX_128_MIR: &str = r#"
+fn shl_i256_max_128(_1: int256::I256, _2: u32) -> int256::I256 {
+    debug a => _1;                       // in scope 0 at src/int256.rs:211:31: 211:32
+    debug sh => _2;                      // in scope 0 at src/int256.rs:211:40: 211:42
+    let mut _0: int256::I256;            // return place in scope 0 at src/int256.rs:211:52: 211:56
+    let mut _3: bool;                    // in scope 0 at src/int256.rs:212:8: 212:15
+    let mut _4: bool;                    // in scope 0 at src/int256.rs:214:15: 214:24
+    let mut _5: u128;                    // in scope 0 at src/int256.rs:216:17: 216:29
+    let mut _6: i128;                    // in scope 0 at src/int256.rs:216:17: 216:21
+    let mut _7: i128;                    // in scope 0 at src/int256.rs:217:17: 217:28
+    let mut _8: i128;                    // in scope 0 at src/int256.rs:217:17: 217:21
+    let mut _9: u32;                     // in scope 0 at src/int256.rs:217:17: 217:28
+    let mut _10: bool;                   // in scope 0 at src/int256.rs:217:17: 217:28
+    let mut _11: u128;                   // in scope 0 at src/int256.rs:221:17: 221:60
+    let mut _12: u128;                   // in scope 0 at src/int256.rs:221:17: 221:29
+    let mut _13: u128;                   // in scope 0 at src/int256.rs:221:18: 221:22
+    let mut _14: bool;                   // in scope 0 at src/int256.rs:221:17: 221:29
+    let mut _15: u128;                   // in scope 0 at src/int256.rs:221:32: 221:60
+    let mut _16: i128;                   // in scope 0 at src/int256.rs:221:32: 221:52
+    let mut _17: i128;                   // in scope 0 at src/int256.rs:221:33: 221:37
+    let mut _18: u32;                    // in scope 0 at src/int256.rs:221:41: 221:51
+    let mut _19: (u32, bool);            // in scope 0 at src/int256.rs:221:41: 221:51
+    let mut _20: bool;                   // in scope 0 at src/int256.rs:221:32: 221:52
+    let mut _21: i128;                   // in scope 0 at src/int256.rs:222:17: 222:27
+    let mut _22: i128;                   // in scope 0 at src/int256.rs:222:17: 222:21
+    let mut _23: bool;                   // in scope 0 at src/int256.rs:222:17: 222:27
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/int256.rs:212:8: 212:15 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/int256.rs:214:15: 214:24 (#0)
+
+    coverage Code { bcb: bcb0 } => src/int256.rs:211:1: 211:56 (#0);
+    coverage Code { bcb: bcb0 } => src/int256.rs:212:8: 212:15 (#0);
+    coverage Code { bcb: bcb1 } => src/int256.rs:213:9: 213:10 (#0);
+    coverage Code { bcb: bcb3 } => src/int256.rs:214:15: 214:24 (#0);
+    coverage Code { bcb: bcb4 } => src/int256.rs:216:17: 216:29 (#0);
+    coverage Code { bcb: bcb4 } => src/int256.rs:215:9: 218:10 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:221:17: 221:29 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:221:33: 221:37 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:221:17: 221:60 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:220:9: 223:10 (#0);
+    coverage Code { bcb: bcb2 } => src/int256.rs:225:1: 225:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => src/int256.rs:212:8: 212:15 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb6 } => src/int256.rs:214:15: 214:24 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/int256.rs:212:8: 212:15
+        _3 = Eq(copy _2, const 0_u32);   // scope 0 at src/int256.rs:212:8: 212:15
+        switchInt(move _3) -> [0: bb2, otherwise: bb1]; // scope 0 at src/int256.rs:212:8: 212:15
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/int256.rs:212:5: 224:6
+        _0 = copy _1;                    // scope 0 at src/int256.rs:213:9: 213:10
+        goto -> bb11;                    // scope 0 at src/int256.rs:212:5: 224:6
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/int256.rs:214:15: 214:24
+        _4 = Eq(copy _2, const 128_u32); // scope 0 at src/int256.rs:214:15: 214:24
+        switchInt(move _4) -> [0: bb4, otherwise: bb3]; // scope 0 at src/int256.rs:214:15: 214:24
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at src/int256.rs:217:17: 217:28
+        _6 = copy (_1.1: i128);          // scope 0 at src/int256.rs:216:17: 216:21
+        _5 = move _6 as u128 (IntToInt); // scope 0 at src/int256.rs:216:17: 216:29
+        _8 = copy (_1.1: i128);          // scope 0 at src/int256.rs:217:17: 217:21
+        _9 = const 127_i32 as u32 (IntToInt); // scope 0 at src/int256.rs:217:17: 217:28
+        _10 = Lt(move _9, const 128_u32); // scope 0 at src/int256.rs:217:17: 217:28
+        assert(move _10, "attempt to shift right by `{}`, which would overflow", const 127_i32) -> [success: bb5, unwind continue]; // scope 0 at src/int256.rs:217:17: 217:28
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at src/int256.rs:221:17: 221:29
+        _13 = copy (_1.0: u128);         // scope 0 at src/int256.rs:221:18: 221:22
+        _14 = Lt(copy _2, const 128_u32); // scope 0 at src/int256.rs:221:17: 221:29
+        assert(move _14, "attempt to shift right by `{}`, which would overflow", copy _2) -> [success: bb6, unwind continue]; // scope 0 at src/int256.rs:221:17: 221:29
+    }
+
+    bb5: {
+        _7 = Shr(move _8, const 127_i32); // scope 0 at src/int256.rs:217:17: 217:28
+        _0 = int256::I256 { lo: move _5, hi: move _7 }; // scope 0 at src/int256.rs:215:9: 218:10
+        goto -> bb10;                    // scope 0 at src/int256.rs:214:12: 224:6
+    }
+
+    bb6: {
+        _12 = Shr(move _13, copy _2);    // scope 0 at src/int256.rs:221:17: 221:29
+        _17 = copy (_1.1: i128);         // scope 0 at src/int256.rs:221:33: 221:37
+        _19 = SubWithOverflow(const 128_u32, copy _2); // scope 0 at src/int256.rs:221:41: 221:51
+        assert(!move (_19.1: bool), "attempt to compute `{} - {}`, which would overflow", const 128_u32, copy _2) -> [success: bb7, unwind continue]; // scope 0 at src/int256.rs:221:41: 221:51
+    }
+
+    bb7: {
+        _18 = move (_19.0: u32);         // scope 0 at src/int256.rs:221:41: 221:51
+        _20 = Lt(copy _18, const 128_u32); // scope 0 at src/int256.rs:221:32: 221:52
+        assert(move _20, "attempt to shift left by `{}`, which would overflow", copy _18) -> [success: bb8, unwind continue]; // scope 0 at src/int256.rs:221:32: 221:52
+    }
+
+    bb8: {
+        _16 = Shl(move _17, move _18);   // scope 0 at src/int256.rs:221:32: 221:52
+        _15 = move _16 as u128 (IntToInt); // scope 0 at src/int256.rs:221:32: 221:60
+        _11 = BitOr(move _12, move _15); // scope 0 at src/int256.rs:221:17: 221:60
+        _22 = copy (_1.1: i128);         // scope 0 at src/int256.rs:222:17: 222:21
+        _23 = Lt(copy _2, const 128_u32); // scope 0 at src/int256.rs:222:17: 222:27
+        assert(move _23, "attempt to shift right by `{}`, which would overflow", copy _2) -> [success: bb9, unwind continue]; // scope 0 at src/int256.rs:222:17: 222:27
+    }
+
+    bb9: {
+        _21 = Shr(move _22, copy _2);    // scope 0 at src/int256.rs:222:17: 222:27
+        _0 = int256::I256 { lo: move _11, hi: move _21 }; // scope 0 at src/int256.rs:220:9: 223:10
+        goto -> bb10;                    // scope 0 at src/int256.rs:214:12: 224:6
+    }
+
+    bb10: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/int256.rs:212:5: 224:6
+        goto -> bb11;                    // scope 0 at src/int256.rs:212:5: 224:6
+    }
+
+    bb11: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/int256.rs:225:2: 225:2
+        return;                          // scope 0 at src/int256.rs:225:2: 225:2
+    }
+}
+fn shl_i256_max_128(_1: int256::I256, _2: u32) -> int256::I256 {
+    debug a => _1;                       // in scope 0 at src/int256.rs:211:31: 211:32
+    debug sh => _2;                      // in scope 0 at src/int256.rs:211:40: 211:42
+    let mut _0: int256::I256;            // return place in scope 0 at src/int256.rs:211:52: 211:56
+    let mut _3: bool;                    // in scope 0 at src/int256.rs:212:8: 212:15
+    let mut _4: u32;                     // in scope 0 at src/int256.rs:212:8: 212:10
+    let mut _5: bool;                    // in scope 0 at src/int256.rs:214:15: 214:24
+    let mut _6: u32;                     // in scope 0 at src/int256.rs:214:15: 214:17
+    let mut _7: u128;                    // in scope 0 at src/int256.rs:216:17: 216:29
+    let mut _8: i128;                    // in scope 0 at src/int256.rs:216:17: 216:21
+    let mut _9: i128;                    // in scope 0 at src/int256.rs:217:17: 217:28
+    let mut _10: i128;                   // in scope 0 at src/int256.rs:217:17: 217:21
+    let mut _11: u32;                    // in scope 0 at src/int256.rs:217:17: 217:28
+    let mut _12: bool;                   // in scope 0 at src/int256.rs:217:17: 217:28
+    let mut _13: u128;                   // in scope 0 at src/int256.rs:221:17: 221:60
+    let mut _14: u128;                   // in scope 0 at src/int256.rs:221:17: 221:29
+    let mut _15: u128;                   // in scope 0 at src/int256.rs:221:18: 221:22
+    let mut _16: u32;                    // in scope 0 at src/int256.rs:221:26: 221:28
+    let mut _17: bool;                   // in scope 0 at src/int256.rs:221:17: 221:29
+    let mut _18: u128;                   // in scope 0 at src/int256.rs:221:32: 221:60
+    let mut _19: i128;                   // in scope 0 at src/int256.rs:221:32: 221:52
+    let mut _20: i128;                   // in scope 0 at src/int256.rs:221:33: 221:37
+    let mut _21: u32;                    // in scope 0 at src/int256.rs:221:41: 221:51
+    let mut _22: u32;                    // in scope 0 at src/int256.rs:221:48: 221:50
+    let mut _23: (u32, bool);            // in scope 0 at src/int256.rs:221:41: 221:51
+    let mut _24: bool;                   // in scope 0 at src/int256.rs:221:32: 221:52
+    let mut _25: i128;                   // in scope 0 at src/int256.rs:222:17: 222:27
+    let mut _26: i128;                   // in scope 0 at src/int256.rs:222:17: 222:21
+    let mut _27: u32;                    // in scope 0 at src/int256.rs:222:25: 222:27
+    let mut _28: bool;                   // in scope 0 at src/int256.rs:222:17: 222:27
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/int256.rs:212:8: 212:15 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/int256.rs:214:15: 214:24 (#0)
+
+    coverage Code { bcb: bcb0 } => src/int256.rs:211:1: 211:56 (#0);
+    coverage Code { bcb: bcb0 } => src/int256.rs:212:8: 212:15 (#0);
+    coverage Code { bcb: bcb1 } => src/int256.rs:213:9: 213:10 (#0);
+    coverage Code { bcb: bcb3 } => src/int256.rs:214:15: 214:24 (#0);
+    coverage Code { bcb: bcb4 } => src/int256.rs:216:17: 216:29 (#0);
+    coverage Code { bcb: bcb4 } => src/int256.rs:215:9: 218:10 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:221:17: 221:29 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:221:33: 221:37 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:221:17: 221:60 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:220:9: 223:10 (#0);
+    coverage Code { bcb: bcb2 } => src/int256.rs:225:1: 225:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => src/int256.rs:212:8: 212:15 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb6 } => src/int256.rs:214:15: 214:24 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/int256.rs:212:8: 212:15
+        StorageLive(_3);                 // scope 0 at src/int256.rs:212:8: 212:15
+        StorageLive(_4);                 // scope 0 at src/int256.rs:212:8: 212:10
+        _4 = copy _2;                    // scope 0 at src/int256.rs:212:8: 212:10
+        _3 = Eq(move _4, const 0_u32);   // scope 0 at src/int256.rs:212:8: 212:15
+        switchInt(move _3) -> [0: bb2, otherwise: bb1]; // scope 0 at src/int256.rs:212:8: 212:15
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/int256.rs:212:5: 224:6
+        StorageDead(_4);                 // scope 0 at src/int256.rs:212:14: 212:15
+        _0 = copy _1;                    // scope 0 at src/int256.rs:213:9: 213:10
+        goto -> bb11;                    // scope 0 at src/int256.rs:212:5: 224:6
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/int256.rs:214:15: 214:24
+        StorageDead(_4);                 // scope 0 at src/int256.rs:212:14: 212:15
+        StorageLive(_5);                 // scope 0 at src/int256.rs:214:15: 214:24
+        StorageLive(_6);                 // scope 0 at src/int256.rs:214:15: 214:17
+        _6 = copy _2;                    // scope 0 at src/int256.rs:214:15: 214:17
+        _5 = Eq(move _6, const 128_u32); // scope 0 at src/int256.rs:214:15: 214:24
+        switchInt(move _5) -> [0: bb4, otherwise: bb3]; // scope 0 at src/int256.rs:214:15: 214:24
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at src/int256.rs:217:17: 217:28
+        StorageDead(_6);                 // scope 0 at src/int256.rs:214:23: 214:24
+        StorageLive(_7);                 // scope 0 at src/int256.rs:216:17: 216:29
+        StorageLive(_8);                 // scope 0 at src/int256.rs:216:17: 216:21
+        _8 = copy (_1.1: i128);          // scope 0 at src/int256.rs:216:17: 216:21
+        _7 = move _8 as u128 (IntToInt); // scope 0 at src/int256.rs:216:17: 216:29
+        StorageDead(_8);                 // scope 0 at src/int256.rs:216:28: 216:29
+        StorageLive(_9);                 // scope 0 at src/int256.rs:217:17: 217:28
+        StorageLive(_10);                // scope 0 at src/int256.rs:217:17: 217:21
+        _10 = copy (_1.1: i128);         // scope 0 at src/int256.rs:217:17: 217:21
+        _11 = const 127_i32 as u32 (IntToInt); // scope 0 at src/int256.rs:217:17: 217:28
+        _12 = Lt(move _11, const 128_u32); // scope 0 at src/int256.rs:217:17: 217:28
+        assert(move _12, "attempt to shift right by `{}`, which would overflow", const 127_i32) -> [success: bb5, unwind continue]; // scope 0 at src/int256.rs:217:17: 217:28
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at src/int256.rs:221:17: 221:29
+        StorageDead(_6);                 // scope 0 at src/int256.rs:214:23: 214:24
+        StorageLive(_13);                // scope 0 at src/int256.rs:221:17: 221:60
+        StorageLive(_14);                // scope 0 at src/int256.rs:221:17: 221:29
+        StorageLive(_15);                // scope 0 at src/int256.rs:221:18: 221:22
+        _15 = copy (_1.0: u128);         // scope 0 at src/int256.rs:221:18: 221:22
+        StorageLive(_16);                // scope 0 at src/int256.rs:221:26: 221:28
+        _16 = copy _2;                   // scope 0 at src/int256.rs:221:26: 221:28
+        _17 = Lt(copy _16, const 128_u32); // scope 0 at src/int256.rs:221:17: 221:29
+        assert(move _17, "attempt to shift right by `{}`, which would overflow", copy _16) -> [success: bb6, unwind continue]; // scope 0 at src/int256.rs:221:17: 221:29
+    }
+
+    bb5: {
+        _9 = Shr(move _10, const 127_i32); // scope 0 at src/int256.rs:217:17: 217:28
+        StorageDead(_10);                // scope 0 at src/int256.rs:217:27: 217:28
+        _0 = int256::I256 { lo: move _7, hi: move _9 }; // scope 0 at src/int256.rs:215:9: 218:10
+        StorageDead(_9);                 // scope 0 at src/int256.rs:218:9: 218:10
+        StorageDead(_7);                 // scope 0 at src/int256.rs:218:9: 218:10
+        goto -> bb10;                    // scope 0 at src/int256.rs:214:12: 224:6
+    }
+
+    bb6: {
+        _14 = Shr(move _15, move _16);   // scope 0 at src/int256.rs:221:17: 221:29
+        StorageDead(_16);                // scope 0 at src/int256.rs:221:28: 221:29
+        StorageDead(_15);                // scope 0 at src/int256.rs:221:28: 221:29
+        StorageLive(_18);                // scope 0 at src/int256.rs:221:32: 221:60
+        StorageLive(_19);                // scope 0 at src/int256.rs:221:32: 221:52
+        StorageLive(_20);                // scope 0 at src/int256.rs:221:33: 221:37
+        _20 = copy (_1.1: i128);         // scope 0 at src/int256.rs:221:33: 221:37
+        StorageLive(_21);                // scope 0 at src/int256.rs:221:41: 221:51
+        StorageLive(_22);                // scope 0 at src/int256.rs:221:48: 221:50
+        _22 = copy _2;                   // scope 0 at src/int256.rs:221:48: 221:50
+        _23 = SubWithOverflow(const 128_u32, copy _22); // scope 0 at src/int256.rs:221:41: 221:51
+        assert(!move (_23.1: bool), "attempt to compute `{} - {}`, which would overflow", const 128_u32, move _22) -> [success: bb7, unwind continue]; // scope 0 at src/int256.rs:221:41: 221:51
+    }
+
+    bb7: {
+        _21 = move (_23.0: u32);         // scope 0 at src/int256.rs:221:41: 221:51
+        StorageDead(_22);                // scope 0 at src/int256.rs:221:50: 221:51
+        _24 = Lt(copy _21, const 128_u32); // scope 0 at src/int256.rs:221:32: 221:52
+        assert(move _24, "attempt to shift left by `{}`, which would overflow", copy _21) -> [success: bb8, unwind continue]; // scope 0 at src/int256.rs:221:32: 221:52
+    }
+
+    bb8: {
+        _19 = Shl(move _20, move _21);   // scope 0 at src/int256.rs:221:32: 221:52
+        StorageDead(_21);                // scope 0 at src/int256.rs:221:51: 221:52
+        StorageDead(_20);                // scope 0 at src/int256.rs:221:51: 221:52
+        _18 = move _19 as u128 (IntToInt); // scope 0 at src/int256.rs:221:32: 221:60
+        StorageDead(_19);                // scope 0 at src/int256.rs:221:59: 221:60
+        _13 = BitOr(move _14, move _18); // scope 0 at src/int256.rs:221:17: 221:60
+        StorageDead(_18);                // scope 0 at src/int256.rs:221:59: 221:60
+        StorageDead(_14);                // scope 0 at src/int256.rs:221:59: 221:60
+        StorageLive(_25);                // scope 0 at src/int256.rs:222:17: 222:27
+        StorageLive(_26);                // scope 0 at src/int256.rs:222:17: 222:21
+        _26 = copy (_1.1: i128);         // scope 0 at src/int256.rs:222:17: 222:21
+        StorageLive(_27);                // scope 0 at src/int256.rs:222:25: 222:27
+        _27 = copy _2;                   // scope 0 at src/int256.rs:222:25: 222:27
+        _28 = Lt(copy _27, const 128_u32); // scope 0 at src/int256.rs:222:17: 222:27
+        assert(move _28, "attempt to shift right by `{}`, which would overflow", copy _27) -> [success: bb9, unwind continue]; // scope 0 at src/int256.rs:222:17: 222:27
+    }
+
+    bb9: {
+        _25 = Shr(move _26, move _27);   // scope 0 at src/int256.rs:222:17: 222:27
+        StorageDead(_27);                // scope 0 at src/int256.rs:222:26: 222:27
+        StorageDead(_26);                // scope 0 at src/int256.rs:222:26: 222:27
+        _0 = int256::I256 { lo: move _13, hi: move _25 }; // scope 0 at src/int256.rs:220:9: 223:10
+        StorageDead(_25);                // scope 0 at src/int256.rs:223:9: 223:10
+        StorageDead(_13);                // scope 0 at src/int256.rs:223:9: 223:10
+        goto -> bb10;                    // scope 0 at src/int256.rs:214:12: 224:6
+    }
+
+    bb10: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/int256.rs:212:5: 224:6
+        StorageDead(_5);                 // scope 0 at src/int256.rs:224:5: 224:6
+        goto -> bb11;                    // scope 0 at src/int256.rs:212:5: 224:6
+    }
+
+    bb11: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/int256.rs:225:2: 225:2
+        StorageDead(_3);                 // scope 0 at src/int256.rs:224:5: 224:6
+        return;                          // scope 0 at src/int256.rs:225:2: 225:2
+    }
+}
+"#;
+
+    #[test]
+    fn non_bool_copy_leaf_declines_shl_i256_max_128() {
+        let mir = mir::parse_text(SHL_I256_MAX_128_MIR).expect("MIR parses");
+        assert_eq!(mir.functions.len(), 2, "runtime and CTFE bodies");
+        for f in &mir.functions {
+            assert_eq!(local_type(f, 1), Some("int256::I256"));
+            assert_eq!(local_type(f, 0), Some("int256::I256"));
+            // Not the spurious 3-condition `a`, `sh == 0`, `sh == 128`.
+            assert_eq!(decompose_function(f), None);
+            assert_eq!(try_decompose_function(f), Err(DeclineReason::NonBoolLeaf));
+        }
+    }
+
+    /// Same toolchain and flags as [`SHL_I256_MAX_128_MIR`] (plain
+    /// `rustc --crate-type=lib`, comment-only lines stripped) for
+    ///
+    /// ```text
+    /// #[inline(never)]
+    /// pub fn helper(x: u32) -> u32 { x.rotate_left(3) }
+    /// #[inline(never)]
+    /// pub fn is_even(x: u32) -> bool { x % 2 == 0 }
+    /// pub fn sel(c: bool, a: bool) -> bool { if c { a } else { false } }
+    /// pub fn both(a: &bool, b: bool) -> bool { b && *a }
+    /// pub fn pick_ref(a: &u8, b: &u8, c: bool) -> u8 { if c { *a } else { *b } }
+    /// pub fn call_u32(c: bool, x: u32) -> u32 { let v = helper(x); if c { v } else { x } }
+    /// pub fn call_bool(c: bool, x: u32) -> bool { let v = is_even(x); if c { v } else { false } }
+    /// pub fn not_u32(c: bool, x: u32) -> u32 { if c { !x } else { x } }
+    /// ```
+    const LEAF_TYPES_MIR: &str = r#"
+fn sel(_1: bool, _2: bool) -> bool {
+    debug c => _1;                       // in scope 0 at leaf.rs:5:12: 5:13
+    debug a => _2;                       // in scope 0 at leaf.rs:5:21: 5:22
+    let mut _0: bool;                    // return place in scope 0 at leaf.rs:5:33: 5:37
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => leaf.rs:5:43: 5:44 (#0)
+
+    coverage Code { bcb: bcb0 } => leaf.rs:5:1: 5:37 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:5:43: 5:44 (#0);
+    coverage Code { bcb: bcb1 } => leaf.rs:5:47: 5:48 (#0);
+    coverage Code { bcb: bcb3 } => leaf.rs:5:58: 5:63 (#0);
+    coverage Code { bcb: bcb2 } => leaf.rs:5:66: 5:67 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => leaf.rs:5:43: 5:44 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at leaf.rs:5:43: 5:44
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 0 at leaf.rs:5:43: 5:44
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at leaf.rs:5:40: 5:65
+        _0 = copy _2;                    // scope 0 at leaf.rs:5:47: 5:48
+        goto -> bb3;                     // scope 0 at leaf.rs:5:40: 5:65
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at leaf.rs:5:40: 5:65
+        _0 = const false;                // scope 0 at leaf.rs:5:58: 5:63
+        goto -> bb3;                     // scope 0 at leaf.rs:5:40: 5:65
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at leaf.rs:5:67: 5:67
+        return;                          // scope 0 at leaf.rs:5:67: 5:67
+    }
+}
+
+fn both(_1: &bool, _2: bool) -> bool {
+    debug a => _1;                       // in scope 0 at leaf.rs:6:13: 6:14
+    debug b => _2;                       // in scope 0 at leaf.rs:6:23: 6:24
+    let mut _0: bool;                    // return place in scope 0 at leaf.rs:6:35: 6:39
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => leaf.rs:6:42: 6:43 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => leaf.rs:6:47: 6:49 (#0)
+
+    coverage Code { bcb: bcb0 } => leaf.rs:6:1: 6:39 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:6:42: 6:43 (#0);
+    coverage Code { bcb: bcb1 } => leaf.rs:6:47: 6:49 (#0);
+    coverage Code { bcb: bcb3 } => leaf.rs:6:50: 6:51 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb5 } => leaf.rs:6:42: 6:43 (#0);
+    coverage Branch { true_bcb: bcb2, false_bcb: bcb4 } => leaf.rs:6:47: 6:49 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at leaf.rs:6:42: 6:43
+        switchInt(copy _2) -> [0: bb2, otherwise: bb1]; // scope 0 at leaf.rs:6:42: 6:43
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at leaf.rs:6:47: 6:49
+        _0 = copy (*_1);                 // scope 0 at leaf.rs:6:47: 6:49
+        switchInt(copy _0) -> [0: bb4, otherwise: bb3]; // scope 0 at leaf.rs:6:47: 6:49
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at leaf.rs:6:42: 6:49
+        _0 = const false;                // scope 0 at leaf.rs:6:42: 6:49
+        goto -> bb5;                     // scope 0 at leaf.rs:6:42: 6:49
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at leaf.rs:6:47: 6:49
+        goto -> bb5;                     // scope 0 at leaf.rs:6:47: 6:49
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at leaf.rs:6:47: 6:49
+        goto -> bb5;                     // scope 0 at leaf.rs:6:47: 6:49
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at leaf.rs:6:51: 6:51
+        return;                          // scope 0 at leaf.rs:6:51: 6:51
+    }
+}
+
+fn pick_ref(_1: &u8, _2: &u8, _3: bool) -> u8 {
+    debug a => _1;                       // in scope 0 at leaf.rs:7:17: 7:18
+    debug b => _2;                       // in scope 0 at leaf.rs:7:25: 7:26
+    debug c => _3;                       // in scope 0 at leaf.rs:7:33: 7:34
+    let mut _0: u8;                      // return place in scope 0 at leaf.rs:7:45: 7:47
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => leaf.rs:7:53: 7:54 (#0)
+
+    coverage Code { bcb: bcb0 } => leaf.rs:7:1: 7:47 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:7:53: 7:54 (#0);
+    coverage Code { bcb: bcb1 } => leaf.rs:7:57: 7:59 (#0);
+    coverage Code { bcb: bcb3 } => leaf.rs:7:69: 7:71 (#0);
+    coverage Code { bcb: bcb2 } => leaf.rs:7:74: 7:75 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => leaf.rs:7:53: 7:54 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at leaf.rs:7:53: 7:54
+        switchInt(copy _3) -> [0: bb2, otherwise: bb1]; // scope 0 at leaf.rs:7:53: 7:54
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at leaf.rs:7:50: 7:73
+        _0 = copy (*_1);                 // scope 0 at leaf.rs:7:57: 7:59
+        goto -> bb3;                     // scope 0 at leaf.rs:7:50: 7:73
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at leaf.rs:7:50: 7:73
+        _0 = copy (*_2);                 // scope 0 at leaf.rs:7:69: 7:71
+        goto -> bb3;                     // scope 0 at leaf.rs:7:50: 7:73
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at leaf.rs:7:75: 7:75
+        return;                          // scope 0 at leaf.rs:7:75: 7:75
+    }
+}
+
+fn call_u32(_1: bool, _2: u32) -> u32 {
+    debug c => _1;                       // in scope 0 at leaf.rs:8:17: 8:18
+    debug x => _2;                       // in scope 0 at leaf.rs:8:26: 8:27
+    let mut _0: u32;                     // return place in scope 0 at leaf.rs:8:37: 8:40
+    let _3: u32;                         // in scope 0 at leaf.rs:8:47: 8:48
+    scope 1 {
+        debug v => _3;                   // in scope 1 at leaf.rs:8:47: 8:48
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => leaf.rs:8:65: 8:66 (#0)
+
+    coverage Code { bcb: bcb0 } => leaf.rs:8:1: 8:40 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:8:51: 8:60 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:8:65: 8:66 (#0);
+    coverage Code { bcb: bcb1 } => leaf.rs:8:69: 8:70 (#0);
+    coverage Code { bcb: bcb3 } => leaf.rs:8:80: 8:81 (#0);
+    coverage Code { bcb: bcb2 } => leaf.rs:8:84: 8:85 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => leaf.rs:8:65: 8:66 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at leaf.rs:8:51: 8:60
+        _3 = helper(copy _2) -> [return: bb1, unwind continue]; // scope 0 at leaf.rs:8:51: 8:60
+    }
+
+    bb1: {
+        switchInt(copy _1) -> [0: bb3, otherwise: bb2]; // scope 1 at leaf.rs:8:65: 8:66
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb1);  // scope 1 at leaf.rs:8:62: 8:83
+        _0 = copy _3;                    // scope 1 at leaf.rs:8:69: 8:70
+        goto -> bb4;                     // scope 1 at leaf.rs:8:62: 8:83
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb3);  // scope 1 at leaf.rs:8:62: 8:83
+        _0 = copy _2;                    // scope 1 at leaf.rs:8:80: 8:81
+        goto -> bb4;                     // scope 1 at leaf.rs:8:62: 8:83
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at leaf.rs:8:85: 8:85
+        return;                          // scope 0 at leaf.rs:8:85: 8:85
+    }
+}
+
+fn call_bool(_1: bool, _2: u32) -> bool {
+    debug c => _1;                       // in scope 0 at leaf.rs:9:18: 9:19
+    debug x => _2;                       // in scope 0 at leaf.rs:9:27: 9:28
+    let mut _0: bool;                    // return place in scope 0 at leaf.rs:9:38: 9:42
+    let _3: bool;                        // in scope 0 at leaf.rs:9:49: 9:50
+    scope 1 {
+        debug v => _3;                   // in scope 1 at leaf.rs:9:49: 9:50
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => leaf.rs:9:68: 9:69 (#0)
+
+    coverage Code { bcb: bcb0 } => leaf.rs:9:1: 9:42 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:9:53: 9:63 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:9:68: 9:69 (#0);
+    coverage Code { bcb: bcb1 } => leaf.rs:9:72: 9:73 (#0);
+    coverage Code { bcb: bcb3 } => leaf.rs:9:83: 9:88 (#0);
+    coverage Code { bcb: bcb2 } => leaf.rs:9:91: 9:92 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => leaf.rs:9:68: 9:69 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at leaf.rs:9:53: 9:63
+        _3 = is_even(copy _2) -> [return: bb1, unwind continue]; // scope 0 at leaf.rs:9:53: 9:63
+    }
+
+    bb1: {
+        switchInt(copy _1) -> [0: bb3, otherwise: bb2]; // scope 1 at leaf.rs:9:68: 9:69
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb1);  // scope 1 at leaf.rs:9:65: 9:90
+        _0 = copy _3;                    // scope 1 at leaf.rs:9:72: 9:73
+        goto -> bb4;                     // scope 1 at leaf.rs:9:65: 9:90
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb3);  // scope 1 at leaf.rs:9:65: 9:90
+        _0 = const false;                // scope 1 at leaf.rs:9:83: 9:88
+        goto -> bb4;                     // scope 1 at leaf.rs:9:65: 9:90
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at leaf.rs:9:92: 9:92
+        return;                          // scope 0 at leaf.rs:9:92: 9:92
+    }
+}
+
+fn not_u32(_1: bool, _2: u32) -> u32 {
+    debug c => _1;                       // in scope 0 at leaf.rs:10:16: 10:17
+    debug x => _2;                       // in scope 0 at leaf.rs:10:25: 10:26
+    let mut _0: u32;                     // return place in scope 0 at leaf.rs:10:36: 10:39
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => leaf.rs:10:45: 10:46 (#0)
+
+    coverage Code { bcb: bcb0 } => leaf.rs:10:1: 10:39 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:10:45: 10:46 (#0);
+    coverage Code { bcb: bcb1 } => leaf.rs:10:49: 10:51 (#0);
+    coverage Code { bcb: bcb3 } => leaf.rs:10:61: 10:62 (#0);
+    coverage Code { bcb: bcb2 } => leaf.rs:10:65: 10:66 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => leaf.rs:10:45: 10:46 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at leaf.rs:10:45: 10:46
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 0 at leaf.rs:10:45: 10:46
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at leaf.rs:10:42: 10:64
+        _0 = Not(copy _2);               // scope 0 at leaf.rs:10:49: 10:51
+        goto -> bb3;                     // scope 0 at leaf.rs:10:42: 10:64
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at leaf.rs:10:42: 10:64
+        _0 = copy _2;                    // scope 0 at leaf.rs:10:61: 10:62
+        goto -> bb3;                     // scope 0 at leaf.rs:10:42: 10:64
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at leaf.rs:10:66: 10:66
+        return;                          // scope 0 at leaf.rs:10:66: 10:66
+    }
+}
+"#;
+
+    fn leaf_fn<'a>(mir: &'a Mir, name: &str) -> &'a MirFunction {
+        mir.functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("fixture has `{name}`"))
+    }
+
+    #[test]
+    fn bool_copy_leaf_is_a_condition() {
+        let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "sel");
+        assert_eq!(
+            try_decompose_function(f),
+            Ok(ite("c", cond("a"), const_(false)))
+        );
+    }
+
+    #[test]
+    fn deref_bool_copy_leaf_is_a_condition() {
+        // `b && *a` with `a: &bool`: the leaf is `_0 = copy (*_1)`.
+        let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "both");
+        assert!(matches!(
+            f.blocks[1].statements[1],
+            MirStatement::AssignCopy {
+                dst: 0,
+                src: 1,
+                deref: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            try_decompose_function(f),
+            Ok(ite("b", cond("a"), const_(false)))
+        );
+    }
+
+    #[test]
+    fn deref_non_bool_copy_leaf_declines() {
+        // `if c { *a } else { *b }` with `a, b: &u8`.
+        let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "pick_ref");
+        assert_eq!(try_decompose_function(f), Err(DeclineReason::NonBoolLeaf));
+    }
+
+    #[test]
+    fn call_result_leaf_is_typed_by_its_destination_local() {
+        // `let v = helper(x)` (`-> u32`) then `if c { v } else { x }`.
+        // bb0 is the call; the decision is rooted at bb1.
+        let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "call_u32");
+        assert_eq!(local_type(f, 3), Some("u32"));
+        assert_eq!(decompose_from_block(f, 2), None, "`v` arm is not a leaf");
+        assert_eq!(
+            try_decompose_from_block(f, 1),
+            Err(DeclineReason::NonBoolLeaf)
+        );
+
+        // `let v = is_even(x)` (`-> bool`): the same shape decomposes.
+        let f = leaf_fn(&mir, "call_bool");
+        assert_eq!(local_type(f, 3), Some("bool"));
+        assert_eq!(
+            try_decompose_from_block(f, 1),
+            Ok(ite("c", cond("v"), const_(false)))
+        );
+    }
+
+    #[test]
+    fn not_of_integer_leaf_declines() {
+        // `if c { !x } else { x }` with `x: u32`: bitwise complement.
+        let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "not_u32");
+        assert!(matches!(
+            f.blocks[1].statements[1],
+            MirStatement::AssignUnaryNot { dst: 0, src: 2, .. }
+        ));
+        assert_eq!(try_decompose_function(f), Err(DeclineReason::NonBoolLeaf));
+    }
+
+    #[test]
+    fn other_declines_report_unsupported_shape() {
+        let mir = mir::parse_text(DEBUG_ASSERT_GUARD_MIR).expect("MIR parses");
+        assert_eq!(
+            try_decompose_function(&mir.functions[0]),
+            Err(DeclineReason::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn leaf_type_check_reads_declared_types_only() {
+        assert_eq!(pointee_type("&bool"), Some("bool"));
+        assert_eq!(pointee_type("&mut bool"), Some("bool"));
+        assert_eq!(pointee_type("&'a bool"), Some("bool"));
+        assert_eq!(pointee_type("&'a mut bool"), Some("bool"));
+        assert_eq!(pointee_type("*const bool"), Some("bool"));
+        assert_eq!(pointee_type("*mut bool"), Some("bool"));
+        assert_eq!(pointee_type("&&bool"), Some("&bool"));
+        assert_eq!(pointee_type("bool"), None);
+        assert_eq!(pointee_type("Box<bool>"), None);
+
+        // A local the function does not declare is never assumed bool.
+        let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "sel");
+        assert!(reads_bool(f, 2, false));
+        assert!(!reads_bool(f, 2, true));
+        assert!(!reads_bool(f, 99, false));
     }
 
     #[test]
