@@ -31,8 +31,10 @@ use floyd::runner;
 
 mod harness;
 mod selector;
+mod summary;
 use std::path::Path;
 use std::process::ExitCode;
+use summary::CoverageSummary;
 
 /// How runtime mode resolved candidate selection. Carried in the
 /// JSON report so a consumer can tell a real verdict apart from the
@@ -138,6 +140,9 @@ struct CargoRuntimeReport<'a> {
     observations: &'a [ConditionObservation],
     /// `None` unless `verdict` is `analysed`.
     analysis: Option<&'a RuntimeAnalysis>,
+    /// Condition counts for the analysed decision and the
+    /// percentage, `null` whenever a condition is unknown.
+    summary: CoverageSummary,
     /// Every decomposable candidate considered, before selection.
     candidates: &'a [CandidateSummary],
     /// Functions with a `switchInt`-shaped decision that the
@@ -161,6 +166,9 @@ struct SingleRuntimeReport<'a> {
     observations: &'a [ConditionObservation],
     /// `None` unless `verdict` is `analysed`.
     analysis: Option<&'a RuntimeAnalysis>,
+    /// Condition counts for the analysed decision and the
+    /// percentage, `null` whenever a condition is unknown.
+    summary: CoverageSummary,
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<(), ExitCode> {
@@ -874,6 +882,10 @@ fn run_test_mode_cargo(
         candidate_summaries.iter().filter(|c| want(c)).count()
     };
     let reached_count = count_status(|c| c.invoked);
+    let not_measurable: Vec<&correlate::NotMeasurable> = candidate_summaries
+        .iter()
+        .filter_map(|c| c.not_measurable.as_ref())
+        .collect();
     let not_measurable_count = count_status(|c| c.not_measurable.is_some());
     let unreached_count = candidate_summaries.len() - reached_count - not_measurable_count;
     let skipped_mirs: Vec<SkippedMir> = skipped_oversize_mirs
@@ -894,6 +906,7 @@ fn run_test_mode_cargo(
         tests_discovered: &all_tests,
         observations,
         analysis,
+        summary: CoverageSummary::new(analysis, not_measurable_count),
         candidates: &candidate_summaries,
         out_of_scope: &declined,
         skipped_oversize_mirs: &skipped_mirs,
@@ -985,7 +998,7 @@ fn run_test_mode_cargo(
             println!("floyd  runtime MC/DC analysis of {}", manifest.display());
             println!();
             println!("Test targets: {}", build.test_artifacts.len());
-            print_runtime_report_body(&all_tests, &all_observations, &analysis);
+            print_runtime_report_body(&all_tests, &all_observations, &analysis, &not_measurable);
             print_out_of_scope_report(
                 &mut std::io::stdout(),
                 &declined,
@@ -1003,7 +1016,14 @@ fn run_test_mode_cargo(
             }
         }
         Format::Junit => {
-            print_runtime_junit(&manifest.display().to_string(), &analysis);
+            print!(
+                "{}",
+                render_runtime_junit(
+                    &manifest.display().to_string(),
+                    &analysis,
+                    not_measurable_count
+                )
+            );
         }
     }
     ExitCode::SUCCESS
@@ -1157,6 +1177,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
         tests_discovered: &tests,
         observations,
         analysis,
+        summary: CoverageSummary::new(analysis, 0),
     };
     let emit_decline = |verdict| -> ExitCode {
         if let Format::Json = format {
@@ -1205,7 +1226,10 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
             }
         }
         Format::Junit => {
-            print_runtime_junit(&source.display().to_string(), &analysis);
+            print!(
+                "{}",
+                render_runtime_junit(&source.display().to_string(), &analysis, 0)
+            );
         }
     }
     ExitCode::SUCCESS
@@ -1307,13 +1331,14 @@ fn print_runtime_report(
 ) {
     println!("floyd  runtime MC/DC analysis of {}", source.display());
     println!();
-    print_runtime_report_body(tests, observations, analysis);
+    print_runtime_report_body(tests, observations, analysis, &[]);
 }
 
 fn print_runtime_report_body(
     tests: &[String],
     observations: &[ConditionObservation],
     analysis: &RuntimeAnalysis,
+    not_measurable: &[&correlate::NotMeasurable],
 ) {
     let ambiguous = observations.iter().filter(|o| o.ambiguous).count();
     println!("Tests discovered: {}", tests.len());
@@ -1382,11 +1407,9 @@ fn print_runtime_report_body(
     }
 
     println!("Per-condition MC/DC status:");
-    let mut exercised = 0usize;
     for cond in &analysis.matrix.conditions {
         match analysis.condition_status.get(cond) {
             Some(ConditionStatus::Exercised(pair)) => {
-                exercised += 1;
                 let t1 = format_inputs(&analysis.matrix.conditions, &pair.test_1);
                 let t2 = format_inputs(&analysis.matrix.conditions, &pair.test_2);
                 println!(
@@ -1396,15 +1419,9 @@ fn print_runtime_report_body(
                 );
             }
             Some(ConditionStatus::Ambiguous { tests }) => {
-                println!(
-                    "  ? {cond}: unknown (ambiguous) — not demonstrated by attributable \
-                     observations, but evaluated in {} test(s) that evaluated the decision \
-                     more than once: {}",
-                    tests.len(),
-                    format_ambiguous_tests(tests, observations)
-                );
+                println!("  ? {cond}: {}", unknown_reason(tests, observations));
             }
-            Some(ConditionStatus::Unexercised) => {
+            Some(ConditionStatus::Unexercised) | None => {
                 let missing = analysis
                     .matrix
                     .independence_pairs
@@ -1418,32 +1435,32 @@ fn print_runtime_report_body(
                     println!("  ✗ {cond}: UNEXERCISED (no valid pair available)");
                 }
             }
-            None => {
-                println!("  ? {cond}: unknown");
-            }
         }
     }
-    let total = analysis.matrix.conditions.len();
-    if total > 0 {
-        let pct = (exercised as f64 / total as f64) * 100.0;
+    let summary = CoverageSummary::new(Some(analysis), not_measurable.len());
+    if let Some(line) = summary.coverage_line(analysis.ambiguous_observations) {
         println!();
-        if analysis.ambiguous_observations == 0 {
-            println!("MC/DC coverage: {exercised} of {total} conditions exercised ({pct:.0}%)",);
-        } else {
-            let unknown = analysis
-                .condition_status
-                .values()
-                .filter(|s| matches!(s, ConditionStatus::Ambiguous { .. }))
-                .count();
-            println!(
-                "MC/DC coverage: {exercised} of {total} conditions exercised ({pct:.0}%; \
-                 {unknown} unknown, {} ambiguous observation(s) excluded; add \
-                 single-evaluation tests or see the README section \
-                 \"Tests that evaluate a decision more than once\")",
-                analysis.ambiguous_observations
-            );
+        println!("{line}");
+        if summary.percentage.is_none() {
+            println!("{}", summary::unknown_hint(analysis.ambiguous_observations));
         }
     }
+    if let Some(line) = summary::not_measurable_line(not_measurable.iter().copied()) {
+        println!();
+        println!("{line}");
+    }
+}
+
+/// The status text after `? {cond}: ` for a condition whose only
+/// evidence is ambiguous: `UNKNOWN`, why, and the tests (at most
+/// [`summary::TESTS_SHOWN`] named, with their evaluation counts).
+fn unknown_reason(tests: &[String], observations: &[ConditionObservation]) -> String {
+    format!(
+        "UNKNOWN — evaluated only in {} test(s) that evaluated the decision more than \
+         once, so no condition vector can be attributed: {}",
+        tests.len(),
+        format_ambiguous_tests(tests, observations)
+    )
 }
 
 /// `evaluated 256x: c1=224T/32F  c2=95T/129F` for an ambiguous
@@ -1462,35 +1479,21 @@ fn format_ambiguous_counts(conditions: &[String], obs: &ConditionObservation) ->
     format!("evaluated {evals}x: {}", counts.join("  "))
 }
 
-/// How many ambiguous tests a condition's status line names before
-/// summarising the rest (all of them are in the per-test listing).
-const AMBIGUOUS_TESTS_SHOWN: usize = 3;
-
 /// `t1 (256 evaluations), t2 (3 evaluations)` for the tests behind a
 /// [`ConditionStatus::Ambiguous`], naming at most
-/// [`AMBIGUOUS_TESTS_SHOWN`] of them.
+/// [`summary::TESTS_SHOWN`] of them and summarising the rest as
+/// `(+N more)` (all of them are in the per-test listing).
 fn format_ambiguous_tests(tests: &[String], observations: &[ConditionObservation]) -> String {
-    let mut shown: Vec<String> = tests
-        .iter()
-        .take(AMBIGUOUS_TESTS_SHOWN)
-        .map(|t| {
-            let evals = observations
-                .iter()
-                .find(|o| o.ambiguous && o.test_name.as_deref() == Some(t.as_str()))
-                .and_then(|o| o.evaluations);
-            match evals {
-                Some(n) => format!("{t} ({n} evaluations)"),
-                None => t.clone(),
-            }
-        })
-        .collect();
-    if tests.len() > AMBIGUOUS_TESTS_SHOWN {
-        shown.push(format!(
-            "and {} more (see per-test observations)",
-            tests.len() - AMBIGUOUS_TESTS_SHOWN
-        ));
-    }
-    shown.join(", ")
+    summary::cap_tests(tests, |t| {
+        let evals = observations
+            .iter()
+            .find(|o| o.ambiguous && o.test_name.as_deref() == Some(t))
+            .and_then(|o| o.evaluations);
+        match evals {
+            Some(n) => format!("{t} ({n} evaluations)"),
+            None => t.to_string(),
+        }
+    })
 }
 
 fn print_truth_table_header(conditions: &[String]) {
@@ -1614,62 +1617,83 @@ fn bool_glyph(v: bool) -> &'static str {
 // JUnit XML rendering
 // ---------------------------------------------------------------------------
 
-/// Emit a JUnit XML report for a runtime analysis. One
+/// Render a JUnit XML report for a runtime analysis. One
 /// `<testsuite>` per analysis context (typically one per
 /// invocation today), one `<testcase>` per recovered condition.
 /// Exercised conditions pass (empty body); unexercised conditions
 /// emit a `<failure type="UnexercisedCondition">` with the required
 /// independence-pair inputs in the message; conditions whose only
 /// evidence is ambiguous emit a `<failure type="AmbiguousCondition">`
-/// naming the multi-evaluation tests (not demonstrated, so not a
-/// pass).
+/// naming at most [`summary::TESTS_SHOWN`] of the multi-evaluation
+/// tests (not demonstrated, so not a pass).
+///
+/// The suite carries the [`CoverageSummary`] counts as
+/// `<properties>`; `floyd.percentage` is present only when no
+/// condition is unknown, matching the text and JSON reports.
 ///
 /// The format is the de-facto JUnit XML that Jenkins, GitLab CI,
 /// GitHub Actions, Bazel/Buck2, and the other CIs the automotive
 /// industry already deploys render natively.
-fn print_runtime_junit(source: &str, analysis: &RuntimeAnalysis) {
+fn render_runtime_junit(source: &str, analysis: &RuntimeAnalysis, not_measurable: usize) -> String {
+    use std::fmt::Write as _;
     let conditions = &analysis.matrix.conditions;
-    let total = conditions.len();
-    let failures = conditions
-        .iter()
-        .filter(|c| {
-            !matches!(
-                analysis.condition_status.get(c.as_str()),
-                Some(ConditionStatus::Exercised(_))
-            )
-        })
-        .count();
+    let summary = CoverageSummary::new(Some(analysis), not_measurable);
+    let total = summary.conditions_total;
+    let failures = total - summary.exercised;
+    let mut out = String::new();
 
-    println!(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
-    println!(r#"<testsuites name="floyd" tests="{total}" failures="{failures}">"#);
-    println!(
+    let _ = writeln!(out, r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    let _ = writeln!(
+        out,
+        r#"<testsuites name="floyd" tests="{total}" failures="{failures}">"#
+    );
+    let _ = writeln!(
+        out,
         r#"  <testsuite name="{}" tests="{total}" failures="{failures}">"#,
         xml_escape(source)
     );
+    let _ = writeln!(out, "    <properties>");
+    let mut props: Vec<(&str, String)> = vec![
+        ("floyd.conditions_total", total.to_string()),
+        ("floyd.exercised", summary.exercised.to_string()),
+        ("floyd.not_exercised", summary.not_exercised.to_string()),
+        ("floyd.unknown", summary.unknown.to_string()),
+        ("floyd.not_measurable", summary.not_measurable.to_string()),
+    ];
+    if let Some(pct) = summary.percentage {
+        props.push(("floyd.percentage", format!("{pct:.0}")));
+    }
+    for (name, value) in props {
+        let _ = writeln!(
+            out,
+            r#"      <property name="{name}" value="{}"/>"#,
+            xml_escape(&value)
+        );
+    }
+    let _ = writeln!(out, "    </properties>");
     for cond in conditions {
         let case_name = xml_escape(cond);
-        match analysis.condition_status.get(cond.as_str()) {
+        let (kind, message) = match analysis.condition_status.get(cond.as_str()) {
             Some(ConditionStatus::Exercised(_)) => {
-                println!(r#"    <testcase name="{case_name}" classname="floyd.mcdc"/>"#);
+                let _ = writeln!(
+                    out,
+                    r#"    <testcase name="{case_name}" classname="floyd.mcdc"/>"#
+                );
+                continue;
             }
-            Some(ConditionStatus::Ambiguous { tests }) => {
-                let message = format!(
-                    "unknown (ambiguous): not demonstrated by attributable observations, \
-                     but evaluated in {} test(s) that evaluated the decision more than \
-                     once ({}); aggregate counters cannot attribute a condition vector \
-                     to them. Add single-evaluation tests.",
+            Some(ConditionStatus::Ambiguous { tests }) => (
+                "AmbiguousCondition",
+                format!(
+                    "UNKNOWN: evaluated only in {} test(s) that evaluated the decision more \
+                     than once ({}); aggregate counters cannot attribute a condition vector \
+                     to them. Add tests that each evaluate the decision once.",
                     tests.len(),
-                    tests.join(", ")
-                );
-                println!(r#"    <testcase name="{case_name}" classname="floyd.mcdc">"#);
-                println!(
-                    r#"      <failure message="{}" type="AmbiguousCondition"/>"#,
-                    xml_escape(&message)
-                );
-                println!(r#"    </testcase>"#);
-            }
-            Some(ConditionStatus::Unexercised) | None => {
-                let required = analysis
+                    summary::cap_tests(tests, str::to_string)
+                ),
+            ),
+            Some(ConditionStatus::Unexercised) | None => (
+                "UnexercisedCondition",
+                analysis
                     .matrix
                     .independence_pairs
                     .get(cond.as_str())
@@ -1685,18 +1709,23 @@ fn print_runtime_junit(source: &str, analysis: &RuntimeAnalysis) {
                     })
                     .unwrap_or_else(|| {
                         "no valid independence pair available for this condition".to_string()
-                    });
-                println!(r#"    <testcase name="{case_name}" classname="floyd.mcdc">"#);
-                println!(
-                    r#"      <failure message="{}" type="UnexercisedCondition"/>"#,
-                    xml_escape(&required)
-                );
-                println!(r#"    </testcase>"#);
-            }
-        }
+                    }),
+            ),
+        };
+        let _ = writeln!(
+            out,
+            r#"    <testcase name="{case_name}" classname="floyd.mcdc">"#
+        );
+        let _ = writeln!(
+            out,
+            r#"      <failure message="{}" type="{kind}"/>"#,
+            xml_escape(&message)
+        );
+        let _ = writeln!(out, r#"    </testcase>"#);
     }
-    println!(r#"  </testsuite>"#);
-    println!(r#"</testsuites>"#);
+    let _ = writeln!(out, r#"  </testsuite>"#);
+    let _ = writeln!(out, r#"</testsuites>"#);
+    out
 }
 
 /// Escape the five XML special characters so condition names like
@@ -1773,6 +1802,7 @@ mod tests {
             tests_discovered: &[],
             observations: &[],
             analysis: None,
+            summary: CoverageSummary::new(None, 1),
             candidates: &candidates,
             out_of_scope: &declined,
             skipped_oversize_mirs: &skipped,
@@ -1795,6 +1825,9 @@ mod tests {
             "uninstrumented"
         );
         assert_eq!(v["skipped_oversize_mirs"][0]["bytes"], 1);
+        assert_eq!(v["summary"]["conditions_total"], 0);
+        assert_eq!(v["summary"]["not_measurable"], 1);
+        assert!(v["summary"]["percentage"].is_null());
     }
 
     #[test]
@@ -1835,6 +1868,7 @@ mod tests {
             tests_discovered: &[],
             observations: &observations,
             analysis: None,
+            summary: CoverageSummary::new(None, 0),
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
@@ -1864,10 +1898,124 @@ mod tests {
             "symbol_matches_char_for_all_valid_symbols (256 evaluations)"
         );
         let many: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
-        assert_eq!(
-            format_ambiguous_tests(&many, &[]),
-            "t0, t1, t2, and 2 more (see per-test observations)"
+        assert_eq!(format_ambiguous_tests(&many, &[]), "t0, t1, t2 (+2 more)");
+    }
+
+    fn ambiguous_analysis(ambiguous_tests: usize) -> RuntimeAnalysis {
+        let tree = floyd::DecisionTree {
+            // a && b
+            decisions: vec![decision::Node::Ite {
+                cond: "a".to_string(),
+                then_branch: Box::new(decision::Node::Ite {
+                    cond: "b".to_string(),
+                    then_branch: Box::new(decision::Node::Const { value: true }),
+                    else_branch: Box::new(decision::Node::Const { value: false }),
+                }),
+                else_branch: Box::new(decision::Node::Const { value: false }),
+            }],
+        };
+        let vec_obs = |name: &str, a: bool, b: Option<bool>, result: bool| {
+            let mut inputs: std::collections::BTreeMap<String, bool> =
+                [("a".to_string(), a)].into_iter().collect();
+            if let Some(b) = b {
+                inputs.insert("b".to_string(), b);
+            }
+            ConditionObservation::vector(Some(name.to_string()), inputs, result)
+        };
+        // `a` is demonstrated by (F,-)->F vs (T,T)->T; `b`'s only
+        // other evidence, (T,F)->F, comes from ambiguous tests.
+        let mut observations = vec![
+            vec_obs("a_false", false, None, false),
+            vec_obs("both_true", true, Some(true), true),
+        ];
+        for i in 0..ambiguous_tests {
+            observations.push(ConditionObservation::ambiguous(
+                Some(format!("loop_{i}")),
+                2,
+                [
+                    (
+                        "a".to_string(),
+                        floyd::BranchCounts {
+                            true_count: 2,
+                            false_count: 0,
+                        },
+                    ),
+                    (
+                        "b".to_string(),
+                        floyd::BranchCounts {
+                            true_count: 1,
+                            false_count: 1,
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+        }
+        masking::analyze_with_runtime(&tree, &observations, Variant::Masking)
+    }
+
+    #[test]
+    fn junit_caps_ambiguous_tests_and_withholds_the_percentage() {
+        let analysis = ambiguous_analysis(5);
+        assert!(matches!(
+            analysis.condition_status.get("b"),
+            Some(ConditionStatus::Ambiguous { tests }) if tests.len() == 5
+        ));
+        let xml = render_runtime_junit("lib.rs", &analysis, 2);
+        assert!(xml.contains(r#"type="AmbiguousCondition""#), "{xml}");
+        assert!(xml.contains("(loop_0, loop_1, loop_2 (+2 more))"), "{xml}");
+        assert!(!xml.contains("loop_3"), "{xml}");
+        assert!(xml.contains(r#"<testsuite name="lib.rs" tests="2" failures="1">"#));
+        assert!(xml.contains(r#"<property name="floyd.unknown" value="1"/>"#));
+        assert!(xml.contains(r#"<property name="floyd.not_measurable" value="2"/>"#));
+        assert!(!xml.contains("floyd.percentage"), "{xml}");
+        assert!(!xml.contains('%'), "{xml}");
+    }
+
+    #[test]
+    fn junit_carries_the_percentage_when_nothing_is_unknown() {
+        let analysis = ambiguous_analysis(0);
+        assert!(matches!(
+            analysis.condition_status.get("b"),
+            Some(ConditionStatus::Unexercised)
+        ));
+        let xml = render_runtime_junit("lib.rs", &analysis, 0);
+        assert!(xml.contains(r#"type="UnexercisedCondition""#), "{xml}");
+        assert!(xml.contains(r#"<property name="floyd.percentage" value="50"/>"#));
+        assert!(xml.contains(r#"<property name="floyd.unknown" value="0"/>"#));
+    }
+
+    #[test]
+    fn json_summary_reports_null_percentage_for_an_analysed_unknown() {
+        let analysis = ambiguous_analysis(1);
+        let report = SingleRuntimeReport {
+            source: "lib.rs".to_string(),
+            verdict: RuntimeVerdict::Analysed,
+            tests_discovered: &[],
+            observations: &[],
+            analysis: Some(&analysis),
+            summary: CoverageSummary::new(Some(&analysis), 0),
+        };
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["summary"]["conditions_total"], 2);
+        assert_eq!(v["summary"]["exercised"], 1);
+        assert_eq!(v["summary"]["not_exercised"], 0);
+        assert_eq!(v["summary"]["unknown"], 1);
+        assert!(v["summary"]["percentage"].is_null());
+        assert!(v["analysis"]["condition_status"]["b"]["Ambiguous"].is_object());
+    }
+
+    #[test]
+    fn unknown_status_line_says_unknown_and_caps_tests() {
+        let tests: Vec<String> = (0..4).map(|i| format!("loop_{i}")).collect();
+        let line = unknown_reason(&tests, &[]);
+        assert!(
+            line.starts_with("UNKNOWN — evaluated only in 4 test(s)"),
+            "{line}"
         );
+        assert!(line.ends_with("loop_0, loop_1, loop_2 (+1 more)"), "{line}");
+        assert!(!line.contains("UNEXERCISED"));
     }
 
     #[test]
