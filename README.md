@@ -269,7 +269,10 @@ whenever `unknown > 0` (or there are no conditions, on the decline
 paths). `not_measurable` counts candidates whose execution coverage
 cannot measure (code rustc does not instrument, such as derive
 output; decisions expanded from a dependency's macro; spans no
-coverage record covers or that several records share). They are
+coverage record covers or that several records share; decisions
+whose record has no branch region at their conditions, such as a
+`match` on an enum or a `matches!` pattern, for which rustc emits
+no branch counters). They are
 listed with their reason in `candidates[].not_measurable`, are never
 part of `conditions_total`, and are reported in the text summary as
 a count per reason. The JUnit suite carries the same counts as
