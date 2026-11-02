@@ -58,6 +58,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod correlate;
+pub mod coverage_index;
 pub mod decision;
 pub mod instrument;
 pub mod masking;
