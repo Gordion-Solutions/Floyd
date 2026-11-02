@@ -1,13 +1,19 @@
 //! The run-level MC/DC summary shared by the text, JSON and JUnit
-//! reports.
+//! reports, and the exit code derived from it.
 //!
 //! Floyd never states a coverage percentage it cannot stand behind:
 //! when any condition's status is unknown (its only evidence came
 //! from tests that evaluated the decision more than once), the
-//! summary carries no percentage.
+//! summary carries no percentage and the run does not pass.
 
 use floyd::correlate::{NotMeasurable, NotMeasurableReason};
 use floyd::masking::{ConditionStatus, RuntimeAnalysis};
+
+/// Process exit code for a run that completed its analysis but did
+/// not demonstrate MC/DC for every condition (at least one condition
+/// is not exercised or unknown). Exit code 1 stays reserved for
+/// errors and for the decline paths (no decision analysed).
+pub const EXIT_MCDC_NOT_DEMONSTRATED: u8 = 2;
 
 /// How many test names a condition status line or a JUnit failure
 /// message lists before summarising the rest as `(+N more)`.
@@ -90,6 +96,23 @@ impl CoverageSummary {
                  \"Tests that evaluate a decision more than once\")"
             )
         })
+    }
+
+    /// True when every condition was exercised: the run demonstrated
+    /// MC/DC for the analysed decision.
+    pub fn demonstrated(&self) -> bool {
+        self.conditions_total > 0 && self.exercised == self.conditions_total
+    }
+
+    /// Exit code for an analysed run: 0 when MC/DC was demonstrated,
+    /// [`EXIT_MCDC_NOT_DEMONSTRATED`] when any condition is not
+    /// exercised or unknown.
+    pub fn exit_code(&self) -> u8 {
+        if self.demonstrated() {
+            0
+        } else {
+            EXIT_MCDC_NOT_DEMONSTRATED
+        }
     }
 }
 
@@ -204,6 +227,7 @@ mod tests {
             s.coverage_line(0).unwrap(),
             "MC/DC coverage: 2 of 3 conditions exercised (67%)"
         );
+        assert_eq!(s.exit_code(), EXIT_MCDC_NOT_DEMONSTRATED);
 
         let full = analysis(&[("a", exercised())], 0);
         let s = CoverageSummary::new(Some(&full), 0);
@@ -212,6 +236,7 @@ mod tests {
             "MC/DC coverage: 1 of 1 conditions exercised (100%)"
         );
         assert_eq!(s.percentage, Some(100.0));
+        assert_eq!(s.exit_code(), 0);
     }
 
     #[test]
@@ -254,6 +279,22 @@ mod tests {
              (no percentage: 2 conditions could not be determined)"
         );
         assert!(!line.contains('%'));
+    }
+
+    #[test]
+    fn an_unknown_condition_fails_the_run_like_an_unexercised_one() {
+        let unknown = analysis(&[("a", exercised()), ("b", ambiguous(1))], 1);
+        let unexercised = analysis(
+            &[("a", exercised()), ("b", ConditionStatus::Unexercised)],
+            0,
+        );
+        let u = CoverageSummary::new(Some(&unknown), 0);
+        let x = CoverageSummary::new(Some(&unexercised), 0);
+        assert!(!u.demonstrated());
+        assert_eq!(u.exit_code(), EXIT_MCDC_NOT_DEMONSTRATED);
+        assert_eq!(u.exit_code(), x.exit_code());
+        assert_ne!(EXIT_MCDC_NOT_DEMONSTRATED, 0);
+        assert_ne!(EXIT_MCDC_NOT_DEMONSTRATED, 1);
     }
 
     #[test]

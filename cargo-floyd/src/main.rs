@@ -1026,7 +1026,7 @@ fn run_test_mode_cargo(
             );
         }
     }
-    ExitCode::SUCCESS
+    ExitCode::from(CoverageSummary::new(Some(&analysis), not_measurable_count).exit_code())
 }
 
 fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCode {
@@ -1232,7 +1232,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
             );
         }
     }
-    ExitCode::SUCCESS
+    ExitCode::from(CoverageSummary::new(Some(&analysis), 0).exit_code())
 }
 
 fn parse_format(s: &str) -> Result<Format, String> {
@@ -1971,6 +1971,10 @@ mod tests {
         assert!(xml.contains(r#"<property name="floyd.not_measurable" value="2"/>"#));
         assert!(!xml.contains("floyd.percentage"), "{xml}");
         assert!(!xml.contains('%'), "{xml}");
+        assert_eq!(
+            CoverageSummary::new(Some(&analysis), 2).exit_code(),
+            summary::EXIT_MCDC_NOT_DEMONSTRATED
+        );
     }
 
     #[test]
