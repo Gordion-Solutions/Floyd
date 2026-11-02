@@ -1324,6 +1324,17 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
         if in_block_switchint.is_some() && dst != RETURN_PLACE {
             return false;
         }
+        // A `goto` block's write to a local other than `_0` is the
+        // block's value only when it reaches `_0` downstream (the
+        // join block reads it into the return place). Otherwise it is
+        // bookkeeping: a drop flag (`_25 = const false; goto -> bb1`
+        // at the top of a loop), or a local the rest of the body
+        // reads for something else.
+        if let MirTerminator::Goto { target, .. } = &block.terminator {
+            if dst != RETURN_PLACE && !feeds_switchint(dst) && !flows_to_return(f, *target, dst) {
+                return false;
+            }
+        }
         !block.statements[idx + 1..]
             .iter()
             .any(|later| statement_reads(later, dst))
@@ -1410,6 +1421,81 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
         }
     }
     None
+}
+
+/// Most blocks [`flows_to_return`] follows before giving up.
+const FLOW_STEP_CAP: usize = 64;
+
+/// Does the value of `local`, as written just before a `goto` to
+/// `start`, reach the return place `_0`?
+///
+/// Follows the straight-line path from `start` (through `goto`, the
+/// `success` edge of an `assert` and the return edge of a call whose
+/// destination is not `_0`) and tracks `local` and any local it is
+/// copied or moved into. The answer is `true` at the first
+/// statement that writes `_0` and reads a tracked local
+/// (`_0 = copy _6`, `_0 = Option::<bool>::Some(move _6)`), and
+/// `false` when `_0` is written from something else, every tracked
+/// local is overwritten, or the path branches, returns or leaves
+/// the shapes above. A drop flag never reaches `_0`: it is read
+/// only by the drop-elaboration `switchInt`s that guard a `drop`.
+fn flows_to_return(f: &MirFunction, start: BlockId, local: LocalId) -> bool {
+    let mut tracked: Vec<LocalId> = vec![local];
+    let mut seen: Vec<BlockId> = Vec::new();
+    let mut cur = start;
+    for _ in 0..FLOW_STEP_CAP {
+        if seen.contains(&cur) {
+            return false;
+        }
+        seen.push(cur);
+        let Some(block) = f.blocks.iter().find(|b| b.id == cur) else {
+            return false;
+        };
+        for stmt in &block.statements {
+            let reads_tracked = tracked.iter().any(|l| statement_reads(stmt, *l));
+            let Some(dst) = statement_dst(stmt).or_else(|| other_statement_dst(stmt)) else {
+                continue;
+            };
+            if dst == RETURN_PLACE {
+                return reads_tracked;
+            }
+            if reads_tracked {
+                if !tracked.contains(&dst) {
+                    tracked.push(dst);
+                }
+            } else {
+                tracked.retain(|l| *l != dst);
+                if tracked.is_empty() {
+                    return false;
+                }
+            }
+        }
+        cur = match &block.terminator {
+            MirTerminator::Goto { target, .. } => *target,
+            MirTerminator::Assert { success, .. } => *success,
+            MirTerminator::Call { dst, target, .. } if *dst != RETURN_PLACE => {
+                tracked.retain(|l| l != dst);
+                if tracked.is_empty() {
+                    return false;
+                }
+                *target
+            }
+            _ => return false,
+        };
+    }
+    false
+}
+
+/// Destination of an unparsed [`MirStatement::Other`] assignment
+/// (`_0 = Option::<bool>::Some(move _6)`, `_4 = const 0_u64`), read
+/// from its leading `_<N> = `. Projections (`(_1.0: u32) = ..`) and
+/// non-assignments yield `None`.
+fn other_statement_dst(stmt: &MirStatement) -> Option<LocalId> {
+    let MirStatement::Other { text, .. } = stmt else {
+        return None;
+    };
+    let (lhs, _) = text.split_once(" = ")?;
+    parse_plain_local(lhs.trim())
 }
 
 /// Fold a `<intermediate> = ...; goto <succ>` block into the arm of
@@ -4320,5 +4406,498 @@ fn not_u32(_1: bool, _2: u32) -> u32 {
         let f = &mir.functions[0];
         let max_id = f.blocks.iter().map(|b| b.id).max().unwrap_or(0);
         assert!(decompose_from_block(f, max_id + 999).is_none());
+    }
+
+    /// BLAKE3 `src/io.rs`, `cargo floyd test` MIR (rustc nightly,
+    /// coverage flags, comment-only lines stripped):
+    ///
+    /// ```text
+    /// pub(crate) fn copy_wide(mut reader: impl io::Read, hasher: &mut crate::Hasher) -> io::Result<u64> {
+    ///     let mut buffer = [0; 65536];
+    ///     let mut total = 0;
+    ///     loop {
+    ///         match reader.read(&mut buffer) {
+    ///             Ok(0) => return Ok(total),
+    ///             Ok(n) => {
+    ///                 hasher.update(&buffer[..n]);
+    ///                 total += n as u64;
+    ///             }
+    ///             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+    ///             Err(e) => return Err(e),
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// bb0 is `_25 = const false; .. goto -> bb1`: `_25` is the drop
+    /// flag of the `Err(e)` binding, and bb1 is the loop head.
+    const COPY_WIDE_MIR: &str = r#"
+fn copy_wide(_1: impl io::Read, _2: &mut Hasher) -> Result<u64, std::io::Error> {
+    debug reader => _1;                  // in scope 0 at src/io.rs:10:25: 10:35
+    debug hasher => _2;                  // in scope 0 at src/io.rs:10:52: 10:58
+    let mut _0: std::result::Result<u64, std::io::Error>; // return place in scope 0 at src/io.rs:10:83: 10:98
+    let mut _3: [u8; 65536];             // in scope 0 at src/io.rs:11:9: 11:19
+    let mut _5: std::result::Result<usize, std::io::Error>; // in scope 0 at src/io.rs:14:15: 14:39
+    let mut _6: &mut impl io::Read;      // in scope 0 at src/io.rs:14:15: 14:21
+    let mut _7: &mut [u8];               // in scope 0 at src/io.rs:14:27: 14:38
+    let mut _8: &mut [u8; 65536];        // in scope 0 at src/io.rs:14:27: 14:38
+    let mut _9: isize;                   // in scope 0 at src/io.rs:15:13: 15:18
+    let mut _10: u64;                    // in scope 0 at src/io.rs:15:32: 15:37
+    let _12: &mut Hasher;                // in scope 0 at src/io.rs:17:17: 17:44
+    let _13: &[u8];                      // in scope 0 at src/io.rs:17:38: 17:43
+    let mut _14: &[u8; 65536];           // in scope 0 at src/io.rs:17:32: 17:38
+    let mut _15: std::ops::RangeTo<usize>; // in scope 0 at src/io.rs:17:39: 17:42
+    let mut _16: u64;                    // in scope 0 at src/io.rs:18:26: 18:34
+    let mut _17: (u64, bool);            // in scope 0 at src/io.rs:18:17: 18:34
+    let mut _20: bool;                   // in scope 0 at src/io.rs:21:23: 21:61
+    let mut _21: &std::io::ErrorKind;    // in scope 0 at src/io.rs:21:23: 21:31
+    let _22: std::io::ErrorKind;         // in scope 0 at src/io.rs:21:23: 21:31
+    let mut _23: &std::io::ErrorKind;    // in scope 0 at src/io.rs:21:35: 21:61
+    let mut _25: bool;                   // in scope 0 at src/io.rs:23:9: 23:10
+    let mut _26: isize;                  // in scope 0 at src/io.rs:23:9: 23:10
+    scope 1 {
+        debug buffer => _3;              // in scope 1 at src/io.rs:11:9: 11:19
+        let mut _4: u64;                 // in scope 1 at src/io.rs:12:9: 12:18
+        scope 2 {
+            debug total => _4;           // in scope 2 at src/io.rs:12:9: 12:18
+            let _11: usize;              // in scope 2 at src/io.rs:16:16: 16:17
+            let _18: std::io::Error;     // in scope 2 at src/io.rs:21:17: 21:18
+            let _19: &std::io::Error;    // in scope 2 at src/io.rs:21:17: 21:18
+            let _24: std::io::Error;     // in scope 2 at src/io.rs:22:17: 22:18
+            scope 3 {
+                debug n => _11;          // in scope 3 at src/io.rs:16:16: 16:17
+            }
+            scope 4 {
+                debug e => _18;          // in scope 4 at src/io.rs:21:17: 21:18
+                debug e => _19;          // in scope 4 at src/io.rs:21:17: 21:18
+            }
+            scope 5 {
+                debug e => _24;          // in scope 5 at src/io.rs:22:17: 22:18
+            }
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/io.rs:21:23: 21:61 (#0)
+
+    coverage Code { bcb: bcb0 } => src/io.rs:10:1: 10:98 (#0);
+    coverage Code { bcb: bcb0 } => src/io.rs:11:22: 11:32 (#0);
+    coverage Code { bcb: bcb0 } => src/io.rs:12:21: 12:22 (#0);
+    coverage Code { bcb: bcb1 } => src/io.rs:14:15: 14:39 (#0);
+    coverage Code { bcb: bcb9 } => src/io.rs:15:22: 15:38 (#0);
+    coverage Code { bcb: bcb8 } => src/io.rs:17:17: 17:23 (#0);
+    coverage Code { bcb: bcb8 } => src/io.rs:17:17: 17:44 (#0);
+    coverage Code { bcb: bcb8 } => src/io.rs:18:17: 18:34 (#0);
+    coverage Code { bcb: bcb2 } => src/io.rs:21:23: 21:61 (#0);
+    coverage Code { bcb: bcb3 } => src/io.rs:21:65: 21:73 (#0);
+    coverage Code { bcb: bcb5 } => src/io.rs:22:23: 22:36 (#0);
+    coverage Code { bcb: bcb6 } => src/io.rs:25:1: 25:2 (#0);
+    coverage Branch { true_bcb: bcb3, false_bcb: bcb4 } => src/io.rs:21:23: 21:61 (#0);
+
+    bb0: {
+        _25 = const false;               // scope 2 at src/io.rs:13:5: 24:6
+        Coverage::VirtualCounter(bcb0);  // scope 2 at src/io.rs:13:5: 24:6
+        _3 = [const 0_u8; 65536];        // scope 0 at src/io.rs:11:22: 11:32
+        _4 = const 0_u64;                // scope 1 at src/io.rs:12:21: 12:22
+        goto -> bb1;                     // scope 2 at src/io.rs:13:5: 24:6
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 2 at src/io.rs:13:5: 24:6
+        _6 = &mut _1;                    // scope 2 at src/io.rs:14:15: 14:21
+        _8 = &mut _3;                    // scope 2 at src/io.rs:14:27: 14:38
+        _7 = copy _8 as &mut [u8] (PointerCoercion(Unsize, Implicit)); // scope 2 at src/io.rs:14:27: 14:38
+        _5 = <impl io::Read as std::io::Read>::read(move _6, move _7) -> [return: bb2, unwind: bb18]; // scope 2 at src/io.rs:14:15: 14:39
+    }
+
+    bb2: {
+        _25 = const true;                // scope 2 at src/io.rs:14:38: 14:39
+        _9 = discriminant(_5);           // scope 2 at src/io.rs:14:15: 14:39
+        switchInt(move _9) -> [0: bb4, 1: bb7, otherwise: bb3]; // scope 2 at src/io.rs:14:9: 14:39
+    }
+
+    bb3: {
+        unreachable;                     // scope 2 at src/io.rs:14:15: 14:39
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb7);  // scope 2 at src/io.rs:14:9: 14:39
+        switchInt(copy ((_5 as Ok).0: usize)) -> [0: bb6, otherwise: bb5]; // scope 2 at src/io.rs:14:9: 14:39
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb8);  // scope 2 at src/io.rs:16:13: 16:18
+        _11 = copy ((_5 as Ok).0: usize); // scope 2 at src/io.rs:16:16: 16:17
+        _14 = &_3;                       // scope 3 at src/io.rs:17:32: 17:38
+        _15 = RangeTo::<usize> { end: copy _11 }; // scope 3 at src/io.rs:17:39: 17:42
+        _13 = <[u8; 65536] as Index<RangeTo<usize>>>::index(move _14, move _15) -> [return: bb8, unwind: bb22]; // scope 3 at src/io.rs:17:38: 17:43
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb9);  // scope 2 at src/io.rs:15:13: 15:18
+        _10 = copy _4;                   // scope 2 at src/io.rs:15:32: 15:37
+        _0 = Result::<u64, std::io::Error>::Ok(move _10); // scope 2 at src/io.rs:15:29: 15:38
+        goto -> bb16;                    // scope 2 at src/io.rs:15:22: 15:38
+    }
+
+    bb7: {
+        Coverage::VirtualCounter(bcb2);  // scope 2 at src/io.rs:21:13: 21:19
+        _19 = &((_5 as Err).0: std::io::Error); // scope 2 at src/io.rs:21:17: 21:18
+        _22 = std::io::Error::kind(copy _19) -> [return: bb11, unwind: bb22]; // scope 2 at src/io.rs:21:23: 21:31
+    }
+
+    bb8: {
+        _12 = Hasher::update(copy _2, copy _13) -> [return: bb9, unwind: bb22]; // scope 3 at src/io.rs:17:17: 17:44
+    }
+
+    bb9: {
+        _16 = copy _11 as u64 (IntToInt); // scope 3 at src/io.rs:18:26: 18:34
+        _17 = AddWithOverflow(copy _4, copy _16); // scope 3 at src/io.rs:18:17: 18:34
+        assert(!move (_17.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _4, move _16) -> [success: bb10, unwind: bb22]; // scope 3 at src/io.rs:18:17: 18:34
+    }
+
+    bb10: {
+        _4 = move (_17.0: u64);          // scope 3 at src/io.rs:18:17: 18:34
+        _25 = const false;               // scope 2 at src/io.rs:23:9: 23:10
+        goto -> bb1;                     // scope 2 at src/io.rs:13:5: 24:6
+    }
+
+    bb11: {
+        _21 = &_22;                      // scope 2 at src/io.rs:21:23: 21:31
+        _23 = const io::copy_wide::<impl io::Read>::promoted[0]; // scope 2 at src/io.rs:21:35: 21:61
+        _20 = <ErrorKind as PartialEq>::eq(move _21, move _23) -> [return: bb12, unwind: bb22]; // scope 2 at src/io.rs:21:23: 21:61
+    }
+
+    bb12: {
+        switchInt(move _20) -> [0: bb14, otherwise: bb13]; // scope 2 at src/io.rs:21:23: 21:61
+    }
+
+    bb13: {
+        Coverage::VirtualCounter(bcb3);  // scope 2 at src/io.rs:21:72: 21:73
+        _25 = const false;               // scope 2 at src/io.rs:21:17: 21:18
+        _18 = move ((_5 as Err).0: std::io::Error); // scope 2 at src/io.rs:21:17: 21:18
+        drop(_18) -> [return: bb15, unwind: bb22]; // scope 2 at src/io.rs:21:72: 21:73
+    }
+
+    bb14: {
+        Coverage::VirtualCounter(bcb4);  // scope 2 at src/io.rs:21:13: 21:19
+        Coverage::VirtualCounter(bcb5);  // scope 5 at src/io.rs:22:35: 22:36
+        _25 = const false;               // scope 2 at src/io.rs:22:17: 22:18
+        _24 = move ((_5 as Err).0: std::io::Error); // scope 2 at src/io.rs:22:17: 22:18
+        _0 = Result::<u64, std::io::Error>::Err(copy _24); // scope 5 at src/io.rs:22:30: 22:36
+        goto -> bb16;                    // scope 2 at no-location
+    }
+
+    bb15: {
+        _25 = const false;               // scope 2 at src/io.rs:23:9: 23:10
+        goto -> bb1;                     // scope 2 at no-location
+    }
+
+    bb16: {
+        Coverage::VirtualCounter(bcb6);  // scope 2 at src/io.rs:23:9: 23:10
+        _25 = const false;               // scope 2 at src/io.rs:23:9: 23:10
+        drop(_1) -> [return: bb17, unwind continue]; // scope 0 at src/io.rs:25:1: 25:2
+    }
+
+    bb17: {
+        return;                          // scope 0 at src/io.rs:25:2: 25:2
+    }
+
+    bb18 (cleanup): {
+        drop(_1) -> [return: bb19, unwind terminate(cleanup)]; // scope 0 at src/io.rs:25:1: 25:2
+    }
+
+    bb19 (cleanup): {
+        resume;                          // scope 0 at src/io.rs:10:1: 25:2
+    }
+
+    bb20 (cleanup): {
+        switchInt(copy _25) -> [0: bb18, otherwise: bb21]; // scope 2 at src/io.rs:23:9: 23:10
+    }
+
+    bb21 (cleanup): {
+        drop(((_5 as Err).0: std::io::Error)) -> [return: bb18, unwind terminate(cleanup)]; // scope 2 at src/io.rs:23:9: 23:10
+    }
+
+    bb22 (cleanup): {
+        _26 = discriminant(_5);          // scope 2 at src/io.rs:23:9: 23:10
+        switchInt(move _26) -> [1: bb20, otherwise: bb18]; // scope 2 at src/io.rs:23:9: 23:10
+    }
+}
+"#;
+
+    /// hashbrown `src/raw.rs`, `RawIterRange::fold_impl`, same
+    /// compilation settings. bb0 is `_31 = const false; _31 = const
+    /// true; goto -> bb1`: two writes of a drop flag.
+    const FOLD_IMPL_MIR: &str = r#"
+fn raw::<impl at src/raw.rs:3556:1: 3556:24>::fold_impl(_1: RawIterRange<T>, _2: usize, _3: B, _4: F) -> B {
+    debug self => _1;                    // in scope 0 at src/raw.rs:3706:31: 3706:39
+    debug n => _2;                       // in scope 0 at src/raw.rs:3706:41: 3706:46
+    debug acc => _3;                     // in scope 0 at src/raw.rs:3706:55: 3706:62
+    debug f => _4;                       // in scope 0 at src/raw.rs:3706:67: 3706:72
+    let mut _0: B;                       // return place in scope 0 at src/raw.rs:3706:80: 3706:81
+    let mut _5: core::option::Option<usize>; // in scope 0 at src/raw.rs:3711:37: 3711:62
+    let mut _6: &mut control::bitmask::BitMaskIter; // in scope 0 at src/raw.rs:3711:37: 3711:55
+    let mut _7: isize;                   // in scope 0 at src/raw.rs:3711:23: 3711:34
+    let mut _9: bool;                    // in scope 0 at src/raw.rs:3714:31: 3714:37
+    let mut _10: usize;                  // in scope 0 at src/raw.rs:3714:31: 3714:32
+    let mut _11: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+    let mut _13: &raw::Bucket<T>;        // in scope 0 at src/raw.rs:3715:39: 3715:48
+    let mut _14: B;                      // in scope 0 at src/raw.rs:3716:23: 3716:37
+    let mut _15: &mut F;                 // in scope 0 at src/raw.rs:3716:23: 3716:24
+    let mut _16: (B, raw::Bucket<T>);    // in scope 0 at src/raw.rs:3716:23: 3716:37
+    let mut _17: B;                      // in scope 0 at src/raw.rs:3716:25: 3716:28
+    let mut _18: (usize, bool);          // in scope 0 at src/raw.rs:3717:17: 3717:23
+    let mut _19: bool;                   // in scope 0 at src/raw.rs:3720:16: 3720:22
+    let mut _20: usize;                  // in scope 0 at src/raw.rs:3720:16: 3720:17
+    let mut _21: control::bitmask::BitMaskIter; // in scope 0 at src/raw.rs:3753:38: 3755:33
+    let mut _22: control::bitmask::BitMask; // in scope 0 at src/raw.rs:3753:38: 3754:34
+    let mut _23: &control::group::sse2::Group; // in scope 0 at src/raw.rs:3753:38: 3753:80
+    let _24: control::group::sse2::Group; // in scope 0 at src/raw.rs:3753:38: 3753:80
+    let mut _25: *const control::tag::Tag; // in scope 0 at src/raw.rs:3753:58: 3753:79
+    let mut _26: *const u8;              // in scope 0 at src/raw.rs:3753:58: 3753:72
+    let mut _27: raw::Bucket<T>;         // in scope 0 at src/raw.rs:3756:29: 3756:59
+    let mut _28: &raw::Bucket<T>;        // in scope 0 at src/raw.rs:3756:29: 3756:38
+    let mut _29: *const u8;              // in scope 0 at src/raw.rs:3757:34: 3757:66
+    let mut _30: *const u8;              // in scope 0 at src/raw.rs:3757:34: 3757:48
+    let mut _31: bool;                   // in scope 0 at src/raw.rs:3760:5: 3760:6
+    scope 1 {
+        debug index => _8;               // in scope 1 at src/raw.rs:3711:28: 3711:33
+        let _8: usize;                   // in scope 1 at src/raw.rs:3711:28: 3711:33
+        let _12: raw::Bucket<T>;         // in scope 1 at src/raw.rs:3715:21: 3715:27
+        scope 2 {
+            debug bucket => _12;         // in scope 2 at src/raw.rs:3715:21: 3715:27
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/raw.rs:3711:23: 3711:34 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:292:12: 292:42 (#158)
+    coverage branch { true: BlockMarkerId(4), false: BlockMarkerId(5) } => /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38 (#159)
+    coverage branch { true: BlockMarkerId(6), false: BlockMarkerId(7) } => src/raw.rs:3720:16: 3720:22 (#0)
+
+    coverage Code { bcb: bcb0 } => src/raw.rs:3706:5: 3708:37 (#0);
+    coverage Code { bcb: bcb2 } => src/raw.rs:3711:19: 3711:62 (#0);
+    coverage Code { bcb: bcb6 } => src/raw.rs:3714:17: 3714:30 (#0);
+    coverage Code { bcb: bcb7 } => src/raw.rs:3714:31: 3714:37 (#0);
+    coverage Code { bcb: bcb9 } => src/raw.rs:3715:39: 3715:62 (#0);
+    coverage Code { bcb: bcb9 } => src/raw.rs:3716:17: 3716:20 (#0);
+    coverage Code { bcb: bcb9 } => src/raw.rs:3716:23: 3716:24 (#0);
+    coverage Code { bcb: bcb9 } => src/raw.rs:3716:17: 3716:37 (#0);
+    coverage Code { bcb: bcb9 } => src/raw.rs:3717:17: 3717:23 (#0);
+    coverage Code { bcb: bcb3 } => src/raw.rs:3720:16: 3720:22 (#0);
+    coverage Code { bcb: bcb4 } => src/raw.rs:3721:17: 3721:27 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3722:13: 3722:14 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3753:17: 3753:35 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3753:17: 3755:33 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3756:17: 3756:26 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3756:17: 3756:59 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3757:17: 3757:31 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3757:17: 3757:66 (#0);
+    coverage Code { bcb: bcb4 } => src/raw.rs:3760:5: 3760:6 (#0);
+    coverage Branch { true_bcb: bcb6, false_bcb: bcb3 } => src/raw.rs:3711:23: 3711:34 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb5 } => src/raw.rs:3720:16: 3720:22 (#0);
+
+    bb0: {
+        _31 = const false;               // scope 0 at src/raw.rs:3710:9: 3759:10
+        _31 = const true;                // scope 0 at src/raw.rs:3710:9: 3759:10
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/raw.rs:3710:9: 3759:10
+        goto -> bb1;                     // scope 0 at src/raw.rs:3710:9: 3759:10
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/raw.rs:3710:9: 3759:10
+        goto -> bb2;                     // scope 0 at src/raw.rs:3711:13: 3718:14
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/raw.rs:3711:13: 3718:14
+        _6 = &mut (_1.0: control::bitmask::BitMaskIter); // scope 1 at src/raw.rs:3711:37: 3711:55
+        _5 = <BitMaskIter as Iterator>::next(move _6) -> [return: bb3, unwind: bb20]; // scope 1 at src/raw.rs:3711:37: 3711:62
+    }
+
+    bb3: {
+        _7 = discriminant(_5);           // scope 1 at src/raw.rs:3711:37: 3711:62
+        switchInt(move _7) -> [1: bb5, 0: bb4, otherwise: bb24]; // scope 1 at src/raw.rs:3711:23: 3711:34
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/raw.rs:3720:16: 3720:22
+        _20 = copy _2;                   // scope 0 at src/raw.rs:3720:16: 3720:17
+        _19 = Eq(move _20, const 0_usize); // scope 0 at src/raw.rs:3720:16: 3720:22
+        switchInt(move _19) -> [0: bb12, otherwise: bb11]; // scope 0 at src/raw.rs:3720:16: 3720:22
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb6);  // scope 1 at src/raw.rs:3711:23: 3711:34
+        _8 = copy ((_5 as Some).0: usize); // scope 1 at src/raw.rs:3711:28: 3711:33
+        Coverage::VirtualCounter(bcb7);  // scope 1 at src/raw.rs:3714:31: 3714:37
+        _10 = copy _2;                   // scope 1 at src/raw.rs:3714:31: 3714:32
+        _9 = Ne(move _10, const 0_usize); // scope 1 at src/raw.rs:3714:31: 3714:37
+        switchInt(move _9) -> [0: bb7, otherwise: bb6]; // scope 1 at src/raw.rs:3714:31: 3714:37
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb8);  // scope 1 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:292:9: 294:10
+        Coverage::VirtualCounter(bcb9);  // scope 1 at src/raw.rs:3715:39: 3715:62
+        _13 = &(_1.1: raw::Bucket<T>);   // scope 1 at src/raw.rs:3715:39: 3715:48
+        _12 = Bucket::<T>::next_n(move _13, copy _8) -> [return: bb8, unwind: bb20]; // scope 1 at src/raw.rs:3715:39: 3715:62
+    }
+
+    bb7: {
+        Coverage::VirtualCounter(bcb10); // scope 1 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+        _11 = panic(const "assertion failed: n != 0") -> bb20; // scope 1 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+    }
+
+    bb8: {
+        _15 = &mut _4;                   // scope 2 at src/raw.rs:3716:23: 3716:24
+        _31 = const false;               // scope 2 at src/raw.rs:3716:25: 3716:28
+        _17 = move _3;                   // scope 2 at src/raw.rs:3716:25: 3716:28
+        _16 = (move _17, copy _12);      // scope 2 at src/raw.rs:3716:23: 3716:37
+        _14 = <F as FnMut<(B, Bucket<T>)>>::call_mut(move _15, move _16) -> [return: bb9, unwind: bb20]; // scope 2 at src/raw.rs:3716:23: 3716:37
+    }
+
+    bb9: {
+        _31 = const true;                // scope 2 at src/raw.rs:3716:17: 3716:20
+        _3 = move _14;                   // scope 2 at src/raw.rs:3716:17: 3716:20
+        _18 = SubWithOverflow(copy _2, const 1_usize); // scope 2 at src/raw.rs:3717:17: 3717:23
+        assert(!move (_18.1: bool), "attempt to compute `{} - {}`, which would overflow", copy _2, const 1_usize) -> [success: bb10, unwind: bb20]; // scope 2 at src/raw.rs:3717:17: 3717:23
+    }
+
+    bb10: {
+        _2 = move (_18.0: usize);        // scope 2 at src/raw.rs:3717:17: 3717:23
+        goto -> bb2;                     // scope 0 at src/raw.rs:3711:13: 3718:14
+    }
+
+    bb11: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at src/raw.rs:3760:5: 3760:6
+        _31 = const false;               // scope 0 at src/raw.rs:3721:24: 3721:27
+        _0 = move _3;                    // scope 0 at src/raw.rs:3721:24: 3721:27
+        drop(_4) -> [return: bb19, unwind: bb23]; // scope 0 at src/raw.rs:3760:5: 3760:6
+    }
+
+    bb12: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/raw.rs:3753:58: 3753:79
+        _26 = copy (_1.2: *const u8);    // scope 0 at src/raw.rs:3753:58: 3753:72
+        _25 = core::ptr::const_ptr::<impl *const u8>::cast::<Tag>(move _26) -> [return: bb13, unwind: bb20]; // scope 0 at src/raw.rs:3753:58: 3753:79
+    }
+
+    bb13: {
+        _24 = Group::load_aligned(move _25) -> [return: bb14, unwind: bb20]; // scope 0 at src/raw.rs:3753:38: 3753:80
+    }
+
+    bb14: {
+        _23 = &_24;                      // scope 0 at src/raw.rs:3753:38: 3753:80
+        _22 = Group::match_full(move _23) -> [return: bb15, unwind: bb20]; // scope 0 at src/raw.rs:3753:38: 3754:34
+    }
+
+    bb15: {
+        _21 = <BitMask as IntoIterator>::into_iter(move _22) -> [return: bb16, unwind: bb20]; // scope 0 at src/raw.rs:3753:38: 3755:33
+    }
+
+    bb16: {
+        (_1.0: control::bitmask::BitMaskIter) = move _21; // scope 0 at src/raw.rs:3753:17: 3755:33
+        _28 = &(_1.1: raw::Bucket<T>);   // scope 0 at src/raw.rs:3756:29: 3756:38
+        _27 = Bucket::<T>::next_n(move _28, const control::group::sse2::Group::WIDTH) -> [return: bb17, unwind: bb20]; // scope 0 at src/raw.rs:3756:29: 3756:59
+    }
+
+    bb17: {
+        (_1.1: raw::Bucket<T>) = move _27; // scope 0 at src/raw.rs:3756:17: 3756:59
+        _30 = copy (_1.2: *const u8);    // scope 0 at src/raw.rs:3757:34: 3757:48
+        _29 = core::ptr::const_ptr::<impl *const u8>::add(move _30, const control::group::sse2::Group::WIDTH) -> [return: bb18, unwind: bb20]; // scope 0 at src/raw.rs:3757:34: 3757:66
+    }
+
+    bb18: {
+        (_1.2: *const u8) = move _29;    // scope 0 at src/raw.rs:3757:17: 3757:66
+        goto -> bb1;                     // scope 0 at src/raw.rs:3710:9: 3759:10
+    }
+
+    bb19: {
+        return;                          // scope 0 at src/raw.rs:3760:6: 3760:6
+    }
+
+    bb20 (cleanup): {
+        drop(_4) -> [return: bb23, unwind terminate(cleanup)]; // scope 0 at src/raw.rs:3760:5: 3760:6
+    }
+
+    bb21 (cleanup): {
+        resume;                          // scope 0 at src/raw.rs:3706:5: 3760:6
+    }
+
+    bb22 (cleanup): {
+        drop(_3) -> [return: bb21, unwind terminate(cleanup)]; // scope 0 at src/raw.rs:3760:5: 3760:6
+    }
+
+    bb23 (cleanup): {
+        switchInt(copy _31) -> [0: bb21, otherwise: bb22]; // scope 0 at src/raw.rs:3760:5: 3760:6
+    }
+
+    bb24: {
+        unreachable;                     // scope 0 at src/raw.rs:3706:5: 3760:6
+    }
+}
+"#;
+
+    #[test]
+    fn drop_flag_write_before_a_loop_is_not_the_decision() {
+        // Before the fix both decomposed to `Const false`: the drop
+        // flag write in the entry block was read as the function's
+        // value, giving a candidate with no conditions.
+        for text in [COPY_WIDE_MIR, FOLD_IMPL_MIR] {
+            let mir = crate::mir::parse_text(text).expect("MIR parses");
+            assert_eq!(mir.functions.len(), 1);
+            let f = &mir.functions[0];
+            assert_eq!(
+                try_decompose_function(f),
+                Err(DeclineReason::UnsupportedShape),
+                "{}",
+                f.name
+            );
+        }
+    }
+
+    /// `fn decide(a: bool, b: bool) -> Option<bool> { let r = if a { b } else { false }; Some(r) }`
+    /// lowered with the per-arm value in `_3`, which the join block
+    /// moves into `_0`.
+    const ARM_LOCAL_FLOWS_TO_RETURN_MIR: &str = r#"
+fn decide(_1: bool, _2: bool) -> Option<bool> {
+    debug a => _1;
+    debug b => _2;
+    let mut _0: std::option::Option<bool>;
+    let mut _3: bool;
+    let mut _4: bool;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _3 = copy _2;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _3 = const false;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _4 = move _3;
+        _0 = Option::<bool>::Some(move _4);
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn arm_local_that_reaches_the_return_place_is_the_value() {
+        let mir = crate::mir::parse_text(ARM_LOCAL_FLOWS_TO_RETURN_MIR).expect("MIR parses");
+        assert_eq!(
+            decompose_function(&mir.functions[0]),
+            Some(ite("a", cond("b"), const_(false)))
+        );
+        // The same arm values written to a local the join block
+        // overwrites never reach `_0`.
+        let text = ARM_LOCAL_FLOWS_TO_RETURN_MIR.replace("_4 = move _3;", "_4 = const true;");
+        let mir = crate::mir::parse_text(&text).expect("MIR parses");
+        assert_eq!(decompose_function(&mir.functions[0]), None);
     }
 }
