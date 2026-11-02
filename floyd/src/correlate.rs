@@ -371,8 +371,7 @@ impl PreparedMir<'_> {
     /// its decision spans plus its coverage-mapping spans. The
     /// mapping spans are the record's own regions, so they find the
     /// record even when a decomposed condition sits at a span with
-    /// no region (a `const fn`'s `MIR FOR CTFE` body reads its
-    /// argument through a copy whose span no region covers).
+    /// no region.
     pub fn lookup_spans(&self, fn_idx: usize, tree: &DecisionTree) -> Vec<SourceSpan> {
         let mut out = self.decision_spans(fn_idx, tree);
         if let Some(mapped) = self.mapping_spans.get(fn_idx) {
@@ -1255,9 +1254,9 @@ fn decide(_1: bool, _2: bool) -> bool {
     /// coverage mappings are printed): the inherent method
     /// `RuleDay::julian_0`, the trait method `<NaiveTime as
     /// Timelike>::with_nanosecond`, and the `MIR FOR CTFE` body of
-    /// the `const fn` `FixedOffset::east_opt` (which decomposes to a
-    /// condition `secs` read through a copy at 63:22-63:26, a span
-    /// no coverage region covers).
+    /// the `const fn` `FixedOffset::east_opt` (whose operand set-up
+    /// copy `_3 = copy _1` at 63:22-63:26 once decomposed as a
+    /// spurious condition `secs`; it is not a decision).
     const CHRONO_MIR: &str = r#"
 fn rule::<impl at src/offset/local/tz_info/rule.rs:460:1: 460:13>::julian_0(_1: u16) -> Result<RuleDay, tz_info::Error> {
     debug julian_day_0 => _1;            // in scope 0 at src/offset/local/tz_info/rule.rs:500:23: 500:35
@@ -1444,9 +1443,6 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -
 
     const WITH_NANOSECOND_RECORD: &str = r#"{"name": "_RNvXs_NtNtCseI4Ere5mNTx_6chrono5naive4timeNtB4_9NaiveTimeNtNtB8_6traits8Timelike15with_nanosecondB8_", "count": 66, "filenames": ["/home/ubuntu/work/verify-span/chrono/src-copy/src/naive/time/mod.rs"], "regions": [[1109, 5, 1109, 62, 66, 0, 0, 0], [1110, 12, 1110, 33, 66, 0, 0, 0], [1111, 13, 1111, 24, 0, 0, 0, 0], [1112, 9, 1112, 10, 66, 0, 0, 0], [1113, 9, 1113, 48, 66, 0, 0, 0], [1114, 5, 1114, 6, 66, 0, 0, 0]], "branches": [[1110, 12, 1110, 33, 0, 66, 0, 0, 4]]}"#;
 
-    /// Real single-test record (`offset::fixed::tests::test_date_extreme_offset`).
-    const EAST_OPT_RECORD: &str = r#"{"name": "_RNvMNtNtCseI4Ere5mNTx_6chrono6offset5fixedNtB2_11FixedOffset8east_opt", "count": 2, "filenames": ["/home/ubuntu/work/verify-span/chrono/src-copy/src/offset/fixed.rs"], "regions": [[62, 5, 62, 60, 2, 0, 0, 0], [63, 12, 63, 26, 2, 0, 0, 0], [63, 30, 63, 43, 2, 0, 0, 0], [64, 13, 64, 56, 2, 0, 0, 0], [66, 13, 66, 17, 0, 0, 0, 0], [68, 5, 68, 6, 2, 0, 0, 0]], "branches": [[63, 12, 63, 26, 2, 0, 0, 0, 4], [63, 30, 63, 43, 2, 0, 0, 0, 4]]}"#;
-
     fn export(functions: &[&str]) -> CoverageReport {
         let json = format!(
             r#"{{"data": [{{"files": [], "functions": [{}], "totals": {{}}}}],
@@ -1537,26 +1533,32 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -
         assert_eq!(c.observations[0].result, Some(false));
     }
 
+    /// `julian_0_record` with the condition's region and branch
+    /// (501:12-501:30) removed: a record whose regions do not cover
+    /// the decision's condition span.
+    const JULIAN_0_RECORD_NO_CONDITION_REGION: &str = r#"{"name": "_RNvMs2_NtNtNtNtCseI4Ere5mNTx_6chrono6offset5local7tz_info4ruleNtB5_7RuleDay8julian_0", "count": 1, "filenames": ["/home/ubuntu/work/verify-span/chrono/src-copy/src/offset/local/tz_info/rule.rs"], "regions": [[500, 5, 500, 64, 1, 0, 0, 0], [502, 13, 502, 77, 0, 0, 0, 0], [503, 9, 503, 10, 0, 0, 0, 0], [505, 9, 505, 51, 1, 0, 0, 0], [506, 5, 506, 6, 1, 0, 0, 0]], "branches": []}"#;
+
     #[test]
     fn mapping_spans_find_the_record_when_the_condition_span_has_none() {
-        // The CTFE body's decision `secs` sits at 63:22-63:26, which
-        // no region covers. Its coverage mappings still locate
-        // east_opt's record: the function ran (invoked), and the
-        // decision has no counters (no observations).
+        // The decision `julian_day_0 > 365` sits at 501:12-501:30,
+        // which no region of this record covers. The body's coverage
+        // mappings still locate julian_0's record: the function ran
+        // (invoked), and the decision has no counters (no
+        // observations).
         let mir = mir::parse_text(CHRONO_MIR).expect("MIR parses");
         let paths = chrono_paths();
         let mut prepared = prepare_mir(&mir, &paths);
-        let (idx, tree) = chrono_candidate(&mir, "east_opt");
+        let (idx, tree) = chrono_candidate(&mir, "julian_0");
         let tests = vec![(
-            "offset::fixed::tests::test_date_extreme_offset".to_string(),
-            CoverageIndex::build(&export(&[EAST_OPT_RECORD]), &paths),
+            "offset::local::tz_info::rule::tests::test_rule_day".to_string(),
+            CoverageIndex::build(&export(&[JULIAN_0_RECORD_NO_CONDITION_REGION]), &paths),
         )];
         let c = join_candidate(&prepared, idx, &tree, &tests);
         assert_eq!(c.status, CoverageStatus::Invoked);
         assert!(c.observations.is_empty());
         assert_eq!(
             c.display_name.as_deref(),
-            Some("<chrono::offset::fixed::FixedOffset>::east_opt")
+            Some("<chrono::offset::local::tz_info::rule::RuleDay>::julian_0")
         );
         // Without the mappings the decision span alone finds nothing.
         prepared.mapping_spans[idx].clear();
@@ -1568,6 +1570,20 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn ctfe_operand_copy_is_not_a_candidate() {
+        // east_opt's `_3 = copy _1` feeds the `Lt` compare in the same
+        // block; it is operand set-up, not the block's value, so the
+        // body yields no single-condition `secs` decision.
+        let mir = mir::parse_text(CHRONO_MIR).expect("MIR parses");
+        let f = mir
+            .functions
+            .iter()
+            .find(|f| f.name.contains("east_opt"))
+            .expect("function in fixture");
+        assert_eq!(decision::decompose_function(f), None);
     }
 
     #[test]
