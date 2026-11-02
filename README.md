@@ -15,7 +15,7 @@ $ cargo floyd test
 floyd  runtime MC/DC analysis of Cargo.toml
 
 Tests discovered: 4
-Observations:     4
+Observations:     4 (4 used, 0 ambiguous)
 Conditions:       channel_a_ok, channel_b_ok, master_enable
 
 Per-condition MC/DC status:
@@ -25,6 +25,14 @@ Per-condition MC/DC status:
 
 MC/DC coverage: 3 of 3 conditions exercised (100%)
 ```
+
+Each test contributes one observation per decision it evaluates.
+An observation is *used* when the test evaluated the decision once
+(or its counters otherwise identify the condition vector); a test
+that evaluated it several times with differing values is reported
+as *ambiguous* and can leave a condition `unknown (ambiguous)`
+rather than exercised or unexercised. See
+[Tests that evaluate a decision more than once](#tests-that-evaluate-a-decision-more-than-once).
 
 ## Install
 
@@ -210,9 +218,11 @@ incomplete MC/DC coverage, post-process the JUnit XML — any
 `<failure>` element with `type="UnexercisedCondition"` indicates
 a missing pair, and `type="AmbiguousCondition"` a condition whose
 only evidence came from tests that evaluated the decision more than
-once (see "Tests that evaluate a decision more than once"). The CI-native test-result steps (`reports: junit:`
-on GitLab, `junit '...'` on Jenkins, JUnit-aware actions on GitHub)
-all surface these as failing tests in their respective UIs.
+once (see [Tests that evaluate a decision more than
+once](#tests-that-evaluate-a-decision-more-than-once)). The
+CI-native test-result steps (`reports: junit:` on GitLab,
+`junit '...'` on Jenkins, JUnit-aware actions on GitHub) all surface
+these as failing tests in their respective UIs.
 
 ## Why MC/DC, why this engine
 
