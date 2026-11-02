@@ -173,3 +173,27 @@ fn single_evaluation_tests_still_demonstrate_full_mcdc() {
         );
     }
 }
+
+#[test]
+fn loop_inside_a_function_called_once_is_still_multi_evaluation() {
+    // The decision runs twice inside ONE call (a loop in the body):
+    // the function entry count is 1, but the root condition `a` was
+    // tested twice. The evaluation count must come from the root,
+    // so the test is ambiguous rather than a single (T,T) vector.
+    let mir = mir::parse_text(AND_MIR).expect("MIR parses");
+    let tree = decision::decompose(&mir);
+    let prepared = correlate::prepare_mir(&mir);
+    let cov = coverage(1, (1, 1), (1, 0));
+    let pcov = correlate::prepare_coverage_lookup(&cov);
+    let observations = correlate::observations_from_prepared_coverage(
+        Some("loop_in_one_call".to_string()),
+        &prepared,
+        0,
+        &pcov,
+        &tree,
+    );
+    assert_eq!(observations.len(), 1);
+    assert!(observations[0].ambiguous);
+    assert_eq!(observations[0].evaluations, Some(2));
+    assert!(observations[0].inputs.is_empty());
+}
