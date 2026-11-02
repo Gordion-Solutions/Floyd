@@ -432,6 +432,51 @@ pub enum MirTerminator {
         /// Source span, if present in the MIR.
         span: Option<SourceSpan>,
     },
+    /// `_<dst> = <func-expr>(<args>) -> unwind <action>;` or
+    /// `_<dst> = <func-expr>(<args>) -> bb<cleanup>;`
+    ///
+    /// A call with no `return` edge: the callee returns `!`
+    /// (`core::panicking::panic`, `std::rt::panic_fmt`,
+    /// `std::rt::begin_panic`, `core::panicking::assert_failed`,
+    /// `std::process::exit`, ..). Control never continues past it, so
+    /// a path that reaches one diverges. This is how rustc lowers the
+    /// failure arm of `assert!`, `assert_eq!`, `panic!`, `unwrap()`
+    /// and friends.
+    NoReturnCall {
+        /// Local named as the (never-written) destination.
+        dst: LocalId,
+        /// Verbatim text of the function expression, as for
+        /// [`MirTerminator::Call::func_text`].
+        func_text: String,
+        /// Source span, if present in the MIR.
+        span: Option<SourceSpan>,
+    },
+    /// `assert(<cond>, "<msg>", <args>..) -> [success: bb<target>, unwind ..];`
+    ///
+    /// rustc's checked-operation terminator: overflow checks on
+    /// arithmetic (`a + b` under `-C overflow-checks`), division by
+    /// zero, array bounds checks, alignment checks. When `<cond>`
+    /// holds, control continues at `success`; otherwise the runtime
+    /// panics with `msg`. The `success` edge is the function's
+    /// normal control flow, so successor-following code treats an
+    /// `Assert` like a non-panicking [`MirTerminator::Call`] or a
+    /// [`MirTerminator::Goto`]. The assert itself is never a user
+    /// decision: it has no source-level `if`, and its failure edge
+    /// is a panic.
+    Assert {
+        /// Successor block reached when the asserted condition holds.
+        success: BlockId,
+        /// Cleanup block named by `unwind: bb<N>`, if any. `None` for
+        /// `unwind continue`, `unwind unreachable` and
+        /// `unwind terminate(..)`.
+        unwind: Option<BlockId>,
+        /// The panic message template (the string literal's contents,
+        /// escapes left as rustc printed them), e.g.
+        /// ``attempt to compute `{} + {}`, which would overflow``.
+        msg: String,
+        /// Source span, if present in the MIR.
+        span: Option<SourceSpan>,
+    },
     /// A terminator shape Phase 0 doesn't yet parse. Preserved verbatim.
     Other {
         /// Original text of the terminator.
@@ -589,7 +634,8 @@ fn is_fn_header_line(line: &str) -> bool {
 ///
 /// Phase 0 scope: function headers, `debug` annotations, `let`
 /// locals, blocks with `copy`/`const bool` assignments, and
-/// `return` / `goto` / `switchInt` terminators. Other shapes pass
+/// `return` / `goto` / `switchInt` / `unreachable` / call / `assert`
+/// terminators. Other shapes pass
 /// through as [`MirStatement::Other`] / [`MirTerminator::Other`].
 ///
 /// When the MIR was emitted with `-Zmir-include-spans`, the parser
@@ -1370,15 +1416,7 @@ fn parse_call_terminator(s: &str) -> Option<CallTerminator> {
     let lhs = &s[..=arrow_idx]; // up to and including the `)`
     let arms_str = s[arrow_idx + 6..].strip_suffix(']')?;
 
-    let eq = lhs.find(" = ")?;
-    let dst = lhs[..eq].trim().strip_prefix('_')?.parse::<u32>().ok()?;
-    let call_expr = lhs[eq + 3..].trim();
-    // Capture the function expression text (everything up to the
-    // opening `(` of the argument list). Used by the `?` detector.
-    let func_text = match call_expr.find('(') {
-        Some(p) => call_expr[..p].trim().to_string(),
-        None => call_expr.to_string(),
-    };
+    let (dst, func_text) = parse_call_lhs(lhs)?;
 
     // Find the `return: bb<N>` arm. Other arms (unwind continue,
     // unwind: bb20, etc.) are ignored — Floyd does not follow
@@ -1397,6 +1435,96 @@ fn parse_call_terminator(s: &str) -> Option<CallTerminator> {
         func_text,
         target: target?,
     })
+}
+
+struct AssertTerminator {
+    success: BlockId,
+    unwind: Option<BlockId>,
+    msg: String,
+}
+
+/// Parse an assert terminator of the form
+/// `assert(<cond>, "<msg>", <args>..) -> [success: bb<N>, unwind <action>]`
+/// (the trailing `;` has already been stripped). `<action>` is one of
+/// `continue`, `unreachable`, `terminate(..)` or `: bb<M>`. Returns
+/// `None` if the shape doesn't match.
+fn parse_assert_terminator(s: &str) -> Option<AssertTerminator> {
+    let rest = s.strip_prefix("assert(")?;
+    // The arm list is the last `) -> [..]` on the line; the message
+    // literal sits before it, so `rfind` cannot land inside it.
+    let arrow_idx = rest.rfind(") -> [")?;
+    let args = &rest[..arrow_idx];
+    let arms_str = rest[arrow_idx + 6..].strip_suffix(']')?;
+
+    let msg = first_string_literal(args)?;
+
+    let mut success: Option<BlockId> = None;
+    let mut unwind: Option<BlockId> = None;
+    for arm in split_top_level(arms_str, ',') {
+        let arm = arm.trim();
+        if let Some(t) = arm.strip_prefix("success:") {
+            success = Some(t.trim().strip_prefix("bb")?.parse::<u32>().ok()?);
+        } else if let Some(t) = arm.strip_prefix("unwind:") {
+            unwind = Some(t.trim().strip_prefix("bb")?.parse::<u32>().ok()?);
+        }
+    }
+    Some(AssertTerminator {
+        success: success?,
+        unwind,
+        msg,
+    })
+}
+
+/// Return the contents of the first double-quoted string literal in
+/// `s`, honouring backslash escapes (which are kept verbatim). `None`
+/// if `s` has no complete literal.
+fn first_string_literal(s: &str) -> Option<String> {
+    let open = s.find('"')?;
+    let body = &s[open + 1..];
+    let mut escaped = false;
+    for (i, c) in body.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return Some(body[..i].to_string()),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split `_<dst> = <func-expr>(<args>)` into the destination local
+/// and the function expression text (everything up to the opening
+/// `(` of the argument list; used by the `?` detector and the panic
+/// filter).
+fn parse_call_lhs(lhs: &str) -> Option<(LocalId, String)> {
+    let eq = lhs.find(" = ")?;
+    let dst = lhs[..eq].trim().strip_prefix('_')?.parse::<u32>().ok()?;
+    let call_expr = lhs[eq + 3..].trim();
+    let func_text = match call_expr.find('(') {
+        Some(p) => call_expr[..p].trim().to_string(),
+        None => call_expr.to_string(),
+    };
+    Some((dst, func_text))
+}
+
+/// Parse a call terminator with no return edge,
+/// `_<dst> = <func-expr>(<args>) -> unwind <action>` or
+/// `_<dst> = <func-expr>(<args>) -> bb<cleanup>` (the trailing `;`
+/// has already been stripped). Returns `None` for any other shape,
+/// including calls that do return (`-> [return: ..]`).
+fn parse_noreturn_call_terminator(s: &str) -> Option<(LocalId, String)> {
+    let arrow_idx = s.rfind(") -> ")?;
+    let edge = &s[arrow_idx + 5..];
+    let is_unwind_only = edge.starts_with("unwind ")
+        || edge.starts_with("unwind:")
+        || edge
+            .strip_prefix("bb")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    if !is_unwind_only {
+        return None;
+    }
+    parse_call_lhs(&s[..=arrow_idx])
 }
 
 /// Parse a local token that may carry a `copy`/`move` prefix, returning
@@ -1467,12 +1595,31 @@ fn parse_terminator(line: &str, span: Option<SourceSpan>) -> Option<MirTerminato
             .map(|target| MirTerminator::Goto { target, span });
     }
 
+    // Before the Call parser: an assert's message text is free-form
+    // and must never be mistaken for a `_N = f(..)` call.
+    if let Some(assert) = parse_assert_terminator(s) {
+        return Some(MirTerminator::Assert {
+            success: assert.success,
+            unwind: assert.unwind,
+            msg: assert.msg,
+            span,
+        });
+    }
+
     if let Some(call) = parse_call_terminator(s) {
         let _ = span.as_ref(); // keep `span` lifetime explicit for readability
         return Some(MirTerminator::Call {
             dst: call.dst,
             func_text: call.func_text,
             target: call.target,
+            span,
+        });
+    }
+
+    if let Some((dst, func_text)) = parse_noreturn_call_terminator(s) {
+        return Some(MirTerminator::NoReturnCall {
+            dst,
+            func_text,
             span,
         });
     }
@@ -2052,6 +2199,233 @@ fn decide(_1: Option<bool>) -> Option<bool> {
     }
 }
 "#;
+
+    /// `rustc +nightly --emit=mir -Zmir-include-spans -C overflow-checks=on
+    /// -C debug-assertions=on` output (nightly 1.101, 2026-10-28) for
+    ///
+    /// ```text
+    /// pub fn add_checked(a: u32, b: u32) -> u32 {
+    ///     debug_assert!(a < 1000);
+    ///     a + b
+    /// }
+    /// ```
+    ///
+    /// `bb2` ends in the overflow-check `assert` terminator; `bb1` is
+    /// the `debug_assert!` failure path (a diverging panic call).
+    const ASSERT_OVERFLOW_MIR: &str = r#"
+fn add_checked(_1: u32, _2: u32) -> u32 {
+    debug a => _1;                       // in scope 0 at ov.rs:1:20: 1:21
+    debug b => _2;                       // in scope 0 at ov.rs:1:28: 1:29
+    let mut _0: u32;                     // return place in scope 0 at ov.rs:1:39: 1:42
+    let mut _3: bool;                    // in scope 0 at ov.rs:2:19: 2:27
+    let mut _4: !;                       // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+    let mut _5: (u32, bool);             // in scope 0 at ov.rs:3:5: 3:10
+
+    bb0: {
+        _3 = Lt(copy _1, const 1000_u32); // scope 0 at ov.rs:2:19: 2:27
+        switchInt(move _3) -> [0: bb1, otherwise: bb2]; // scope 0 at ov.rs:2:19: 2:27
+    }
+
+    bb1: {
+        _4 = core::panicking::panic(const "assertion failed: a < 1000") -> unwind continue; // scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+                                         // mir::ConstOperand
+                                         // + span: /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+                                         // + const_: Const { ty: fn(&'static str) -> ! {core::panicking::panic}, val: Value(core::panicking::panic) }
+                                         // mir::ConstOperand
+                                         // + span: no-location
+                                         // + const_: Const { ty: &str, val: Value("assertion failed: a < 1000") }
+    }
+
+    bb2: {
+        _5 = AddWithOverflow(copy _1, copy _2); // scope 0 at ov.rs:3:5: 3:10
+        assert(!move (_5.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _1, copy _2) -> [success: bb3, unwind continue]; // scope 0 at ov.rs:3:5: 3:10
+    }
+
+    bb3: {
+        _0 = move (_5.0: u32);           // scope 0 at ov.rs:3:5: 3:10
+        return;                          // scope 0 at ov.rs:4:2: 4:2
+    }
+}
+"#;
+
+    /// `rustc +nightly --emit=mir -C overflow-checks=on` output
+    /// (nightly 1.101, comment lines stripped) for
+    ///
+    /// ```text
+    /// pub fn idx(v: Vec<u32>, i: usize) -> u32 {
+    ///     let a = [1u32, 2, 3];
+    ///     a[i] + v.len() as u32
+    /// }
+    /// ```
+    ///
+    /// A bounds-check `assert` and an overflow-check `assert`, both
+    /// unwinding to the cleanup block `bb5` because `v` needs a drop.
+    const ASSERT_UNWIND_CLEANUP_MIR: &str = r#"
+fn idx(_1: Vec<u32>, _2: usize) -> u32 {
+    debug v => _1;
+    debug i => _2;
+    let mut _0: u32;
+    let _3: [u32; 3];
+    let mut _4: u32;
+    let mut _5: bool;
+    let mut _6: u32;
+    let mut _7: usize;
+    let mut _8: &std::vec::Vec<u32>;
+    let mut _9: (u32, bool);
+    scope 1 {
+        debug a => _3;
+    }
+
+    bb0: {
+        _3 = [const 1_u32, const 2_u32, const 3_u32];
+        _5 = Lt(copy _2, const 3_usize);
+        assert(move _5, "index out of bounds: the length is {} but the index is {}", const 3_usize, copy _2) -> [success: bb1, unwind: bb5];
+    }
+
+    bb1: {
+        _4 = copy _3[_2];
+        _8 = &_1;
+        _7 = Vec::<u32>::len(move _8) -> [return: bb2, unwind: bb5];
+    }
+
+    bb2: {
+        _6 = move _7 as u32 (IntToInt);
+        _9 = AddWithOverflow(copy _4, copy _6);
+        assert(!move (_9.1: bool), "attempt to compute `{} + {}`, which would overflow", move _4, move _6) -> [success: bb3, unwind: bb5];
+    }
+
+    bb3: {
+        _0 = move (_9.0: u32);
+        drop(_1) -> [return: bb4, unwind continue];
+    }
+
+    bb4: {
+        return;
+    }
+
+    bb5 (cleanup): {
+        drop(_1) -> [return: bb6, unwind terminate(cleanup)];
+    }
+
+    bb6 (cleanup): {
+        resume;
+    }
+}
+"#;
+
+    fn block(f: &MirFunction, id: BlockId) -> &MirBlock {
+        f.blocks.iter().find(|b| b.id == id).expect("block exists")
+    }
+
+    #[test]
+    fn parses_overflow_assert_terminator() {
+        let mir = parse_text(ASSERT_OVERFLOW_MIR).expect("parse ok");
+        let f = &mir.functions[0];
+        let bb2 = block(f, 2);
+        match &bb2.terminator {
+            MirTerminator::Assert {
+                success,
+                unwind,
+                msg,
+                span,
+            } => {
+                assert_eq!(*success, 3);
+                assert_eq!(*unwind, None, "`unwind continue` names no block");
+                assert_eq!(msg, "attempt to compute `{} + {}`, which would overflow");
+                let span = span.as_ref().expect("span recovered");
+                assert_eq!((span.start_line, span.start_col), (3, 5));
+            }
+            other => panic!("expected Assert, got {other:?}"),
+        }
+        // The terminator line must not also leak into the statements.
+        assert!(
+            bb2.statements.iter().all(
+                |s| !matches!(s, MirStatement::Other { text, .. } if text.contains("assert("))
+            ),
+            "assert line kept as a statement: {:?}",
+            bb2.statements
+        );
+    }
+
+    #[test]
+    fn parses_assert_terminator_with_cleanup_unwind() {
+        let mir = parse_text(ASSERT_UNWIND_CLEANUP_MIR).expect("parse ok");
+        let f = &mir.functions[0];
+        match &block(f, 0).terminator {
+            MirTerminator::Assert {
+                success,
+                unwind,
+                msg,
+                ..
+            } => {
+                assert_eq!(*success, 1);
+                assert_eq!(*unwind, Some(5));
+                assert_eq!(
+                    msg,
+                    "index out of bounds: the length is {} but the index is {}"
+                );
+            }
+            other => panic!("expected bounds-check Assert, got {other:?}"),
+        }
+        assert!(matches!(
+            block(f, 2).terminator,
+            MirTerminator::Assert {
+                success: 3,
+                unwind: Some(5),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn assert_parser_rejects_non_assert_shapes() {
+        assert!(parse_assert_terminator("goto -> bb1").is_none());
+        // No `success` arm.
+        assert!(parse_assert_terminator("assert(move _5, \"m\") -> [unwind continue]").is_none());
+        // Message literal with an escaped quote and a comma survives.
+        let a = parse_assert_terminator(
+            "assert(move _5, \"a \\\"b\\\", c\", copy _2) -> [success: bb7, unwind unreachable]",
+        )
+        .expect("parses");
+        assert_eq!(a.success, 7);
+        assert_eq!(a.unwind, None);
+        assert_eq!(a.msg, "a \\\"b\\\", c");
+    }
+
+    #[test]
+    fn parses_noreturn_call_terminators() {
+        // `-> unwind continue`: the `debug_assert!` failure call.
+        let mir = parse_text(ASSERT_OVERFLOW_MIR).expect("parse ok");
+        match &block(&mir.functions[0], 1).terminator {
+            MirTerminator::NoReturnCall { dst, func_text, .. } => {
+                assert_eq!(*dst, 4);
+                assert_eq!(func_text, "core::panicking::panic");
+            }
+            other => panic!("expected NoReturnCall, got {other:?}"),
+        }
+        // `-> bb<cleanup>`: `panic!("big")` in a fn holding a `String`
+        // (rustc nightly 1.101 output).
+        let t = parse_terminator(
+            "_4 = std::rt::begin_panic::<&str>(const \"big\") -> bb5;",
+            None,
+        );
+        assert!(
+            matches!(
+                &t,
+                Some(MirTerminator::NoReturnCall { dst: 4, func_text, .. })
+                    if func_text == "std::rt::begin_panic::<&str>"
+            ),
+            "got {t:?}"
+        );
+        // A returning call is still a `Call`, not a `NoReturnCall`.
+        assert!(matches!(
+            parse_terminator(
+                "_7 = Vec::<u32>::len(move _8) -> [return: bb2, unwind: bb5];",
+                None
+            ),
+            Some(MirTerminator::Call { target: 2, .. })
+        ));
+    }
 
     #[test]
     fn parses_call_terminator() {
