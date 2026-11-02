@@ -43,7 +43,7 @@
 //!
 //! [ADR-0002]: ../../../architecture/decisions/0002-runtime-pipeline.md
 
-use crate::coverage_index::{CoverageIndex, FunctionKey, FunctionMatch, PathNormaliser, SpanRole};
+use crate::coverage_index::{CoverageIndex, FunctionId, FunctionMatch, PathNormaliser};
 use crate::decision::{self, DecisionTree, Node};
 use crate::masking::{BranchCounts, ConditionObservation};
 use crate::mir::{Mir, MirFunction, MirStatement, MirTerminator, SourceSpan};
@@ -101,7 +101,7 @@ pub fn correlate(mir: &Mir, coverage: &CoverageReport, paths: &PathNormaliser) -
     let mut map = DecisionMap::default();
     for (f, spans) in mir.functions.iter().zip(&prepared.function_spans) {
         let mut conditions = BTreeMap::new();
-        if let FunctionMatch::Found(cov_fn) = index.resolve(spans.values()) {
+        if let FunctionMatch::Found(cov_fn) = index.resolve(spans.values(), Some(&f.name)) {
             for (name, span) in spans {
                 if let Some(counts) = cov_fn.branch_counts(span) {
                     conditions.insert(
@@ -423,7 +423,8 @@ pub fn join_test<'i>(
     else {
         return none(FunctionMatch::Missing);
     };
-    let matched = index.resolve(&prepared.lookup_spans(fn_idx, tree));
+    let mir_name = prepared.mir.functions.get(fn_idx).map(|f| f.name.as_str());
+    let matched = index.resolve(&prepared.lookup_spans(fn_idx, tree), mir_name);
     let FunctionMatch::Found(cov_fn) = matched else {
         return none(matched);
     };
@@ -474,7 +475,8 @@ pub enum NotMeasurableReason {
     NoCoverageRecord,
     /// The decision's spans cannot be attributed to one source
     /// function: they fall in more than one coverage function, the
-    /// coverage records at those spans name different functions, or
+    /// coverage records at those spans are different functions that
+    /// no exact crate-relative path picks between, or
     /// another candidate with a different MIR name resolves to the
     /// same coverage function.
     AmbiguousSpans,
@@ -515,7 +517,7 @@ pub struct CandidateCoverage {
     pub display_name: Option<String>,
     /// Keys of the coverage functions the candidate resolved to
     /// (one per distinct key across tests).
-    pub function_keys: Vec<FunctionKey>,
+    pub function_keys: Vec<FunctionId>,
 }
 
 impl CandidateCoverage {
@@ -601,7 +603,7 @@ pub fn join_candidate(
     tests: &[(String, CoverageIndex)],
 ) -> CandidateCoverage {
     let mut observations = Vec::new();
-    let mut function_keys: Vec<FunctionKey> = Vec::new();
+    let mut function_keys: Vec<FunctionId> = Vec::new();
     let mut display_name = None;
     let mut ambiguous: Option<String> = None;
     let mut invoked = false;
@@ -615,10 +617,10 @@ pub fn join_candidate(
             FunctionMatch::Found(f) => {
                 invoked |= f.count > 0;
                 if display_name.is_none() {
-                    display_name = f.display_name();
+                    display_name = Some(f.display_name().to_string());
                 }
-                if !function_keys.iter().any(|k| k.as_slice() == f.key()) {
-                    function_keys.push(f.key().to_vec());
+                if !function_keys.contains(f.id()) {
+                    function_keys.push(f.id().clone());
                 }
             }
         }
@@ -665,16 +667,16 @@ pub fn join_candidate(
 /// example a body whose MIR carries spans inlined from another
 /// function), so neither candidate's counters can be trusted.
 pub fn mark_shared_coverage(candidates: &mut [(&str, &mut CandidateCoverage)]) {
-    let mut names_by_key: HashMap<&[(SpanRole, SourceSpan)], BTreeSet<&str>> = HashMap::new();
+    let mut names_by_key: HashMap<&FunctionId, BTreeSet<&str>> = HashMap::new();
     for (name, c) in candidates.iter() {
         for key in &c.function_keys {
-            names_by_key.entry(key.as_slice()).or_default().insert(name);
+            names_by_key.entry(key).or_default().insert(name);
         }
     }
-    let shared: Vec<(FunctionKey, Vec<String>)> = names_by_key
+    let shared: Vec<(FunctionId, Vec<String>)> = names_by_key
         .into_iter()
         .filter(|(_, names)| names.len() > 1)
-        .map(|(key, names)| (key.to_vec(), names.into_iter().map(String::from).collect()))
+        .map(|(key, names)| (key.clone(), names.into_iter().map(String::from).collect()))
         .collect();
     for (key, names) in shared {
         for (_, c) in candidates.iter_mut() {

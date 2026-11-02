@@ -20,24 +20,27 @@
 //!   branch regions, each as a [`SourceSpan`] whose file has been
 //!   put in canonical form by [`PathNormaliser`]. Spans in
 //!   `/rustc/<hash>/...` (standard-library code) are dropped.
-//! - **Merge.** Records whose keys are equal describe the same
-//!   source function: the monomorphisations of one generic function
+//! - **Merge.** Records with equal keys whose symbols demangle to
+//!   the same path once generic arguments are removed
+//!   ([`display_name`]) describe the same source function: the
+//!   monomorphisations of one generic function
 //!   (`set_if_consistent::<u32>`, `::<i64>`, ...) and the same
 //!   function compiled into several crates of one binary. They are
 //!   merged into one [`CoveredFunction`] whose entry count and branch
 //!   counters are the **sums** over the merged records, so a generic
 //!   candidate is credited with the union of its instantiations.
+//!   Equal keys with different paths (functions stamped out by one
+//!   `macro_rules!` body) are not merged.
 //! - **Lookup.** [`CoverageIndex::resolve`] takes a candidate's
-//!   condition spans and returns the one merged function containing
-//!   any of them, [`FunctionMatch::Missing`] if none does, and
-//!   [`FunctionMatch::Ambiguous`] if the spans land in more than one
-//!   merged function or the merged function's records demangle to
-//!   more than one function path (distinct functions sharing the
-//!   same spans, as macro-generated code can).
+//!   spans and returns the one merged function containing any of
+//!   them, [`FunctionMatch::Missing`] if none does, and
+//!   [`FunctionMatch::Ambiguous`] if they land in more than one.
 //!
-//! There is no name-based fallback. A display name is derived from
-//! the merged records' symbols for reports only (see
-//! [`display_name`]).
+//! Names are never used to find a record. The one name comparison,
+//! [`full_path_matches`], only chooses among functions the spans
+//! already matched, and only on an exact crate-relative path; see
+//! there for the case that needs it. A display name is derived from
+//! the merged records' symbols for reports (see [`display_name`]).
 
 use crate::masking::BranchCounts;
 use crate::mir::SourceSpan;
@@ -147,18 +150,34 @@ pub enum SpanRole {
     Branch,
 }
 
-/// The merge key of a [`CoveredFunction`]: its sorted
-/// `(role, normalised span)` pairs.
+/// The sorted `(role, normalised span)` pairs of a record's code
+/// and branch regions.
 pub type FunctionKey = Vec<(SpanRole, SourceSpan)>;
 
+/// What identifies one source function in coverage: its span set
+/// and its [`display_name`]. Two indexes (two tests' coverage) that
+/// hold equal ids hold the same source function.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FunctionId {
+    /// The function's code and branch spans.
+    pub spans: FunctionKey,
+    /// The demangled path without crate hashes or generic arguments.
+    pub name: String,
+}
+
 /// One source function's coverage: every `llvm-cov` record with the
-/// same span key, merged.
+/// same [`FunctionId`], merged.
 ///
-/// Records are merged when their keys (normalised code-region and
-/// branch spans) are equal. For a generic function that is one
-/// record per monomorphisation, all with the same spans; the merged
-/// [`Self::count`] and branch counters are the sums over them, so the
-/// function is credited with the union of its instantiations.
+/// Records are merged when their span sets (normalised code-region
+/// and branch spans) are equal and their symbols demangle to the
+/// same path once generic arguments are removed. For a generic
+/// function that is one record per monomorphisation, all with the
+/// same spans; the merged [`Self::count`] and branch counters are
+/// the sums over them, so the function is credited with the union of
+/// its instantiations. Records with equal spans but different paths
+/// (functions stamped out by one `macro_rules!` body, such as
+/// `fixed::from_str::u8::get_int` and `fixed::from_str::u16::get_int`)
+/// stay separate.
 #[derive(Debug, Clone)]
 pub struct CoveredFunction {
     /// Mangled symbols of the merged records, in report order.
@@ -168,31 +187,18 @@ pub struct CoveredFunction {
     /// Branch regions with normalised spans, sorted by span; each
     /// counter is the sum over the merged records.
     pub branches: Vec<Branch>,
-    /// The merge key.
-    key: FunctionKey,
+    id: FunctionId,
 }
 
 impl CoveredFunction {
-    /// The merge key: this function's sorted `(role, span)` pairs.
-    /// Equal keys in two indexes (two tests' coverage) identify the
-    /// same source function.
-    pub fn key(&self) -> &[(SpanRole, SourceSpan)] {
-        &self.key
+    /// The merge identity: span set and display name.
+    pub fn id(&self) -> &FunctionId {
+        &self.id
     }
 
-    /// The distinct [`display_name`]s of the merged symbols.
-    pub fn display_names(&self) -> BTreeSet<String> {
-        self.symbols.iter().map(|s| display_name(s)).collect()
-    }
-
-    /// The display name when all merged symbols agree on one.
-    pub fn display_name(&self) -> Option<String> {
-        let names = self.display_names();
-        if names.len() == 1 {
-            names.into_iter().next()
-        } else {
-            None
-        }
+    /// The report name shared by every merged symbol.
+    pub fn display_name(&self) -> &str {
+        &self.id.name
     }
 
     /// Summed counters of the first branch region at exactly `span`
@@ -254,7 +260,7 @@ impl CoverageIndex {
         wanted: Option<&HashSet<SourceSpan>>,
     ) -> Self {
         let mut functions: Vec<CoveredFunction> = Vec::new();
-        let mut by_key: HashMap<FunctionKey, usize> = HashMap::new();
+        let mut by_key: HashMap<FunctionId, usize> = HashMap::new();
         for record in &coverage.functions {
             let mut branches: Vec<Branch> = record
                 .branches
@@ -282,9 +288,13 @@ impl CoverageIndex {
                 }
             }
             key.sort();
-            match by_key.get(&key) {
+            let id = FunctionId {
+                spans: key,
+                name: display_name(&record.name),
+            };
+            match by_key.get(&id) {
                 Some(&idx) => {
-                    // Equal keys hold equal branch spans, so the
+                    // Equal ids hold equal branch spans, so the
                     // sorted branch lists line up position by
                     // position.
                     let merged = &mut functions[idx];
@@ -296,19 +306,19 @@ impl CoverageIndex {
                     }
                 }
                 None => {
-                    by_key.insert(key.clone(), functions.len());
+                    by_key.insert(id.clone(), functions.len());
                     functions.push(CoveredFunction {
                         symbols: vec![record.name.clone()],
                         count: record.count,
                         branches,
-                        key,
+                        id,
                     });
                 }
             }
         }
         let mut by_span: HashMap<SourceSpan, Vec<usize>> = HashMap::new();
         for (idx, f) in functions.iter().enumerate() {
-            for (_, span) in &f.key {
+            for (_, span) in &f.id.spans {
                 let ids = by_span.entry(span.clone()).or_default();
                 if ids.last() != Some(&idx) {
                     ids.push(idx);
@@ -326,13 +336,15 @@ impl CoverageIndex {
     /// Look up the source function containing `spans` (normalised).
     ///
     /// A merged function contains a span when the span is one of its
-    /// code or branch regions. Exactly one containing function whose
-    /// records all demangle to one path is a match; more than one
-    /// containing function, or one whose records name different
-    /// functions, is [`FunctionMatch::Ambiguous`].
+    /// code or branch regions. Exactly one containing function is a
+    /// match. When several contain the spans, `mir_name` (the MIR
+    /// header name of the candidate) may pick one, but only by a
+    /// full-path match ([`full_path_matches`]); otherwise the result
+    /// is [`FunctionMatch::Ambiguous`].
     pub fn resolve<'s>(
         &self,
         spans: impl IntoIterator<Item = &'s SourceSpan>,
+        mir_name: Option<&str>,
     ) -> FunctionMatch<'_> {
         let hits: BTreeSet<usize> = spans
             .into_iter()
@@ -340,36 +352,62 @@ impl CoverageIndex {
             .flatten()
             .copied()
             .collect();
-        let mut hits = hits.into_iter();
-        let Some(first) = hits.next() else {
-            return FunctionMatch::Missing;
-        };
-        let rest: Vec<usize> = hits.collect();
-        if !rest.is_empty() {
-            let names: BTreeSet<String> = std::iter::once(first)
-                .chain(rest.iter().copied())
-                .flat_map(|i| self.functions[i].display_names())
+        let hits: Vec<&CoveredFunction> = hits.into_iter().map(|i| &self.functions[i]).collect();
+        match hits.as_slice() {
+            [] => return FunctionMatch::Missing,
+            [only] => return FunctionMatch::Found(only),
+            _ => {}
+        }
+        if let Some(mir_name) = mir_name {
+            let named: Vec<&CoveredFunction> = hits
+                .iter()
+                .copied()
+                .filter(|f| full_path_matches(f.display_name(), mir_name))
                 .collect();
-            return FunctionMatch::Ambiguous(format!(
-                "the decision's spans fall in {} coverage functions with different \
-                 span sets ({})",
-                rest.len() + 1,
-                names.into_iter().collect::<Vec<_>>().join(", ")
-            ));
+            if let [only] = named.as_slice() {
+                return FunctionMatch::Found(only);
+            }
         }
-        let f = &self.functions[first];
-        let names = f.display_names();
-        if names.len() > 1 {
-            return FunctionMatch::Ambiguous(format!(
+        let names: BTreeSet<&str> = hits.iter().map(|f| f.display_name()).collect();
+        let names = names.into_iter().collect::<Vec<_>>().join(", ");
+        let one_span_set = hits.iter().all(|f| f.id.spans == hits[0].id.spans);
+        FunctionMatch::Ambiguous(if one_span_set {
+            format!(
                 "coverage records for {} differently named functions share the \
-                 decision's spans ({}); Floyd cannot tell one generic function from \
-                 distinct macro-generated ones",
-                names.len(),
-                names.into_iter().collect::<Vec<_>>().join(", ")
-            ));
-        }
-        FunctionMatch::Found(f)
+                 decision's spans ({names}); Floyd cannot tell which one this body is",
+                hits.len()
+            )
+        } else {
+            format!(
+                "the decision's spans fall in {} coverage functions with different \
+                 span sets ({names})",
+                hits.len()
+            )
+        })
     }
+}
+
+/// The one name comparison Floyd makes, and only to choose among
+/// coverage functions the spans have already matched.
+///
+/// Case: a `macro_rules!` body that defines one function per
+/// invocation (`fixed`'s `from_str` macro defines `get_int` in
+/// modules `u8`, `u16`, `u32`, `u64`, `u128`). Every copy carries
+/// the macro body's spans, so spans alone cannot tell the copies
+/// apart. rustc prints such a function in MIR by its crate-relative
+/// path (`from_str::u16::get_int`: the path is not trimmed because
+/// the name is not unique), and its symbol demangles to the same
+/// path under the crate name (`fixed::from_str::u16::get_int`).
+///
+/// The match is exact on everything after the first `::` of the
+/// display name (the crate segment): never a suffix, never a last
+/// segment. Trimmed MIR names (`get_int`), impl-method names
+/// (`<impl at ..>::m`) and generic names do not match and stay
+/// ambiguous.
+pub fn full_path_matches(display_name: &str, mir_name: &str) -> bool {
+    display_name
+        .split_once("::")
+        .is_some_and(|(_, path)| path == mir_name)
 }
 
 /// Report name for a coverage symbol: `rustc_demangle`'s alternate
@@ -564,13 +602,13 @@ mod tests {
         // no name join can reach the record, the span join does.
         let index = CoverageIndex::build(&export(&[EAST_OPT, WITH_NANOSECOND]), &chrono_paths());
         let cond = span("src/offset/fixed.rs", 63, 12, 63, 26);
-        let FunctionMatch::Found(f) = index.resolve([&cond]) else {
+        let FunctionMatch::Found(f) = index.resolve([&cond], None) else {
             panic!("east_opt not found");
         };
         assert_eq!(f.count, 2339);
         assert_eq!(
-            f.display_name().as_deref(),
-            Some("<chrono::offset::fixed::FixedOffset>::east_opt")
+            f.display_name(),
+            "<chrono::offset::fixed::FixedOffset>::east_opt"
         );
         let c = f.branch_counts(&cond).expect("branch at condition span");
         assert_eq!((c.true_count, c.false_count), (2338, 1));
@@ -584,13 +622,13 @@ mod tests {
     fn trait_impl_method_resolves_by_condition_span() {
         let index = CoverageIndex::build(&export(&[EAST_OPT, WITH_NANOSECOND]), &chrono_paths());
         let cond = span("src/naive/time/mod.rs", 1110, 12, 1110, 33);
-        let FunctionMatch::Found(f) = index.resolve([&cond]) else {
+        let FunctionMatch::Found(f) = index.resolve([&cond], None) else {
             panic!("with_nanosecond not found");
         };
         assert_eq!(f.count, 66);
         assert_eq!(
-            f.display_name().as_deref(),
-            Some("<chrono::naive::time::NaiveTime as chrono::traits::Timelike>::with_nanosecond")
+            f.display_name(),
+            "<chrono::naive::time::NaiveTime as chrono::traits::Timelike>::with_nanosecond"
         );
         let c = f.branch_counts(&cond).expect("branch");
         assert_eq!((c.true_count, c.false_count), (0, 66));
@@ -601,7 +639,7 @@ mod tests {
         let index = CoverageIndex::build(&export(&SET_IF_CONSISTENT), &chrono_paths());
         assert_eq!(index.functions().len(), 1, "one source function");
         let cond = span("src/format/parsed.rs", 182, 22, 182, 33);
-        let FunctionMatch::Found(f) = index.resolve([&cond]) else {
+        let FunctionMatch::Found(f) = index.resolve([&cond], None) else {
             panic!("set_if_consistent not found");
         };
         assert_eq!(f.symbols.len(), 4);
@@ -610,8 +648,8 @@ mod tests {
         assert_eq!(c.true_count, 9 + 14 + 2);
         assert_eq!(c.false_count, 7 + 17);
         assert_eq!(
-            f.display_name().as_deref(),
-            Some("chrono::format::parsed::set_if_consistent")
+            f.display_name(),
+            "chrono::format::parsed::set_if_consistent"
         );
     }
 
@@ -624,7 +662,7 @@ mod tests {
             &chrono_paths(),
         );
         let cond = span("src/format/parsed.rs", 182, 22, 182, 33);
-        let FunctionMatch::Found(f) = index.resolve([&cond]) else {
+        let FunctionMatch::Found(f) = index.resolve([&cond], None) else {
             panic!("not found");
         };
         assert_eq!(f.count, 128);
@@ -643,7 +681,7 @@ mod tests {
             10,
             50,
         );
-        match index.resolve([&body]) {
+        match index.resolve([&body], None) {
             FunctionMatch::Ambiguous(why) => {
                 assert!(
                     why.contains("to_degrees") && why.contains("to_radians"),
@@ -660,7 +698,7 @@ mod tests {
         let a = span("src/offset/fixed.rs", 63, 12, 63, 26);
         let b = span("src/naive/time/mod.rs", 1110, 12, 1110, 33);
         assert!(matches!(
-            index.resolve([&a, &b]),
+            index.resolve([&a, &b], None),
             FunctionMatch::Ambiguous(_)
         ));
     }
@@ -670,10 +708,16 @@ mod tests {
         let index = CoverageIndex::build(&export(&[EAST_OPT]), &chrono_paths());
         // Right lines, wrong file.
         let other = span("src/offset/local/mod.rs", 63, 12, 63, 26);
-        assert!(matches!(index.resolve([&other]), FunctionMatch::Missing));
+        assert!(matches!(
+            index.resolve([&other], None),
+            FunctionMatch::Missing
+        ));
         // Right file, shifted column.
         let shifted = span("src/offset/fixed.rs", 63, 13, 63, 26);
-        assert!(matches!(index.resolve([&shifted]), FunctionMatch::Missing));
+        assert!(matches!(
+            index.resolve([&shifted], None),
+            FunctionMatch::Missing
+        ));
     }
 
     #[test]
@@ -727,5 +771,58 @@ mod tests {
             strip_generic_args("<fn(u8) -> bool as a::Pred>::check"),
             "<fn(u8) -> bool as a::Pred>::check"
         );
+    }
+
+    /// `fixed`'s `from_str` macro body defines `get_int` once per
+    /// integer module; the `u8` and `u16` copies (real records, the
+    /// lib's `from_str` tests) share most spans.
+    const FIXED_GET_INT: [&str; 2] = [
+        r#"{"name": "_RNvNtNtCs72z5BvmdZW2_5fixed8from_str2u87get_int", "count": 761, "filenames": ["/home/ubuntu/work/verify-span/fixed/src-copy/src/from_str.rs"], "regions": [[360, 9, 365, 26, 761, 0, 0, 0], [374, 16, 374, 30, 761, 0, 0, 0], [374, 34, 374, 51, 169, 0, 0, 0], [375, 17, 375, 34, 168, 0, 0, 0], [376, 13, 376, 14, 593, 0, 0, 0], [377, 70, 377, 75, 593, 0, 0, 0], [378, 22, 378, 45, 18, 0, 0, 0], [379, 22, 379, 54, 27, 0, 0, 0], [379, 22, 379, 40, 27, 0, 0, 0], [380, 23, 380, 55, 29, 0, 0, 0], [380, 23, 380, 41, 29, 0, 0, 0], [382, 21, 382, 34, 519, 0, 0, 0], [382, 35, 382, 46, 519, 0, 0, 0], [383, 21, 383, 44, 519, 0, 0, 0], [386, 31, 386, 49, 593, 0, 0, 0], [387, 16, 387, 26, 593, 0, 0, 0], [388, 17, 388, 32, 27, 0, 0, 0], [389, 17, 389, 31, 27, 0, 0, 0], [390, 23, 390, 38, 566, 0, 0, 0], [391, 20, 391, 46, 498, 0, 0, 0], [392, 21, 392, 36, 9, 0, 0, 0], [393, 17, 393, 18, 489, 0, 0, 0], [394, 17, 394, 43, 498, 0, 0, 0], [395, 13, 395, 14, 68, 0, 0, 0], [396, 13, 396, 35, 593, 0, 0, 0], [397, 9, 397, 10, 761, 0, 0, 0]], "branches": []}"#,
+        r#"{"name": "_RNvNtNtCs72z5BvmdZW2_5fixed8from_str3u167get_int", "count": 1179878, "filenames": ["/home/ubuntu/work/verify-span/fixed/src-copy/src/from_str.rs"], "regions": [[360, 9, 365, 26, 1179878, 0, 0, 0], [367, 20, 367, 40, 1179878, 0, 0, 0], [369, 25, 369, 84, 179, 0, 0, 0], [369, 25, 369, 56, 179, 0, 0, 0], [369, 57, 369, 60, 179, 0, 0, 0], [369, 62, 369, 67, 179, 0, 0, 0], [370, 21, 370, 69, 179, 0, 0, 0], [371, 17, 371, 18, 1179699, 0, 0, 0], [374, 16, 374, 30, 1179699, 0, 0, 0], [374, 34, 374, 51, 2, 0, 0, 0], [375, 17, 375, 34, 2, 0, 0, 0], [376, 13, 376, 14, 1179697, 0, 0, 0], [377, 70, 377, 75, 1179697, 0, 0, 0], [378, 22, 378, 45, 10, 0, 0, 0], [379, 22, 379, 54, 10, 0, 0, 0], [379, 22, 379, 40, 10, 0, 0, 0], [380, 23, 380, 55, 11, 0, 0, 0], [380, 23, 380, 41, 11, 0, 0, 0], [382, 21, 382, 34, 1179666, 0, 0, 0], [382, 35, 382, 46, 1179666, 0, 0, 0], [383, 21, 383, 44, 1179666, 0, 0, 0], [386, 31, 386, 49, 1179697, 0, 0, 0], [387, 16, 387, 26, 1179697, 0, 0, 0], [388, 17, 388, 32, 0, 0, 0, 0], [389, 17, 389, 31, 0, 0, 0, 0], [390, 23, 390, 38, 1179697, 0, 0, 0], [391, 20, 391, 46, 1179648, 0, 0, 0], [392, 21, 392, 36, 0, 0, 0, 0], [393, 17, 393, 18, 1179648, 0, 0, 0], [394, 17, 394, 43, 1179648, 0, 0, 0], [395, 13, 395, 14, 49, 0, 0, 0], [396, 13, 396, 35, 1179697, 0, 0, 0], [397, 9, 397, 10, 1179878, 0, 0, 0]], "branches": []}"#,
+    ];
+
+    #[test]
+    fn macro_twins_resolve_only_by_full_path() {
+        let p = PathNormaliser::new(Some(Path::new(
+            "/home/ubuntu/work/verify-span/fixed/src-copy",
+        )));
+        let index = CoverageIndex::build(&export(&FIXED_GET_INT), &p);
+        assert_eq!(index.functions().len(), 2, "different paths stay apart");
+        let shared = span("src/from_str.rs", 374, 16, 374, 30);
+        assert!(matches!(
+            index.resolve([&shared], None),
+            FunctionMatch::Ambiguous(_)
+        ));
+        // The MIR prints the crate-relative path; the symbol is that
+        // path under the crate name.
+        let FunctionMatch::Found(f) = index.resolve([&shared], Some("from_str::u16::get_int"))
+        else {
+            panic!("full path should pick the u16 copy");
+        };
+        assert_eq!(f.display_name(), "fixed::from_str::u16::get_int");
+        assert_eq!(f.count, 1179878);
+        // Never a suffix or a bare last segment.
+        for name in [
+            "get_int",
+            "u16::get_int",
+            "fixed::from_str::u16::get_int",
+            "from_str::u1",
+        ] {
+            assert!(
+                matches!(
+                    index.resolve([&shared], Some(name)),
+                    FunctionMatch::Ambiguous(_)
+                ),
+                "{name} must not pick a function"
+            );
+        }
+        assert!(full_path_matches(
+            "fixed::from_str::u8::get_int",
+            "from_str::u8::get_int"
+        ));
+        assert!(!full_path_matches(
+            "fixed::from_str::u8::get_int",
+            "u8::get_int"
+        ));
     }
 }

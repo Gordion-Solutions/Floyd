@@ -663,9 +663,10 @@ fn run_test_mode_cargo(
         .iter()
         .map(|a| correlate::prepare_mir(&a.mir, &paths))
         .collect();
-    // Every span a candidate's decision is tested at. Each test's
-    // coverage index keeps only the records containing one of
-    // these, so Pass 2 holds a few records per test instead of
+    // Every span that locates a candidate's coverage record (its
+    // decision spans and its body's coverage-mapping spans). Each
+    // test's coverage index keeps only the records containing one
+    // of these, so Pass 2 holds a few records per test instead of
     // every record of every test.
     let wanted: std::collections::HashSet<floyd::mir::SourceSpan> = raw_candidates
         .iter()
@@ -673,8 +674,9 @@ fn run_test_mode_cargo(
         .collect();
 
     // Pass 2: run every test across every artifact once; keep each
-    // test's coverage, indexed by source span. We intentionally do NOT dedupe test
-    // names across artifacts — two artifacts can share a test name.
+    // test's coverage, indexed by source span. We intentionally do
+    // NOT dedupe test names across artifacts — two artifacts can
+    // share a test name.
     //
     // Parallelised across tests via rayon. Each per-test job is
     // self-contained (unique profraw file per `(art_idx, test_idx)`,
@@ -828,7 +830,9 @@ fn run_test_mode_cargo(
             }
             let spans = prep.lookup_spans(raw.fn_idx, &raw.tree);
             for (test_name, index) in &test_indexes {
-                if let floyd::coverage_index::FunctionMatch::Found(fc) = index.resolve(&spans) {
+                if let floyd::coverage_index::FunctionMatch::Found(fc) =
+                    index.resolve(&spans, Some(&prep.mir.functions[raw.fn_idx].name))
+                {
                     if fc.count > 0 {
                         eprintln!(
                             "[span-diag]   test '{test_name}' has {} branches, count={}",
