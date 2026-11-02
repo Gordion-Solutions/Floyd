@@ -58,6 +58,10 @@ struct DeclinedFunction {
     name: String,
     source_file: Option<String>,
     line: Option<u32>,
+    /// Why the decomposer declined it: `unsupported_shape`, or
+    /// `non_bool_leaf` when an arm's value is a named local that is
+    /// not `bool`.
+    reason: decision::DeclineReason,
 }
 
 /// One decomposable candidate the engine considered, with whether
@@ -588,63 +592,65 @@ fn run_test_mode_cargo(
             // are "no boolean decision at all", so they do not
             // belong in the OOS report.
             if decision::has_switchint(f) {
-                if let Some(node) = decision::decompose_function(f) {
-                    let prov = correlate::provenance_for(f);
-                    // `--only=<pattern>` scopes Floyd to the
-                    // functions the user named. On real embedded
-                    // crates the whole-crate scan is both slow and
-                    // noisy — a qualification engineer typically
-                    // has a specific list of safety-critical gates
-                    // they need to prove MC/DC on. If any --only
-                    // pattern is present and this function's name
-                    // doesn't contain any of them, drop it before
-                    // scoring; it will not appear in the verdict
-                    // or in the honest-scope report.
-                    if !only_patterns.is_empty() {
-                        let fn_name = prov.function_name.as_deref().unwrap_or(&f.name);
-                        let hit = only_patterns
-                            .iter()
-                            .any(|pat| fn_name.contains(pat.as_str()));
-                        if !hit {
-                            continue;
-                        }
-                    }
-                    // Reject candidates whose decision spans come
-                    // from inlined-stdlib macro expansions.
-                    // Rustc paths of the form `/rustc/<hash>/library/
-                    // core/src/macros/mod.rs` are the hygiene
-                    // bindings of `assert_eq!`, `debug_assert!`,
-                    // `panic!`, and friends — not user-written
-                    // decisions. On blake3 and other
-                    // test-heavy crates, every `#[test] fn x() {
-                    // assert_eq!(a, b); }` was being flagged as a
-                    // candidate whose "conditions" `left_val` and
-                    // `right_val` are the macro's own locals,
-                    // producing reached-but-unobserved false
-                    // positives in the AllUnobserved verdict.
-                    if is_stdlib_macro_span(prov.source_file.as_deref()) {
+                let node = match decision::try_decompose_function(f) {
+                    Ok(node) => node,
+                    Err(reason) => {
+                        // Has a switchInt (so some kind of decision)
+                        // but the decomposer did not match any
+                        // supported pattern. Honest-scope report entry.
+                        let prov = correlate::provenance_for(f);
+                        declined.push(DeclinedFunction {
+                            name: prov.function_name.unwrap_or_default(),
+                            source_file: prov.source_file,
+                            line: prov.line,
+                            reason,
+                        });
                         continue;
                     }
-                    raw_candidates.push(RawCandidate {
-                        tree: floyd::DecisionTree {
-                            decisions: vec![node],
-                        },
-                        prov,
-                        artifact_idx: art_idx,
-                        fn_idx,
-                    });
+                };
+                let prov = correlate::provenance_for(f);
+                // `--only=<pattern>` scopes Floyd to the
+                // functions the user named. On real embedded
+                // crates the whole-crate scan is both slow and
+                // noisy — a qualification engineer typically
+                // has a specific list of safety-critical gates
+                // they need to prove MC/DC on. If any --only
+                // pattern is present and this function's name
+                // doesn't contain any of them, drop it before
+                // scoring; it will not appear in the verdict
+                // or in the honest-scope report.
+                if !only_patterns.is_empty() {
+                    let fn_name = prov.function_name.as_deref().unwrap_or(&f.name);
+                    let hit = only_patterns
+                        .iter()
+                        .any(|pat| fn_name.contains(pat.as_str()));
+                    if !hit {
+                        continue;
+                    }
+                }
+                // Reject candidates whose decision spans come
+                // from inlined-stdlib macro expansions.
+                // Rustc paths of the form `/rustc/<hash>/library/
+                // core/src/macros/mod.rs` are the hygiene
+                // bindings of `assert_eq!`, `debug_assert!`,
+                // `panic!`, and friends — not user-written
+                // decisions. On blake3 and other
+                // test-heavy crates, every `#[test] fn x() {
+                // assert_eq!(a, b); }` was being flagged as a
+                // candidate whose "conditions" `left_val` and
+                // `right_val` are the macro's own locals,
+                // producing reached-but-unobserved false
+                // positives in the AllUnobserved verdict.
+                if is_stdlib_macro_span(prov.source_file.as_deref()) {
                     continue;
                 }
-            }
-            if decision::has_switchint(f) {
-                // Has a switchInt (so some kind of decision) but
-                // the decomposer did not match any supported
-                // pattern. Honest-scope report entry.
-                let prov = correlate::provenance_for(f);
-                declined.push(DeclinedFunction {
-                    name: prov.function_name.unwrap_or_default(),
-                    source_file: prov.source_file,
-                    line: prov.line,
+                raw_candidates.push(RawCandidate {
+                    tree: floyd::DecisionTree {
+                        decisions: vec![node],
+                    },
+                    prov,
+                    artifact_idx: art_idx,
+                    fn_idx,
                 });
             }
         }
@@ -1760,6 +1766,7 @@ mod tests {
             name: "crate::f".to_string(),
             source_file: Some("src/lib.rs".to_string()),
             line: Some(7),
+            reason: decision::DeclineReason::NonBoolLeaf,
         }];
         let candidates = vec![
             CandidateSummary {
@@ -1815,6 +1822,7 @@ mod tests {
         assert_eq!(v["observations"].as_array().unwrap().len(), 0);
         assert_eq!(v["out_of_scope"][0]["name"], "crate::f");
         assert_eq!(v["out_of_scope"][0]["line"], 7);
+        assert_eq!(v["out_of_scope"][0]["reason"], "non_bool_leaf");
         assert_eq!(v["candidates"][0]["function_name"], "crate::g");
         assert_eq!(v["candidates"][0]["invoked"], false);
         assert_eq!(v["candidates"][0]["display_name"], "crate::g");

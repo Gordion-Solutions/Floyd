@@ -275,6 +275,12 @@ part of `conditions_total`, and are reported in the text summary as
 a count per reason. The JUnit suite carries the same counts as
 `floyd.*` `<properties>`.
 
+Functions that have a decision the engine declined are listed in
+`out_of_scope`, each with a `reason`: `non_bool_leaf` when an arm's
+value is a named local that is not `bool` (for example a branch that
+returns a struct or an integer, which is not a Boolean condition),
+otherwise `unsupported_shape`.
+
 ## Why MC/DC, why this engine
 
 DO-178C, ISO 26262, and IEC 61508 require MC/DC analysis at the
