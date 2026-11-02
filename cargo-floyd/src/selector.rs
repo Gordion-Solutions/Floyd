@@ -110,13 +110,16 @@ pub fn pick_best(candidates: Vec<Candidate>) -> PickResult {
 /// twice would bias selection toward single-condition candidates.
 /// Observations without a test name count individually.
 pub fn observed_tests(candidate: &Candidate) -> usize {
-    let named: BTreeSet<&str> = candidate
-        .observations
+    observed_test_count(&candidate.observations)
+}
+
+/// [`observed_tests`] over a bare observation list.
+pub fn observed_test_count(observations: &[ConditionObservation]) -> usize {
+    let named: BTreeSet<&str> = observations
         .iter()
         .filter_map(|o| o.test_name.as_deref())
         .collect();
-    let unnamed = candidate
-        .observations
+    let unnamed = observations
         .iter()
         .filter(|o| o.test_name.is_none())
         .count();
@@ -213,6 +216,7 @@ mod tests {
                 function_name: Some(name.to_string()),
                 source_file: None,
                 line: None,
+                display_name: None,
             },
             observations: (0..n_obs)
                 .map(|i| {
@@ -277,6 +281,7 @@ mod tests {
                 function_name: Some("const_fn".to_string()),
                 source_file: None,
                 line: None,
+                display_name: None,
             },
             observations: (0..5)
                 .map(|i| ConditionObservation::vector(Some(format!("t{i}")), BTreeMap::new(), true))

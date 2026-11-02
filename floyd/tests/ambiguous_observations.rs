@@ -15,6 +15,7 @@
 //! (ambiguous) rather than unexercised.
 
 use floyd::correlate;
+use floyd::coverage_index::{CoverageIndex, PathNormaliser};
 use floyd::decision;
 use floyd::masking::{self, ConditionStatus, Variant};
 use floyd::{mir, profile};
@@ -45,6 +46,12 @@ fn decide(_1: bool, _2: bool) -> bool {
     }
 }
 "#;
+
+/// MIR prints `src/lib.rs` (relative to the directory rustc ran
+/// in); llvm-cov reports `/abs/src/lib.rs`.
+fn paths() -> PathNormaliser {
+    PathNormaliser::new(Some(std::path::Path::new("/abs")))
+}
 
 /// One test's `llvm-cov export` for `decide`, with the function's
 /// entry count and the (true, false) counters of `a` and `b`.
@@ -88,16 +95,16 @@ fn loop_test_is_ambiguous_and_a_is_unknown_not_unexercised() {
         ("once_tf", coverage(1, (1, 0), (0, 1))),
     ];
     // The cargo-mode Pass 3 path.
-    let prepared = correlate::prepare_mir(&mir);
+    let prepared = correlate::prepare_mir(&mir, &paths());
     let observations: Vec<_> = tests
         .iter()
         .flat_map(|(name, cov)| {
-            let pcov = correlate::prepare_coverage_lookup(cov);
+            let index = CoverageIndex::build(cov, &paths());
             correlate::observations_from_prepared_coverage(
                 Some(name.to_string()),
                 &prepared,
                 0,
-                &pcov,
+                &index,
                 &tree,
             )
         })
@@ -142,7 +149,7 @@ fn single_evaluation_tests_still_demonstrate_full_mcdc() {
     // evidence: (T,T), (F,-), (T,F) -> 100% masking MC/DC.
     let mir = mir::parse_text(AND_MIR).expect("MIR parses");
     let tree = decision::decompose(&mir);
-    let prepared = correlate::prepare_mir(&mir);
+    let prepared = correlate::prepare_mir(&mir, &paths());
     let tests = [
         ("tt", coverage(1, (1, 0), (1, 0))),
         ("f", coverage(1, (0, 1), (0, 0))),
@@ -151,12 +158,12 @@ fn single_evaluation_tests_still_demonstrate_full_mcdc() {
     let observations: Vec<_> = tests
         .iter()
         .flat_map(|(name, cov)| {
-            let pcov = correlate::prepare_coverage_lookup(cov);
+            let index = CoverageIndex::build(cov, &paths());
             correlate::observations_from_prepared_coverage(
                 Some(name.to_string()),
                 &prepared,
                 0,
-                &pcov,
+                &index,
                 &tree,
             )
         })
@@ -182,14 +189,14 @@ fn loop_inside_a_function_called_once_is_still_multi_evaluation() {
     // so the test is ambiguous rather than a single (T,T) vector.
     let mir = mir::parse_text(AND_MIR).expect("MIR parses");
     let tree = decision::decompose(&mir);
-    let prepared = correlate::prepare_mir(&mir);
+    let prepared = correlate::prepare_mir(&mir, &paths());
     let cov = coverage(1, (1, 1), (1, 0));
-    let pcov = correlate::prepare_coverage_lookup(&cov);
+    let index = CoverageIndex::build(&cov, &paths());
     let observations = correlate::observations_from_prepared_coverage(
         Some("loop_in_one_call".to_string()),
         &prepared,
         0,
-        &pcov,
+        &index,
         &tree,
     );
     assert_eq!(observations.len(), 1);

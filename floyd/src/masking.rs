@@ -217,9 +217,18 @@ pub struct DecisionProvenance {
     /// the crate root).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_file: Option<String>,
-    /// Rust-level function name the decision lives in.
+    /// Rust-level function name the decision lives in, as rustc
+    /// prints it in the MIR header (impl methods read
+    /// `<impl at FILE:L:C: L:C>::name`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub function_name: Option<String>,
+    /// Report name taken from the coverage symbol the decision's
+    /// source spans joined to: demangled without crate hashes, with
+    /// generic arguments removed (for example
+    /// `<chrono::offset::fixed::FixedOffset>::east_opt`). `None`
+    /// when no coverage record joined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// 1-based line number where the decision starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
@@ -1026,6 +1035,7 @@ mod tests {
                 function_name: Some("allow_actuation".to_string()),
                 source_file: Some("src/lib.rs".to_string()),
                 line: Some(42),
+                display_name: Some("<brakes::Controller>::allow_actuation".to_string()),
             }),
             ambiguous_observations: 0,
         };
@@ -1039,6 +1049,10 @@ mod tests {
         assert_eq!(p.function_name.as_deref(), Some("allow_actuation"));
         assert_eq!(p.source_file.as_deref(), Some("src/lib.rs"));
         assert_eq!(p.line, Some(42));
+        assert_eq!(
+            p.display_name.as_deref(),
+            Some("<brakes::Controller>::allow_actuation")
+        );
     }
 
     #[test]
