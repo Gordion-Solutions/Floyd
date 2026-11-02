@@ -58,6 +58,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod correlate;
+pub mod coverage_index;
 pub mod decision;
 pub mod instrument;
 pub mod masking;
@@ -68,7 +69,8 @@ pub mod runner;
 pub use correlate::DecisionMap;
 pub use decision::DecisionTree;
 pub use masking::{
-    ConditionObservation, ConditionStatus, DecisionProvenance, IndependenceMatrix, RuntimeAnalysis,
+    BranchCounts, ConditionObservation, ConditionStatus, DecisionProvenance, IndependenceMatrix,
+    RuntimeAnalysis,
 };
 pub use mir::Mir;
 pub use profile::CoverageReport;

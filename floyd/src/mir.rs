@@ -40,7 +40,7 @@ pub type BlockId = u32;
 /// `llvm-cov export` branches array. The cross-format compatibility
 /// is what lets `floyd::correlate` join MIR decisions to runtime
 /// coverage data without resolving counter IDs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceSpan {
     /// Source file path as rustc reports it.
     pub file: String,
@@ -106,6 +106,23 @@ pub struct MirFunction {
     pub captures: Vec<MirCapture>,
     /// Basic blocks in source order.
     pub blocks: Vec<MirBlock>,
+    /// Number of coverage mapping statements in the body preamble
+    /// (`coverage Code { .. } => <span>;`, `coverage Branch { .. }
+    /// => <span>;`, ...). rustc prints these when the MIR is emitted
+    /// by the same `-Cinstrument-coverage` compilation that produces
+    /// the test binary; they are the regions `llvm-cov` will report
+    /// for this function. Zero in an instrumented MIR means rustc
+    /// did not instrument the body (it skips
+    /// `#[automatically_derived]` impls, `#[coverage(off)]` items and
+    /// bodies whose code has no usable source span), so the function
+    /// has no coverage record. Lower-case `coverage branch { .. }`
+    /// lines are branch markers, not mappings, and are not counted.
+    pub coverage_mappings: usize,
+    /// The source spans of those mappings, as printed. They are the
+    /// spans of the code and branch regions `llvm-cov` reports for
+    /// this body, so they locate its coverage record even when a
+    /// decomposed condition's own span carries no region.
+    pub coverage_spans: Vec<SourceSpan>,
 }
 
 /// A captured variable from a closure's environment.
@@ -836,6 +853,11 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
                         loc.span = span.clone();
                         f.locals.push(loc);
                     }
+                } else if is_coverage_mapping(code) {
+                    f.coverage_mappings += 1;
+                    if let Some(span) = coverage_mapping_span(code) {
+                        f.coverage_spans.push(span);
+                    }
                 }
                 // Other fn-level lines (e.g. scope annotations) ignored.
             }
@@ -1005,6 +1027,25 @@ fn split_top_level(s: &str, sep: char) -> Vec<&str> {
     }
     out.push(&s[start..]);
     out
+}
+
+/// `coverage Code { bcb: bcb0 } => src/lib.rs:1:1: 1:9 (#0);` and the
+/// other capitalised mapping kinds (`Branch`, `MCDCBranch`, ...).
+/// The lower-case `coverage branch { true: .., false: .. } => ..`
+/// form is a branch marker recorded before mappings are built.
+fn is_coverage_mapping(code: &str) -> bool {
+    code.strip_prefix("coverage ")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// The span of a coverage mapping statement:
+/// `coverage Code { bcb: bcb0 } => src/lib.rs:1:1: 1:9 (#0);` gives
+/// `src/lib.rs:1:1: 1:9`.
+fn coverage_mapping_span(code: &str) -> Option<SourceSpan> {
+    let rest = code.rsplit_once(" => ")?.1.trim_end_matches(';');
+    let span = rest.rsplit_once(" (#").map_or(rest, |(span, _)| span);
+    parse_span_literal(span.trim())
 }
 
 fn parse_bb_header(line: &str) -> Option<BlockId> {

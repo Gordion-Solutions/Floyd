@@ -19,6 +19,7 @@
 //! natively (Jenkins, GitLab CI, GitHub Actions, Bazel/Buck2, etc.).
 
 use floyd::correlate;
+use floyd::coverage_index::{CoverageIndex, PathNormaliser};
 use floyd::decision;
 use floyd::instrument;
 use floyd::masking::{
@@ -26,13 +27,14 @@ use floyd::masking::{
     Variant,
 };
 use floyd::mir;
-use floyd::profile;
 use floyd::runner;
 
 mod harness;
 mod selector;
+mod summary;
 use std::path::Path;
 use std::process::ExitCode;
+use summary::CoverageSummary;
 
 /// How runtime mode resolved candidate selection. Carried in the
 /// JSON report so a consumer can tell a real verdict apart from the
@@ -62,14 +64,50 @@ struct DeclinedFunction {
 /// any test reached its function at runtime.
 #[derive(serde::Serialize, Clone, Debug)]
 struct CandidateSummary {
+    /// The function's name as rustc printed it in the MIR header
+    /// (impl methods read `<impl at FILE:L:C: L:C>::name`). Kept
+    /// verbatim for traceability back to the MIR.
     function_name: Option<String>,
+    /// Report name from the coverage symbol the span join found
+    /// (demangled, no crate hashes, generic arguments removed);
+    /// the MIR name when the join found none.
+    display_name: Option<String>,
     source_file: Option<String>,
     line: Option<u32>,
     /// True when at least one test's coverage shows the function
-    /// was executed.
+    /// was executed. Determined by the same source-span join as
+    /// `observations`. False for a `not_measurable` candidate.
     invoked: bool,
-    /// Number of tests that produced a usable observation.
+    /// Number of tests that produced an observation (a condition
+    /// vector or an ambiguous record).
     observations: usize,
+    /// Present when coverage cannot tell whether the function ran
+    /// (rustc did not instrument it, its decision comes from a
+    /// dependency's macro, no coverage record has its spans, or the
+    /// spans are ambiguous). Such a candidate is neither invoked nor
+    /// never-invoked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    not_measurable: Option<correlate::NotMeasurable>,
+}
+
+impl CandidateSummary {
+    fn new(prov: &floyd::DecisionProvenance, join: &correlate::CandidateCoverage) -> Self {
+        CandidateSummary {
+            function_name: prov.function_name.clone(),
+            display_name: join
+                .display_name
+                .clone()
+                .or_else(|| prov.function_name.clone()),
+            source_file: prov.source_file.clone(),
+            line: prov.line,
+            invoked: join.invoked(),
+            observations: selector::observed_test_count(&join.observations),
+            not_measurable: match &join.status {
+                correlate::CoverageStatus::NotMeasurable(nm) => Some(nm.clone()),
+                _ => None,
+            },
+        }
+    }
 }
 
 /// A test-binary MIR file skipped by the size guard.
@@ -102,6 +140,9 @@ struct CargoRuntimeReport<'a> {
     observations: &'a [ConditionObservation],
     /// `None` unless `verdict` is `analysed`.
     analysis: Option<&'a RuntimeAnalysis>,
+    /// Condition counts for the analysed decision and the
+    /// percentage, `null` whenever a condition is unknown.
+    summary: CoverageSummary,
     /// Every decomposable candidate considered, before selection.
     candidates: &'a [CandidateSummary],
     /// Functions with a `switchInt`-shaped decision that the
@@ -125,6 +166,9 @@ struct SingleRuntimeReport<'a> {
     observations: &'a [ConditionObservation],
     /// `None` unless `verdict` is `analysed`.
     analysis: Option<&'a RuntimeAnalysis>,
+    /// Condition counts for the analysed decision and the
+    /// percentage, `null` whenever a condition is unknown.
+    summary: CoverageSummary,
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<(), ExitCode> {
@@ -615,9 +659,32 @@ fn run_test_mode_cargo(
         eprintln!("[progress] Pass 1 complete: {} candidates, {} declined, {} artifacts, {} skipped-oversize",
         raw_candidates.len(), declined.len(), artifacts.len(), skipped_oversize_mirs.len());
     }
+    // Source spans are compared in one canonical form: relative to
+    // the workspace root rustc ran in (see `PathNormaliser`).
+    let paths = PathNormaliser::new(Some(&build.workspace_root));
+    // Pre-compute normalised condition span maps per artifact's MIR.
+    // Done once; reused across every (candidate, test) pair in
+    // Pass 3. This turns Pass 3 from O(candidates × tests ×
+    // functions × blocks) into O(functions × blocks) +
+    // O(candidates × tests).
+    let prepared: Vec<correlate::PreparedMir<'_>> = artifacts
+        .iter()
+        .map(|a| correlate::prepare_mir(&a.mir, &paths))
+        .collect();
+    // Every span that locates a candidate's coverage record (its
+    // decision spans and its body's coverage-mapping spans). Each
+    // test's coverage index keeps only the records containing one
+    // of these, so Pass 2 holds a few records per test instead of
+    // every record of every test.
+    let wanted: std::collections::HashSet<floyd::mir::SourceSpan> = raw_candidates
+        .iter()
+        .flat_map(|raw| prepared[raw.artifact_idx].lookup_spans(raw.fn_idx, &raw.tree))
+        .collect();
+
     // Pass 2: run every test across every artifact once; keep each
-    // test's parsed coverage. We intentionally do NOT dedupe test
-    // names across artifacts — two artifacts can share a test name.
+    // test's coverage, indexed by source span. We intentionally do
+    // NOT dedupe test names across artifacts — two artifacts can
+    // share a test name.
     //
     // Parallelised across tests via rayon. Each per-test job is
     // self-contained (unique profraw file per `(art_idx, test_idx)`,
@@ -666,9 +733,9 @@ fn run_test_mode_cargo(
     let progress_total = jobs.len();
 
     use rayon::prelude::*;
-    let results: Result<Vec<(String, profile::CoverageReport)>, String> = jobs
+    let results: Result<Vec<(String, CoverageIndex)>, String> = jobs
         .par_iter()
-        .map(|job| -> Result<(String, profile::CoverageReport), String> {
+        .map(|job| -> Result<(String, CoverageIndex), String> {
             let prof = workdir.join(format!(
                 "cov-{:03}-{:03}.profraw",
                 job.art_idx, job.test_idx
@@ -688,14 +755,17 @@ fn run_test_mode_cargo(
             {
                 eprintln!("[progress]   {n}/{progress_total}");
             }
-            Ok((job.test_name.clone(), coverage))
+            Ok((
+                job.test_name.clone(),
+                CoverageIndex::build_for(&coverage, &paths, &wanted),
+            ))
         })
         .collect();
     if std::env::var("FLOYD_DIAG").is_ok() {
         eprintln!("[progress] Pass 2 complete");
     }
 
-    let all_coverage = match results {
+    let test_indexes = match results {
         Ok(v) => v,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
@@ -703,125 +773,74 @@ fn run_test_mode_cargo(
         }
     };
 
-    // Pre-compute condition span maps per artifact's MIR. Done
-    // once; reused across every (candidate, test) pair in Pass 3.
-    // This turns Pass 3 from O(candidates × tests × functions ×
-    // blocks) into O(functions × blocks) + O(candidates × tests).
-    // On `bytes` (10 candidates, 1053 tests, ~500 functions per
-    // artifact MIR), that is a factor-of-thousands speedup.
+    // Pass 3: join every candidate to every test's coverage index
+    // by source span. Candidates rustc did not instrument, or whose
+    // decision comes from a dependency's macro, are classified from
+    // their MIR without a join. The same per-test join gives both
+    // the observations and the `invoked` status. Parallelised
+    // across candidates — each is independent.
     if std::env::var("FLOYD_DIAG").is_ok() {
-        eprintln!("[progress] starting Pass 3 prep (precompute span maps)");
+        eprintln!("[progress] starting Pass 3");
     }
-    let prepared: Vec<correlate::PreparedMir<'_>> = artifacts
+    let mir_instrumented: Vec<bool> = artifacts
         .iter()
-        .map(|a| correlate::prepare_mir(&a.mir))
+        .map(|a| a.mir.functions.iter().any(|f| f.coverage_mappings > 0))
         .collect();
-    if std::env::var("FLOYD_DIAG").is_ok() {
-        eprintln!("[progress] Pass 3 prep complete");
-    }
-
-    // Pre-compute per-test coverage lookups (one `HashMap` per
-    // test so Pass 3's `find_matching_function` scan becomes O(1)).
-    if std::env::var("FLOYD_DIAG").is_ok() {
-        eprintln!("[progress] prepping per-test coverage lookups");
-    }
-    let prepared_covs: Vec<(String, correlate::PreparedCoverage<'_>)> = all_coverage
+    let mut joins: Vec<correlate::CandidateCoverage> = raw_candidates
         .par_iter()
-        .map(|(name, cov)| (name.clone(), correlate::prepare_coverage_lookup(cov)))
-        .collect();
-    if std::env::var("FLOYD_DIAG").is_ok() {
-        eprintln!("[progress] coverage lookups ready: {}", prepared_covs.len());
-    }
-
-    // Pass 3: for each candidate, correlate against every test's
-    // coverage using the pre-computed span maps and coverage
-    // lookups. Parallelised across candidates — each is
-    // independent.
-    let candidates: Vec<selector::Candidate> = raw_candidates
-        .into_par_iter()
         .map(|raw| {
             let prep = &prepared[raw.artifact_idx];
-            let obs: Vec<_> = prepared_covs
-                .iter()
-                .filter_map(|(test_name, prepared_cov)| {
-                    correlate::observation_from_prepared_coverage(
-                        Some(test_name.clone()),
-                        prep,
-                        raw.fn_idx,
-                        prepared_cov,
-                        &raw.tree,
-                    )
-                })
-                .collect();
-            selector::Candidate {
-                tree: raw.tree,
-                provenance: raw.prov,
-                observations: obs,
+            match correlate::mir_not_measurable(
+                prep,
+                raw.fn_idx,
+                &raw.tree,
+                mir_instrumented[raw.artifact_idx],
+                Some(&paths),
+            ) {
+                Some(nm) => correlate::CandidateCoverage::not_measurable(nm.reason, nm.detail),
+                None => correlate::join_candidate(prep, raw.fn_idx, &raw.tree, &test_indexes),
             }
         })
         .collect();
+    {
+        let mut named: Vec<(&str, &mut correlate::CandidateCoverage)> = raw_candidates
+            .iter()
+            .map(|raw| {
+                prepared[raw.artifact_idx].mir.functions[raw.fn_idx]
+                    .name
+                    .as_str()
+            })
+            .zip(joins.iter_mut())
+            .collect();
+        correlate::mark_shared_coverage(&mut named);
+    }
     if std::env::var("FLOYD_DIAG").is_ok() {
-        eprintln!(
-            "[progress] Pass 3 complete: {} candidates",
-            candidates.len()
-        );
+        eprintln!("[progress] Pass 3 complete: {} candidates", joins.len());
     }
 
-    // Classify every candidate by whether its own function was
-    // actually reached at runtime by any test. Lets us split the
-    // AllUnobserved message into (a) candidates the test suite
-    // genuinely never invoked and (b) candidates the suite DID
-    // run through but Floyd's span-match correlation missed —
-    // the latter is a Floyd bug, the former a user gap, and
-    // conflating them hides evidence that matters to a
-    // qualification audit.
-    let candidate_reach: Vec<bool> = candidates
-        .iter()
-        .map(|c| {
-            let fn_name = c.provenance.function_name.as_deref().unwrap_or("");
-            prepared_covs
-                .iter()
-                .any(|(_, pcov)| pcov.find(fn_name).map(|f| f.count > 0).unwrap_or(false))
-        })
-        .collect();
-
-    // FLOYD_DIAG span-mismatch probe: for every candidate that
-    // WAS reached at runtime but produced zero observations,
-    // dump its MIR condition spans alongside the first
-    // reaching test's coverage branch regions. Lets a human
-    // diff the two and see what offset / file-path shift the
-    // span-equality join is tripping on.
+    // FLOYD_DIAG span-mismatch probe: for every candidate that WAS
+    // reached at runtime but produced zero observations, dump its
+    // decision spans alongside the branch regions of its coverage
+    // function in the first test that entered it. Lets a human diff
+    // the two and see which span the condition join missed.
     if std::env::var("FLOYD_DIAG").is_ok() {
-        for (c, reached) in candidates.iter().zip(candidate_reach.iter()) {
-            if !*reached || !c.observations.is_empty() {
+        for (raw, join) in raw_candidates.iter().zip(&joins) {
+            if !join.invoked() || !join.observations.is_empty() {
                 continue;
             }
-            let fn_name = c.provenance.function_name.as_deref().unwrap_or("");
-            eprintln!("[span-diag] candidate fn={fn_name}");
-            // MIR condition spans — rebuild for this function via
-            // the correlate helper (prepared.function_spans is
-            // keyed by fn_idx, not reachable from this scope
-            // cleanly; collecting the one function's spans here
-            // is cheap).
-            for (art_idx, info) in artifacts.iter().enumerate() {
-                if let Some((fidx, _)) = info
-                    .mir
-                    .functions
-                    .iter()
-                    .enumerate()
-                    .find(|(_, f)| f.name == fn_name)
-                {
-                    eprintln!("[span-diag]   artifact {art_idx} function_idx={fidx}");
-                    let spans = &prepared[art_idx].function_spans[fidx];
-                    for (name, span) in spans {
-                        eprintln!("[span-diag]     MIR cond '{name}' @ {span:?}");
-                    }
-                    break;
-                }
+            let prep = &prepared[raw.artifact_idx];
+            eprintln!(
+                "[span-diag] candidate fn={}",
+                prep.mir.functions[raw.fn_idx].name
+            );
+            for (name, span) in &prep.function_spans[raw.fn_idx] {
+                eprintln!("[span-diag]     MIR cond '{name}' @ {span:?}");
             }
-            // Coverage branches from the first reaching test.
-            for (test_name, pcov) in prepared_covs.iter() {
-                if let Some(fc) = pcov.find(fn_name) {
+            let spans = prep.lookup_spans(raw.fn_idx, &raw.tree);
+            for (test_name, index) in &test_indexes {
+                if let floyd::coverage_index::FunctionMatch::Found(fc) =
+                    index.resolve(&spans, Some(&prep.mir.functions[raw.fn_idx].name))
+                {
                     if fc.count > 0 {
                         eprintln!(
                             "[span-diag]   test '{test_name}' has {} branches, count={}",
@@ -840,19 +859,35 @@ fn run_test_mode_cargo(
             }
         }
     }
-    let reached_count = candidate_reach.iter().filter(|r| **r).count();
-    let unreached_count = candidate_reach.len() - reached_count;
-    let candidate_summaries: Vec<CandidateSummary> = candidates
+
+    let candidate_summaries: Vec<CandidateSummary> = raw_candidates
         .iter()
-        .zip(candidate_reach.iter())
-        .map(|(c, reached)| CandidateSummary {
-            function_name: c.provenance.function_name.clone(),
-            source_file: c.provenance.source_file.clone(),
-            line: c.provenance.line,
-            invoked: *reached,
-            observations: c.observations.len(),
+        .zip(&joins)
+        .map(|(raw, join)| CandidateSummary::new(&raw.prov, join))
+        .collect();
+    let candidates: Vec<selector::Candidate> = raw_candidates
+        .into_iter()
+        .zip(joins)
+        .map(|(raw, join)| {
+            let mut provenance = raw.prov;
+            provenance.display_name = join.display_name;
+            selector::Candidate {
+                tree: raw.tree,
+                provenance,
+                observations: join.observations,
+            }
         })
         .collect();
+    let count_status = |want: fn(&CandidateSummary) -> bool| {
+        candidate_summaries.iter().filter(|c| want(c)).count()
+    };
+    let reached_count = count_status(|c| c.invoked);
+    let not_measurable: Vec<&correlate::NotMeasurable> = candidate_summaries
+        .iter()
+        .filter_map(|c| c.not_measurable.as_ref())
+        .collect();
+    let not_measurable_count = count_status(|c| c.not_measurable.is_some());
+    let unreached_count = candidate_summaries.len() - reached_count - not_measurable_count;
     let skipped_mirs: Vec<SkippedMir> = skipped_oversize_mirs
         .iter()
         .map(|(path, bytes)| SkippedMir {
@@ -871,6 +906,7 @@ fn run_test_mode_cargo(
         tests_discovered: &all_tests,
         observations,
         analysis,
+        summary: CoverageSummary::new(analysis, not_measurable_count),
         candidates: &candidate_summaries,
         out_of_scope: &declined,
         skipped_oversize_mirs: &skipped_mirs,
@@ -928,6 +964,16 @@ fn run_test_mode_cargo(
                      --format=json's `candidates` list."
                 );
             }
+            if not_measurable_count > 0 {
+                eprintln!(
+                    "  {not_measurable_count} candidate(s) are not \
+                     measurable by coverage (code rustc does not \
+                     instrument, such as derive output, or code \
+                     expanded from a dependency's macro); whether \
+                     they ran is unknown, not a test gap. See \
+                     `not_measurable` in --format=json's `candidates` list."
+                );
+            }
             return emit_decline(RuntimeVerdict::AllUnobserved);
         }
         selector::PickResult::NoCandidates => {
@@ -952,7 +998,7 @@ fn run_test_mode_cargo(
             println!("floyd  runtime MC/DC analysis of {}", manifest.display());
             println!();
             println!("Test targets: {}", build.test_artifacts.len());
-            print_runtime_report_body(&all_tests, &all_observations, &analysis);
+            print_runtime_report_body(&all_tests, &all_observations, &analysis, &not_measurable);
             print_out_of_scope_report(
                 &mut std::io::stdout(),
                 &declined,
@@ -970,10 +1016,17 @@ fn run_test_mode_cargo(
             }
         }
         Format::Junit => {
-            print_runtime_junit(&manifest.display().to_string(), &analysis);
+            print!(
+                "{}",
+                render_runtime_junit(
+                    &manifest.display().to_string(),
+                    &analysis,
+                    not_measurable_count
+                )
+            );
         }
     }
-    ExitCode::SUCCESS
+    ExitCode::from(CoverageSummary::new(Some(&analysis), not_measurable_count).exit_code())
 }
 
 fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCode {
@@ -1035,21 +1088,32 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
 
     // 4b. Collect per-function candidates (smarter selector) and
     //     pre-compute coverage per test — same shape as the cargo-mode path.
-    let mut artifact_candidates: Vec<(floyd::DecisionTree, floyd::DecisionProvenance)> = Vec::new();
-    for f in &mir.functions {
+    // rustc ran in this process's working directory, so relative
+    // MIR paths and the absolute paths llvm-cov reports both
+    // normalise against it.
+    let cwd = std::env::current_dir().ok();
+    let paths = PathNormaliser::new(cwd.as_deref());
+    let prepared = correlate::prepare_mir(&mir, &paths);
+    let mut artifact_candidates: Vec<(floyd::DecisionTree, floyd::DecisionProvenance, usize)> =
+        Vec::new();
+    for (fn_idx, f) in mir.functions.iter().enumerate() {
         if let Some(node) = decision::decompose_function(f) {
             artifact_candidates.push((
                 floyd::DecisionTree {
                     decisions: vec![node],
                 },
                 correlate::provenance_for(f),
+                fn_idx,
             ));
         }
     }
+    let wanted: std::collections::HashSet<floyd::mir::SourceSpan> = artifact_candidates
+        .iter()
+        .flat_map(|(tree, _, fn_idx)| prepared.lookup_spans(*fn_idx, tree))
+        .collect();
 
     // 5. Run each test individually.
-    let mut per_test_coverage: Vec<(String, profile::CoverageReport)> =
-        Vec::with_capacity(tests.len());
+    let mut per_test_coverage: Vec<(String, CoverageIndex)> = Vec::with_capacity(tests.len());
     for (idx, test_name) in tests.iter().enumerate() {
         let prof = workdir.join(format!("cov-{idx:03}.profraw"));
         if let Err(e) = runner::run_test_isolated(&compiled.binary_path, test_name, &prof) {
@@ -1069,26 +1133,42 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
                 return ExitCode::from(1);
             }
         };
-        per_test_coverage.push((test_name.clone(), coverage));
+        per_test_coverage.push((
+            test_name.clone(),
+            CoverageIndex::build_for(&coverage, &paths, &wanted),
+        ));
     }
 
-    // Build candidates with per-tree observations.
-    let mut candidates: Vec<selector::Candidate> = Vec::new();
-    for (tree, prov) in artifact_candidates {
-        let mut obs = Vec::new();
-        for (test_name, coverage) in &per_test_coverage {
-            if let Some(o) =
-                correlate::observation_from_coverage(Some(test_name.clone()), &mir, coverage, &tree)
-            {
-                obs.push(o);
-            }
-        }
-        candidates.push(selector::Candidate {
-            tree,
-            provenance: prov,
-            observations: obs,
-        });
+    // Join every candidate to every test's coverage by source span.
+    // This MIR comes from a separate, uninstrumented rustc run, so
+    // it carries no coverage mappings to classify candidates by;
+    // the join alone decides.
+    let mut joins: Vec<correlate::CandidateCoverage> = artifact_candidates
+        .iter()
+        .map(|(tree, _, fn_idx)| {
+            correlate::join_candidate(&prepared, *fn_idx, tree, &per_test_coverage)
+        })
+        .collect();
+    {
+        let mut named: Vec<(&str, &mut correlate::CandidateCoverage)> = artifact_candidates
+            .iter()
+            .map(|(_, _, fn_idx)| mir.functions[*fn_idx].name.as_str())
+            .zip(joins.iter_mut())
+            .collect();
+        correlate::mark_shared_coverage(&mut named);
     }
+    let candidates: Vec<selector::Candidate> = artifact_candidates
+        .into_iter()
+        .zip(joins)
+        .map(|((tree, mut provenance, _), join)| {
+            provenance.display_name = join.display_name;
+            selector::Candidate {
+                tree,
+                provenance,
+                observations: join.observations,
+            }
+        })
+        .collect();
 
     // 6. Pick the best candidate, run the analysis.
     let report = |verdict, observations, analysis| SingleRuntimeReport {
@@ -1097,6 +1177,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
         tests_discovered: &tests,
         observations,
         analysis,
+        summary: CoverageSummary::new(analysis, 0),
     };
     let emit_decline = |verdict| -> ExitCode {
         if let Format::Json = format {
@@ -1145,10 +1226,13 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
             }
         }
         Format::Junit => {
-            print_runtime_junit(&source.display().to_string(), &analysis);
+            print!(
+                "{}",
+                render_runtime_junit(&source.display().to_string(), &analysis, 0)
+            );
         }
     }
-    ExitCode::SUCCESS
+    ExitCode::from(CoverageSummary::new(Some(&analysis), 0).exit_code())
 }
 
 fn parse_format(s: &str) -> Result<Format, String> {
@@ -1247,16 +1331,22 @@ fn print_runtime_report(
 ) {
     println!("floyd  runtime MC/DC analysis of {}", source.display());
     println!();
-    print_runtime_report_body(tests, observations, analysis);
+    print_runtime_report_body(tests, observations, analysis, &[]);
 }
 
 fn print_runtime_report_body(
     tests: &[String],
     observations: &[ConditionObservation],
     analysis: &RuntimeAnalysis,
+    not_measurable: &[&correlate::NotMeasurable],
 ) {
+    let ambiguous = observations.iter().filter(|o| o.ambiguous).count();
     println!("Tests discovered: {}", tests.len());
-    println!("Observations:     {}", observations.len());
+    println!(
+        "Observations:     {} ({} used, {ambiguous} ambiguous)",
+        observations.len(),
+        observations.len() - ambiguous,
+    );
     println!(
         "Conditions:       {}",
         if analysis.matrix.conditions.is_empty() {
@@ -1289,6 +1379,14 @@ fn print_runtime_report_body(
     if !observations.is_empty() {
         println!("Per-test observations:");
         for obs in observations {
+            let label = obs.test_name.as_deref().unwrap_or("?");
+            if obs.ambiguous {
+                println!(
+                    "  {label:30}  AMBIGUOUS  {}",
+                    format_ambiguous_counts(&analysis.matrix.conditions, obs)
+                );
+                continue;
+            }
             let mut parts: Vec<String> = analysis
                 .matrix
                 .conditions
@@ -1299,19 +1397,19 @@ fn print_runtime_report_body(
                     None => format!("{c}=-"),
                 })
                 .collect();
-            parts.push(format!("result={}", bool_glyph(obs.result)));
-            let label = obs.test_name.as_deref().unwrap_or("?");
+            parts.push(format!("result={}", obs.result.map_or("?", bool_glyph)));
+            if let Some(n) = obs.evaluations.filter(|n| *n > 1) {
+                parts.push(format!("({n} evaluations)"));
+            }
             println!("  {label:30}  {}", parts.join("  "));
         }
         println!();
     }
 
     println!("Per-condition MC/DC status:");
-    let mut exercised = 0usize;
     for cond in &analysis.matrix.conditions {
         match analysis.condition_status.get(cond) {
             Some(ConditionStatus::Exercised(pair)) => {
-                exercised += 1;
                 let t1 = format_inputs(&analysis.matrix.conditions, &pair.test_1);
                 let t2 = format_inputs(&analysis.matrix.conditions, &pair.test_2);
                 println!(
@@ -1320,7 +1418,10 @@ fn print_runtime_report_body(
                     bool_glyph(pair.test_2.result),
                 );
             }
-            Some(ConditionStatus::Unexercised) => {
+            Some(ConditionStatus::Ambiguous { tests }) => {
+                println!("  ? {cond}: {}", unknown_reason(tests, observations));
+            }
+            Some(ConditionStatus::Unexercised) | None => {
                 let missing = analysis
                     .matrix
                     .independence_pairs
@@ -1334,17 +1435,65 @@ fn print_runtime_report_body(
                     println!("  ✗ {cond}: UNEXERCISED (no valid pair available)");
                 }
             }
-            None => {
-                println!("  ? {cond}: unknown");
-            }
         }
     }
-    let total = analysis.matrix.conditions.len();
-    if total > 0 {
-        let pct = (exercised as f64 / total as f64) * 100.0;
+    let summary = CoverageSummary::new(Some(analysis), not_measurable.len());
+    if let Some(line) = summary.coverage_line(analysis.ambiguous_observations) {
         println!();
-        println!("MC/DC coverage: {exercised} of {total} conditions exercised ({pct:.0}%)",);
+        println!("{line}");
+        if summary.percentage.is_none() {
+            println!("{}", summary::unknown_hint(analysis.ambiguous_observations));
+        }
     }
+    if let Some(line) = summary::not_measurable_line(not_measurable.iter().copied()) {
+        println!();
+        println!("{line}");
+    }
+}
+
+/// The status text after `? {cond}: ` for a condition whose only
+/// evidence is ambiguous: `UNKNOWN`, why, and the tests (at most
+/// [`summary::TESTS_SHOWN`] named, with their evaluation counts).
+fn unknown_reason(tests: &[String], observations: &[ConditionObservation]) -> String {
+    format!(
+        "UNKNOWN — evaluated only in {} test(s) that evaluated the decision more than \
+         once, so no condition vector can be attributed: {}",
+        tests.len(),
+        format_ambiguous_tests(tests, observations)
+    )
+}
+
+/// `evaluated 256x: c1=224T/32F  c2=95T/129F` for an ambiguous
+/// observation, in the decision's condition order.
+fn format_ambiguous_counts(conditions: &[String], obs: &ConditionObservation) -> String {
+    let counts: Vec<String> = conditions
+        .iter()
+        .map(|c| match obs.counts.get(c) {
+            Some(n) => format!("{c}={}T/{}F", n.true_count, n.false_count),
+            None => format!("{c}=-"),
+        })
+        .collect();
+    let evals = obs
+        .evaluations
+        .map_or_else(|| "?".to_string(), |n| n.to_string());
+    format!("evaluated {evals}x: {}", counts.join("  "))
+}
+
+/// `t1 (256 evaluations), t2 (3 evaluations)` for the tests behind a
+/// [`ConditionStatus::Ambiguous`], naming at most
+/// [`summary::TESTS_SHOWN`] of them and summarising the rest as
+/// `(+N more)` (all of them are in the per-test listing).
+fn format_ambiguous_tests(tests: &[String], observations: &[ConditionObservation]) -> String {
+    summary::cap_tests(tests, |t| {
+        let evals = observations
+            .iter()
+            .find(|o| o.ambiguous && o.test_name.as_deref() == Some(t))
+            .and_then(|o| o.evaluations);
+        match evals {
+            Some(n) => format!("{t} ({n} evaluations)"),
+            None => t.to_string(),
+        }
+    })
 }
 
 fn print_truth_table_header(conditions: &[String]) {
@@ -1468,43 +1617,83 @@ fn bool_glyph(v: bool) -> &'static str {
 // JUnit XML rendering
 // ---------------------------------------------------------------------------
 
-/// Emit a JUnit XML report for a runtime analysis. One
+/// Render a JUnit XML report for a runtime analysis. One
 /// `<testsuite>` per analysis context (typically one per
 /// invocation today), one `<testcase>` per recovered condition.
 /// Exercised conditions pass (empty body); unexercised conditions
-/// emit a `<failure>` with the required independence-pair inputs
-/// in the message.
+/// emit a `<failure type="UnexercisedCondition">` with the required
+/// independence-pair inputs in the message; conditions whose only
+/// evidence is ambiguous emit a `<failure type="AmbiguousCondition">`
+/// naming at most [`summary::TESTS_SHOWN`] of the multi-evaluation
+/// tests (not demonstrated, so not a pass).
+///
+/// The suite carries the [`CoverageSummary`] counts as
+/// `<properties>`; `floyd.percentage` is present only when no
+/// condition is unknown, matching the text and JSON reports.
 ///
 /// The format is the de-facto JUnit XML that Jenkins, GitLab CI,
 /// GitHub Actions, Bazel/Buck2, and the other CIs the automotive
 /// industry already deploys render natively.
-fn print_runtime_junit(source: &str, analysis: &RuntimeAnalysis) {
+fn render_runtime_junit(source: &str, analysis: &RuntimeAnalysis, not_measurable: usize) -> String {
+    use std::fmt::Write as _;
     let conditions = &analysis.matrix.conditions;
-    let total = conditions.len();
-    let failures = conditions
-        .iter()
-        .filter(|c| {
-            matches!(
-                analysis.condition_status.get(c.as_str()),
-                Some(ConditionStatus::Unexercised) | None
-            )
-        })
-        .count();
+    let summary = CoverageSummary::new(Some(analysis), not_measurable);
+    let total = summary.conditions_total;
+    let failures = total - summary.exercised;
+    let mut out = String::new();
 
-    println!(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
-    println!(r#"<testsuites name="floyd" tests="{total}" failures="{failures}">"#);
-    println!(
+    let _ = writeln!(out, r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    let _ = writeln!(
+        out,
+        r#"<testsuites name="floyd" tests="{total}" failures="{failures}">"#
+    );
+    let _ = writeln!(
+        out,
         r#"  <testsuite name="{}" tests="{total}" failures="{failures}">"#,
         xml_escape(source)
     );
+    let _ = writeln!(out, "    <properties>");
+    let mut props: Vec<(&str, String)> = vec![
+        ("floyd.conditions_total", total.to_string()),
+        ("floyd.exercised", summary.exercised.to_string()),
+        ("floyd.not_exercised", summary.not_exercised.to_string()),
+        ("floyd.unknown", summary.unknown.to_string()),
+        ("floyd.not_measurable", summary.not_measurable.to_string()),
+    ];
+    if let Some(pct) = summary.percentage {
+        props.push(("floyd.percentage", format!("{pct:.0}")));
+    }
+    for (name, value) in props {
+        let _ = writeln!(
+            out,
+            r#"      <property name="{name}" value="{}"/>"#,
+            xml_escape(&value)
+        );
+    }
+    let _ = writeln!(out, "    </properties>");
     for cond in conditions {
         let case_name = xml_escape(cond);
-        match analysis.condition_status.get(cond.as_str()) {
+        let (kind, message) = match analysis.condition_status.get(cond.as_str()) {
             Some(ConditionStatus::Exercised(_)) => {
-                println!(r#"    <testcase name="{case_name}" classname="floyd.mcdc"/>"#);
+                let _ = writeln!(
+                    out,
+                    r#"    <testcase name="{case_name}" classname="floyd.mcdc"/>"#
+                );
+                continue;
             }
-            Some(ConditionStatus::Unexercised) | None => {
-                let required = analysis
+            Some(ConditionStatus::Ambiguous { tests }) => (
+                "AmbiguousCondition",
+                format!(
+                    "UNKNOWN: evaluated only in {} test(s) that evaluated the decision more \
+                     than once ({}); aggregate counters cannot attribute a condition vector \
+                     to them. Add tests that each evaluate the decision once.",
+                    tests.len(),
+                    summary::cap_tests(tests, str::to_string)
+                ),
+            ),
+            Some(ConditionStatus::Unexercised) | None => (
+                "UnexercisedCondition",
+                analysis
                     .matrix
                     .independence_pairs
                     .get(cond.as_str())
@@ -1520,18 +1709,23 @@ fn print_runtime_junit(source: &str, analysis: &RuntimeAnalysis) {
                     })
                     .unwrap_or_else(|| {
                         "no valid independence pair available for this condition".to_string()
-                    });
-                println!(r#"    <testcase name="{case_name}" classname="floyd.mcdc">"#);
-                println!(
-                    r#"      <failure message="{}" type="UnexercisedCondition"/>"#,
-                    xml_escape(&required)
-                );
-                println!(r#"    </testcase>"#);
-            }
-        }
+                    }),
+            ),
+        };
+        let _ = writeln!(
+            out,
+            r#"    <testcase name="{case_name}" classname="floyd.mcdc">"#
+        );
+        let _ = writeln!(
+            out,
+            r#"      <failure message="{}" type="{kind}"/>"#,
+            xml_escape(&message)
+        );
+        let _ = writeln!(out, r#"    </testcase>"#);
     }
-    println!(r#"  </testsuite>"#);
-    println!(r#"</testsuites>"#);
+    let _ = writeln!(out, r#"  </testsuite>"#);
+    let _ = writeln!(out, r#"</testsuites>"#);
+    out
 }
 
 /// Escape the five XML special characters so condition names like
@@ -1567,13 +1761,35 @@ mod tests {
             source_file: Some("src/lib.rs".to_string()),
             line: Some(7),
         }];
-        let candidates = vec![CandidateSummary {
-            function_name: Some("crate::g".to_string()),
-            source_file: Some("src/lib.rs".to_string()),
-            line: Some(12),
-            invoked: false,
-            observations: 0,
-        }];
+        let candidates = vec![
+            CandidateSummary {
+                function_name: Some("crate::g".to_string()),
+                display_name: Some("crate::g".to_string()),
+                source_file: Some("src/lib.rs".to_string()),
+                line: Some(12),
+                invoked: false,
+                observations: 0,
+                not_measurable: None,
+            },
+            CandidateSummary {
+                function_name: Some(
+                    "ast::comment::_::<impl at src/ast/comment.rs:11:38: 11:54>::serialize"
+                        .to_string(),
+                ),
+                display_name: Some(
+                    "ast::comment::_::<impl at src/ast/comment.rs:11:38: 11:54>::serialize"
+                        .to_string(),
+                ),
+                source_file: Some("src/ast/comment.rs".to_string()),
+                line: Some(11),
+                invoked: false,
+                observations: 0,
+                not_measurable: Some(correlate::NotMeasurable {
+                    reason: correlate::NotMeasurableReason::Uninstrumented,
+                    detail: "no coverage mapping".to_string(),
+                }),
+            },
+        ];
         let skipped = vec![SkippedMir {
             path: "target/x.mir".to_string(),
             bytes: 1,
@@ -1586,6 +1802,7 @@ mod tests {
             tests_discovered: &[],
             observations: &[],
             analysis: None,
+            summary: CoverageSummary::new(None, 1),
             candidates: &candidates,
             out_of_scope: &declined,
             skipped_oversize_mirs: &skipped,
@@ -1600,7 +1817,209 @@ mod tests {
         assert_eq!(v["out_of_scope"][0]["line"], 7);
         assert_eq!(v["candidates"][0]["function_name"], "crate::g");
         assert_eq!(v["candidates"][0]["invoked"], false);
+        assert_eq!(v["candidates"][0]["display_name"], "crate::g");
+        assert!(v["candidates"][0].get("not_measurable").is_none());
+        assert_eq!(v["candidates"][1]["invoked"], false);
+        assert_eq!(
+            v["candidates"][1]["not_measurable"]["reason"],
+            "uninstrumented"
+        );
         assert_eq!(v["skipped_oversize_mirs"][0]["bytes"], 1);
+        assert_eq!(v["summary"]["conditions_total"], 0);
+        assert_eq!(v["summary"]["not_measurable"], 1);
+        assert!(v["summary"]["percentage"].is_null());
+    }
+
+    #[test]
+    fn json_observations_carry_ambiguity_evaluations_and_raw_counts() {
+        use floyd::BranchCounts;
+        let mut vector = ConditionObservation::vector(
+            Some("detects_unprintable".to_string()),
+            [("byte >= 32".to_string(), false)].into_iter().collect(),
+            false,
+        );
+        vector.evaluations = Some(1);
+        let ambiguous = ConditionObservation::ambiguous(
+            Some("symbol_matches_char_for_all_valid_symbols".to_string()),
+            256,
+            [
+                (
+                    "byte >= 32".to_string(),
+                    BranchCounts {
+                        true_count: 224,
+                        false_count: 32,
+                    },
+                ),
+                (
+                    "byte <= 126".to_string(),
+                    BranchCounts {
+                        true_count: 95,
+                        false_count: 129,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let observations = [vector, ambiguous];
+        let report = SingleRuntimeReport {
+            source: "lib.rs".to_string(),
+            verdict: RuntimeVerdict::Analysed,
+            tests_discovered: &[],
+            observations: &observations,
+            analysis: None,
+            summary: CoverageSummary::new(None, 0),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        let o = &v["observations"];
+        assert_eq!(o[0]["ambiguous"], false);
+        assert_eq!(o[0]["evaluations"], 1);
+        assert_eq!(o[0]["result"], false);
+        assert!(o[0].get("counts").is_none());
+        assert_eq!(o[1]["ambiguous"], true);
+        assert_eq!(o[1]["evaluations"], 256);
+        assert!(o[1]["result"].is_null());
+        assert_eq!(o[1]["counts"]["byte >= 32"]["true_count"], 224);
+        assert_eq!(o[1]["counts"]["byte >= 32"]["false_count"], 32);
+        assert_eq!(o[1]["counts"]["byte <= 126"]["true_count"], 95);
+        assert_eq!(o[1]["counts"]["byte <= 126"]["false_count"], 129);
+
+        let conditions = ["byte <= 126".to_string(), "byte >= 32".to_string()];
+        assert_eq!(
+            format_ambiguous_counts(&conditions, &observations[1]),
+            "evaluated 256x: byte <= 126=95T/129F  byte >= 32=224T/32F"
+        );
+        assert_eq!(
+            format_ambiguous_tests(
+                &["symbol_matches_char_for_all_valid_symbols".to_string()],
+                &observations
+            ),
+            "symbol_matches_char_for_all_valid_symbols (256 evaluations)"
+        );
+        let many: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
+        assert_eq!(format_ambiguous_tests(&many, &[]), "t0, t1, t2 (+2 more)");
+    }
+
+    fn ambiguous_analysis(ambiguous_tests: usize) -> RuntimeAnalysis {
+        let tree = floyd::DecisionTree {
+            // a && b
+            decisions: vec![decision::Node::Ite {
+                cond: "a".to_string(),
+                then_branch: Box::new(decision::Node::Ite {
+                    cond: "b".to_string(),
+                    then_branch: Box::new(decision::Node::Const { value: true }),
+                    else_branch: Box::new(decision::Node::Const { value: false }),
+                }),
+                else_branch: Box::new(decision::Node::Const { value: false }),
+            }],
+        };
+        let vec_obs = |name: &str, a: bool, b: Option<bool>, result: bool| {
+            let mut inputs: std::collections::BTreeMap<String, bool> =
+                [("a".to_string(), a)].into_iter().collect();
+            if let Some(b) = b {
+                inputs.insert("b".to_string(), b);
+            }
+            ConditionObservation::vector(Some(name.to_string()), inputs, result)
+        };
+        // `a` is demonstrated by (F,-)->F vs (T,T)->T; `b`'s only
+        // other evidence, (T,F)->F, comes from ambiguous tests.
+        let mut observations = vec![
+            vec_obs("a_false", false, None, false),
+            vec_obs("both_true", true, Some(true), true),
+        ];
+        for i in 0..ambiguous_tests {
+            observations.push(ConditionObservation::ambiguous(
+                Some(format!("loop_{i}")),
+                2,
+                [
+                    (
+                        "a".to_string(),
+                        floyd::BranchCounts {
+                            true_count: 2,
+                            false_count: 0,
+                        },
+                    ),
+                    (
+                        "b".to_string(),
+                        floyd::BranchCounts {
+                            true_count: 1,
+                            false_count: 1,
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+        }
+        masking::analyze_with_runtime(&tree, &observations, Variant::Masking)
+    }
+
+    #[test]
+    fn junit_caps_ambiguous_tests_and_withholds_the_percentage() {
+        let analysis = ambiguous_analysis(5);
+        assert!(matches!(
+            analysis.condition_status.get("b"),
+            Some(ConditionStatus::Ambiguous { tests }) if tests.len() == 5
+        ));
+        let xml = render_runtime_junit("lib.rs", &analysis, 2);
+        assert!(xml.contains(r#"type="AmbiguousCondition""#), "{xml}");
+        assert!(xml.contains("(loop_0, loop_1, loop_2 (+2 more))"), "{xml}");
+        assert!(!xml.contains("loop_3"), "{xml}");
+        assert!(xml.contains(r#"<testsuite name="lib.rs" tests="2" failures="1">"#));
+        assert!(xml.contains(r#"<property name="floyd.unknown" value="1"/>"#));
+        assert!(xml.contains(r#"<property name="floyd.not_measurable" value="2"/>"#));
+        assert!(!xml.contains("floyd.percentage"), "{xml}");
+        assert!(!xml.contains('%'), "{xml}");
+        assert_eq!(
+            CoverageSummary::new(Some(&analysis), 2).exit_code(),
+            summary::EXIT_MCDC_NOT_DEMONSTRATED
+        );
+    }
+
+    #[test]
+    fn junit_carries_the_percentage_when_nothing_is_unknown() {
+        let analysis = ambiguous_analysis(0);
+        assert!(matches!(
+            analysis.condition_status.get("b"),
+            Some(ConditionStatus::Unexercised)
+        ));
+        let xml = render_runtime_junit("lib.rs", &analysis, 0);
+        assert!(xml.contains(r#"type="UnexercisedCondition""#), "{xml}");
+        assert!(xml.contains(r#"<property name="floyd.percentage" value="50"/>"#));
+        assert!(xml.contains(r#"<property name="floyd.unknown" value="0"/>"#));
+    }
+
+    #[test]
+    fn json_summary_reports_null_percentage_for_an_analysed_unknown() {
+        let analysis = ambiguous_analysis(1);
+        let report = SingleRuntimeReport {
+            source: "lib.rs".to_string(),
+            verdict: RuntimeVerdict::Analysed,
+            tests_discovered: &[],
+            observations: &[],
+            analysis: Some(&analysis),
+            summary: CoverageSummary::new(Some(&analysis), 0),
+        };
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["summary"]["conditions_total"], 2);
+        assert_eq!(v["summary"]["exercised"], 1);
+        assert_eq!(v["summary"]["not_exercised"], 0);
+        assert_eq!(v["summary"]["unknown"], 1);
+        assert!(v["summary"]["percentage"].is_null());
+        assert!(v["analysis"]["condition_status"]["b"]["Ambiguous"].is_object());
+    }
+
+    #[test]
+    fn unknown_status_line_says_unknown_and_caps_tests() {
+        let tests: Vec<String> = (0..4).map(|i| format!("loop_{i}")).collect();
+        let line = unknown_reason(&tests, &[]);
+        assert!(
+            line.starts_with("UNKNOWN — evaluated only in 4 test(s)"),
+            "{line}"
+        );
+        assert!(line.ends_with("loop_0, loop_1, loop_2 (+1 more)"), "{line}");
+        assert!(!line.contains("UNEXERCISED"));
     }
 
     #[test]

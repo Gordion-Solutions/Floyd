@@ -22,23 +22,33 @@
 //!    whose source local has a `debug` name contribute that name at
 //!    the statement's span (the RHS condition being *read*). If a
 //!    name appears in multiple places, the first occurrence wins.
-//! 2. Look up the corresponding [`crate::profile::FunctionCoverage`]
-//!    by demangling its symbol and matching the unmangled tail against
-//!    the MIR function name.
-//! 3. For each `(condition_name, span)` pair, find the matching
-//!    [`crate::profile::Branch`] (equal `SourceSpan`) and record its
+//! 2. Find the function's coverage record by **source span**: the
+//!    [`CoverageIndex`] keys every `llvm-cov` record by its
+//!    normalised code and branch spans, merges the records of one
+//!    source function (generic monomorphisations) by summing their
+//!    counters, and returns the one function whose spans contain the
+//!    decision's condition spans (and, when the MIR came from the
+//!    instrumented compilation, the body's own coverage-mapping
+//!    spans). Function names are never compared:
+//!    MIR names impl methods `<impl at FILE:L:C: L:C>::m` and trims
+//!    paths, coverage names monomorphised symbols, and neither can
+//!    be reconciled with the other.
+//! 3. For each `(condition_name, span)` pair, take the merged
+//!    function's branch region at exactly that span and record its
 //!    `true_count` / `false_count`.
 //!
-//! Source-span equality is structural: same `file`, same start/end
-//! line, same start/end column.
+//! Spans compare structurally after [`PathNormaliser`] has put both
+//! files in canonical form: same file, same start/end line, same
+//! start/end column.
 //!
 //! [ADR-0002]: ../../../architecture/decisions/0002-runtime-pipeline.md
 
-use crate::decision::{self, DecisionTree};
-use crate::masking::ConditionObservation;
+use crate::coverage_index::{CoverageIndex, FunctionId, FunctionMatch, PathNormaliser};
+use crate::decision::{self, DecisionTree, Node};
+use crate::masking::{BranchCounts, ConditionObservation};
 use crate::mir::{Mir, MirFunction, MirStatement, MirTerminator, SourceSpan};
-use crate::profile::{CoverageReport, FunctionCoverage};
-use std::collections::BTreeMap;
+use crate::profile::CoverageReport;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// The result of joining MIR decision structure with runtime
 /// coverage data.
@@ -65,7 +75,8 @@ pub struct FunctionRuntime {
 /// location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConditionRuntime {
-    /// The source span where this condition appears in the program.
+    /// The source span where this condition appears in the program
+    /// (file in [`PathNormaliser`] canonical form).
     pub span: SourceSpan,
     /// Number of times the condition evaluated true across the runs
     /// represented by the [`CoverageReport`].
@@ -76,27 +87,29 @@ pub struct ConditionRuntime {
 
 /// Join MIR decisions to runtime coverage data by source span.
 ///
-/// Phase 1 scope: matches functions by unmangled name and conditions
-/// by exact `SourceSpan` equality. Macro-expanded conditions, inlined
-/// generics, and conditions whose source span shifts under
-/// optimisation are out of scope and may yield missing entries —
-/// safe failure rather than wrong data.
-pub fn correlate(mir: &Mir, coverage: &CoverageReport) -> DecisionMap {
+/// Each MIR function is looked up in a [`CoverageIndex`] of
+/// `coverage` by all of its condition spans; conditions are then
+/// joined to the found function's branch regions by exact
+/// (normalised) span equality. A function with no coverage record,
+/// or whose spans are ambiguous, gets an empty `conditions` map:
+/// safe failure rather than wrong data. `paths` must be built with
+/// the root rustc ran in, so relative MIR paths and absolute
+/// `llvm-cov` paths normalise to the same string.
+pub fn correlate(mir: &Mir, coverage: &CoverageReport, paths: &PathNormaliser) -> DecisionMap {
+    let index = CoverageIndex::build(coverage, paths);
+    let prepared = prepare_mir(mir, paths);
     let mut map = DecisionMap::default();
-    for f in &mir.functions {
-        let condition_spans = collect_condition_spans(f);
-        let cov_fn = find_matching_function(&f.name, coverage);
-
+    for (f, spans) in mir.functions.iter().zip(&prepared.function_spans) {
         let mut conditions = BTreeMap::new();
-        for (name, span) in &condition_spans {
-            if let Some(cov_fn) = cov_fn {
-                if let Some(branch) = cov_fn.branches.iter().find(|b| spans_match(&b.span, span)) {
+        if let FunctionMatch::Found(cov_fn) = index.resolve(spans.values(), Some(&f.name)) {
+            for (name, span) in spans {
+                if let Some(counts) = cov_fn.branch_counts(span) {
                     conditions.insert(
                         name.clone(),
                         ConditionRuntime {
                             span: span.clone(),
-                            true_count: branch.true_count,
-                            false_count: branch.false_count,
+                            true_count: counts.true_count,
+                            false_count: counts.false_count,
                         },
                     );
                 }
@@ -110,214 +123,575 @@ pub fn correlate(mir: &Mir, coverage: &CoverageReport) -> DecisionMap {
     map
 }
 
-/// Build a [`ConditionObservation`] from a single-test
-/// [`CoverageReport`], a [`Mir`] tree, and a [`DecisionTree`].
+/// The condition a decision tests first: the `cond` of its root
+/// [`Node::Ite`], or the leaf of a bare [`Node::Condition`].
 ///
-/// For each condition the [`correlate`] join finds runtime counts
-/// for, infer the boolean value the test evaluated it to: `true` if
-/// `true_count > 0`, `false` if `false_count > 0`, *omitted* if both
-/// are zero (the condition was short-circuited and not evaluated in
-/// this test).
-///
-/// The decision's result is computed by evaluating the first decision
-/// in `tree` under the inferred inputs via
-/// [`decision::evaluate_partial`]. Returns `None` if the tree is
-/// empty or the ITE evaluation needs a condition that wasn't observed
-/// (which would indicate inconsistent input data).
-pub fn observation_from_coverage(
-    test_name: Option<String>,
-    mir: &Mir,
-    coverage: &CoverageReport,
-    tree: &DecisionTree,
-) -> Option<ConditionObservation> {
-    let map = correlate(mir, coverage);
-    let mut inputs = BTreeMap::new();
-    for f in &map.functions {
-        for (name, runtime) in &f.conditions {
-            if runtime.true_count > 0 {
-                inputs.insert(name.clone(), true);
-            } else if runtime.false_count > 0 {
-                inputs.insert(name.clone(), false);
-            }
-            // Both 0 -> short-circuited; omit from inputs.
-        }
+/// An ITE tree is evaluated from its root, so this condition is
+/// tested on every entry into the decision and is never
+/// short-circuited. Its `true_count + false_count` is therefore the
+/// number of times the decision was evaluated. `None` for a
+/// constant decision, which tests no condition.
+fn root_condition(node: &Node) -> Option<&str> {
+    match node {
+        Node::Ite { cond, .. } => Some(cond),
+        Node::Condition { name } => Some(name),
+        _ => None,
     }
-    let decision_node = tree.decisions.first()?;
-    let result = decision::evaluate_partial(decision_node, &inputs)?;
-    Some(ConditionObservation {
+}
+
+/// Reduce one test's aggregate per-condition counters for one
+/// decision to the observations those counters prove occurred.
+///
+/// `counts` maps condition names to the test's `llvm-cov` branch
+/// counters. Those counters are TOTALS over every evaluation of the
+/// decision in the test, and each condition is counted on its own,
+/// so they do not record which values occurred *together*. A test
+/// that runs `a && b` as (T,T) and then (F,-) leaves `a = [1 T, 1 F]`,
+/// `b = [1 T, 0 F]`; collapsing each condition independently gives
+/// one vector, (T,T), and silently drops the (F,-) evaluation. Worse,
+/// for some decisions the collapsed vector never occurred at all.
+/// Floyd therefore only derives a vector when the counters determine
+/// it.
+///
+/// # Evaluation count
+///
+/// The number of times the test evaluated the decision, `N`, is the
+/// root condition's `true_count + false_count`. The root (the `cond`
+/// of the outermost [`Node::Ite`], or the leaf of a bare
+/// [`Node::Condition`]) is tested on every entry into the decision
+/// and is never short-circuited. This is the
+/// primary signal. `function_count`
+/// ([`crate::profile::FunctionCoverage::count`], when known) counts entries into the
+/// enclosing function, not evaluations of the decision: a function
+/// that evaluates the decision inside a loop has `N` greater than its
+/// entry count, and a decision behind an early `?` return has `N`
+/// smaller. It is used only as a consistency check (see rule 0).
+///
+/// # Rules, in order
+///
+/// 0. **Consistent counters.** Every condition of the decision is
+///    tested at most once per evaluation, so its total must not
+///    exceed `N`; and a decision evaluated `N > 0` times means its
+///    function was entered, so `function_count` must not be
+///    `Some(0)`. Inconsistent counters cannot be attributed and the
+///    test is recorded as ambiguous.
+/// 1. **Single evaluation.** `N == 1`: each evaluated condition has
+///    exactly one non-zero counter, which is its value. One vector.
+/// 2. **Uniform repeated evaluations.** `N > 1` but every condition
+///    was only ever true or only ever false in this test. The ITE
+///    path is fully determined by the condition values, so all `N`
+///    evaluations followed the same path with the same values. One
+///    vector (the same one rule 1 would derive).
+/// 3. **Single-condition decision.** A decision over one condition
+///    that was both true and false yields two vectors, `{c: T}` and
+///    `{c: F}`, however many evaluations there were: with one
+///    condition the vector is the condition's value, so each
+///    non-zero counter proves its vector occurred.
+/// 4. Otherwise the test is **ambiguous**: recorded with its
+///    evaluation count and raw counters, no vector, no result.
+///
+/// `N == 0` (the test never evaluated the decision) or a root with
+/// no counters yields no observation at all. Condition names in
+/// `counts` that the decision does not reference are ignored.
+pub fn observations_from_counts(
+    test_name: Option<String>,
+    decision: &Node,
+    counts: &BTreeMap<String, BranchCounts>,
+    function_count: Option<u64>,
+) -> Vec<ConditionObservation> {
+    let Some(root) = root_condition(decision) else {
+        return Vec::new();
+    };
+    let Some(evaluations) = counts.get(root).map(BranchCounts::total) else {
+        return Vec::new();
+    };
+    if evaluations == 0 {
+        return Vec::new();
+    }
+    let conditions = crate::masking::collect_conditions(decision);
+    let decision_counts: BTreeMap<String, BranchCounts> = conditions
+        .iter()
+        .filter_map(|c| counts.get(c).map(|n| (c.clone(), *n)))
+        .collect();
+
+    // Rule 0: counters that cannot describe `evaluations`
+    // evaluations of this decision are not attributable.
+    let consistent =
+        decision_counts.values().all(|c| c.total() <= evaluations) && function_count != Some(0);
+    if !consistent {
+        return vec![ConditionObservation::ambiguous(
+            test_name,
+            evaluations,
+            decision_counts,
+        )];
+    }
+
+    // Rules 1 and 2: one vector. With `evaluations == 1` every
+    // condition is one-sided, so rule 1 is the `N == 1` case of
+    // rule 2; both are spelled out for the reader.
+    let one_sided = |c: &BranchCounts| c.true_count == 0 || c.false_count == 0;
+    if evaluations == 1 || decision_counts.values().all(one_sided) {
+        let inputs: BTreeMap<String, bool> = decision_counts
+            .iter()
+            .filter(|(_, c)| c.total() > 0)
+            .map(|(name, c)| (name.clone(), c.true_count > 0))
+            .collect();
+        return vector_observation(test_name, decision, inputs, evaluations)
+            .into_iter()
+            .collect();
+    }
+
+    // Rule 3.
+    if conditions.len() == 1 {
+        return single_condition_rule(test_name, decision, root, evaluations);
+    }
+
+    // Rule 4.
+    vec![ConditionObservation::ambiguous(
         test_name,
-        inputs,
-        result,
-    })
+        evaluations,
+        decision_counts,
+    )]
+}
+
+/// Single-condition rule: a decision over ONE condition that the
+/// test evaluated both true and false (in any number of
+/// evaluations, e.g. in a loop) yields two vectors, `{c: T}` and
+/// `{c: F}`.
+///
+/// This is sound where the general case is not: with one condition
+/// the vector *is* the condition's value, so `true_count > 0` proves
+/// that `{c: T}` occurred and `false_count > 0` proves that `{c: F}`
+/// occurred. No combination of values across conditions has to be
+/// guessed. Called only when both counters are non-zero (the
+/// one-sided case is rule 2 of [`observations_from_counts`]).
+fn single_condition_rule(
+    test_name: Option<String>,
+    decision: &Node,
+    condition: &str,
+    evaluations: u64,
+) -> Vec<ConditionObservation> {
+    [true, false]
+        .into_iter()
+        .filter_map(|value| {
+            let inputs = BTreeMap::from([(condition.to_string(), value)]);
+            vector_observation(test_name.clone(), decision, inputs, evaluations)
+        })
+        .collect()
+}
+
+/// A condition-vector observation whose result is evaluated from
+/// `inputs`. `None` if the decision needs a condition missing from
+/// `inputs` (inconsistent counters).
+fn vector_observation(
+    test_name: Option<String>,
+    decision: &Node,
+    inputs: BTreeMap<String, bool>,
+    evaluations: u64,
+) -> Option<ConditionObservation> {
+    let result = decision::evaluate_partial(decision, &inputs)?;
+    let mut obs = ConditionObservation::vector(test_name, inputs, result);
+    obs.evaluations = Some(evaluations);
+    Some(obs)
 }
 
 /// A MIR with per-function condition-span maps pre-computed.
 ///
-/// `observation_from_coverage` and the lower-level [`correlate`] both
-/// rebuild `collect_condition_spans` for every function on every
-/// call. On a crate with hundreds of tests and a MIR that holds
-/// hundreds of monomorphised functions, Pass 3 rebuilds the same
-/// span map `candidates × tests` times — easily tens of millions of
-/// redundant walks on a large crate. `PreparedMir` builds every
-/// function's span map ONCE at Pass 1 so Pass 3 is just lookup +
+/// Pass 3 joins every candidate against every test's coverage;
+/// rebuilding `collect_condition_spans` on each call would walk the
+/// same function `candidates × tests` times. `PreparedMir` builds
+/// every function's span map ONCE, with each span's file already in
+/// [`PathNormaliser`] canonical form, so Pass 3 is just lookup +
 /// join against runtime counts.
 pub struct PreparedMir<'m> {
     /// The MIR itself. Borrowed to keep the pre-computation cost
     /// out of ownership.
     pub mir: &'m Mir,
-    /// Function name → `(name → SourceSpan)` map. Function ordering
-    /// matches `mir.functions` for direct indexed access when
-    /// callers need it.
+    /// Per function, in `mir.functions` order: condition name →
+    /// normalised [`SourceSpan`]. Conditions whose span is in
+    /// `/rustc/` standard-library code are left out; they can never
+    /// join.
     pub function_spans: Vec<BTreeMap<String, SourceSpan>>,
+    /// Per function: the normalised spans of the body's coverage
+    /// mappings ([`MirFunction::coverage_spans`]); empty when the
+    /// MIR does not carry them.
+    pub mapping_spans: Vec<Vec<SourceSpan>>,
 }
 
 /// Build a [`PreparedMir`] for the given MIR, computing each
-/// function's condition-span map once up-front.
-pub fn prepare_mir(mir: &Mir) -> PreparedMir<'_> {
-    let function_spans = mir.functions.iter().map(collect_condition_spans).collect();
+/// function's normalised condition-span map once up-front.
+pub fn prepare_mir<'m>(mir: &'m Mir, paths: &PathNormaliser) -> PreparedMir<'m> {
+    let function_spans = mir
+        .functions
+        .iter()
+        .map(|f| {
+            collect_condition_spans(f)
+                .into_iter()
+                .filter_map(|(name, span)| Some((name, paths.span(&span)?)))
+                .collect()
+        })
+        .collect();
+    let mapping_spans = mir
+        .functions
+        .iter()
+        .map(|f| {
+            f.coverage_spans
+                .iter()
+                .filter_map(|s| paths.span(s))
+                .collect()
+        })
+        .collect();
     PreparedMir {
         mir,
         function_spans,
+        mapping_spans,
     }
 }
 
-/// Build an [`ConditionObservation`] for one candidate and one
-/// test's coverage, using pre-computed span data and the candidate's
-/// known home-function index.
+impl PreparedMir<'_> {
+    /// The normalised spans of the conditions the first decision of
+    /// `tree` tests, for function `fn_idx`. These, not every named
+    /// local in the body, locate the decision's coverage record.
+    pub fn decision_spans(&self, fn_idx: usize, tree: &DecisionTree) -> Vec<SourceSpan> {
+        let (Some(spans), Some(decision)) =
+            (self.function_spans.get(fn_idx), tree.decisions.first())
+        else {
+            return Vec::new();
+        };
+        let mut out: Vec<SourceSpan> = crate::masking::collect_conditions(decision)
+            .iter()
+            .filter_map(|c| spans.get(c).cloned())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The spans that locate function `fn_idx`'s coverage record:
+    /// its decision spans plus its coverage-mapping spans. The
+    /// mapping spans are the record's own regions, so they find the
+    /// record even when a decomposed condition sits at a span with
+    /// no region (a `const fn`'s `MIR FOR CTFE` body reads its
+    /// argument through a copy whose span no region covers).
+    pub fn lookup_spans(&self, fn_idx: usize, tree: &DecisionTree) -> Vec<SourceSpan> {
+        let mut out = self.decision_spans(fn_idx, tree);
+        if let Some(mapped) = self.mapping_spans.get(fn_idx) {
+            out.extend(mapped.iter().cloned());
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+/// One test's join of one candidate: which coverage function its
+/// decision spans resolved to, and the observations its counters
+/// yield.
+#[derive(Debug, Clone)]
+pub struct TestJoin<'i> {
+    /// The coverage function the decision spans resolved to.
+    pub matched: FunctionMatch<'i>,
+    /// Observations for this test; empty unless `matched` is
+    /// [`FunctionMatch::Found`] and the test evaluated the decision.
+    pub observations: Vec<ConditionObservation>,
+}
+
+/// Join one candidate to one test's [`CoverageIndex`].
 ///
-/// The old `observation_from_coverage` iterated EVERY function in
-/// the MIR against every call — correct, but on a big crate with
-/// hundreds of monomorphised functions and thousands of tests it
-/// turned Pass 3 into billions of operations. Pass 3 only cares
-/// about the decision rooted in the candidate's own function, so
-/// this entry point consults just `prepared.function_spans[fn_idx]`
-/// and the matching coverage function — O(branches) per call.
-///
-/// `prepared_cov` is a per-test coverage lookup table (`name` →
-/// `&FunctionCoverage`) that lets us skip the linear
-/// `find_matching_function` scan + `rustc_demangle` work on every
-/// call. Built once per test's coverage via
-/// [`prepare_coverage_lookup`].
-pub fn observation_from_prepared_coverage(
+/// The candidate's lookup spans ([`PreparedMir::lookup_spans`]: its
+/// decision spans and its body's coverage-mapping spans) select its
+/// coverage function; each condition's counters are the
+/// merged function's branch region at the condition's span. The
+/// counters are reduced with [`observations_from_counts`], with the
+/// merged function's entry count as the consistency cross-check: a
+/// vector only when the counters determine it, otherwise one
+/// ambiguous observation. No observations when the test did not
+/// reach the decision or the spans do not resolve to one function.
+pub fn join_test<'i>(
     test_name: Option<String>,
     prepared: &PreparedMir<'_>,
     fn_idx: usize,
-    prepared_cov: &PreparedCoverage<'_>,
+    index: &'i CoverageIndex,
     tree: &DecisionTree,
-) -> Option<ConditionObservation> {
+) -> TestJoin<'i> {
+    let none = |matched| TestJoin {
+        matched,
+        observations: Vec::new(),
+    };
+    let (Some(spans), Some(decision_node)) =
+        (prepared.function_spans.get(fn_idx), tree.decisions.first())
+    else {
+        return none(FunctionMatch::Missing);
+    };
+    let mir_name = prepared.mir.functions.get(fn_idx).map(|f| f.name.as_str());
+    let matched = index.resolve(&prepared.lookup_spans(fn_idx, tree), mir_name);
+    let FunctionMatch::Found(cov_fn) = matched else {
+        return none(matched);
+    };
+    let counts: BTreeMap<String, BranchCounts> = spans
+        .iter()
+        .filter_map(|(name, span)| Some((name.clone(), cov_fn.branch_counts(span)?)))
+        .collect();
+    TestJoin {
+        observations: observations_from_counts(
+            test_name,
+            decision_node,
+            &counts,
+            Some(cov_fn.count),
+        ),
+        matched,
+    }
+}
+
+/// The observations of [`join_test`] alone.
+pub fn observations_from_prepared_coverage(
+    test_name: Option<String>,
+    prepared: &PreparedMir<'_>,
+    fn_idx: usize,
+    index: &CoverageIndex,
+    tree: &DecisionTree,
+) -> Vec<ConditionObservation> {
+    join_test(test_name, prepared, fn_idx, index, tree).observations
+}
+
+/// Why coverage cannot say whether a candidate ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotMeasurableReason {
+    /// The MIR was emitted by the instrumented compilation, and this
+    /// body carries no coverage mapping: rustc did not instrument it
+    /// (`#[automatically_derived]` impls such as serde derives,
+    /// `#[coverage(off)]` items, bodies made of macro-expanded code
+    /// with no usable source span). `llvm-cov` has no record for it.
+    Uninstrumented,
+    /// Every condition span lies in a file outside the workspace.
+    /// The candidate is a workspace function (Floyd only reads MIR of
+    /// the primary package), so those conditions were expanded from
+    /// a dependency's macro; `llvm-cov` maps such code to the macro
+    /// call site, never to the definition span MIR prints.
+    ExternalMacro,
+    /// No test's coverage has a record with a code or branch region
+    /// at any of the decision's spans.
+    NoCoverageRecord,
+    /// The decision's spans cannot be attributed to one source
+    /// function: they fall in more than one coverage function, the
+    /// coverage records at those spans are different functions that
+    /// no exact crate-relative path picks between, or
+    /// another candidate with a different MIR name resolves to the
+    /// same coverage function.
+    AmbiguousSpans,
+}
+
+/// A candidate whose execution coverage cannot measure, with why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NotMeasurable {
+    /// The reason class.
+    pub reason: NotMeasurableReason,
+    /// Human-readable detail for reports.
+    pub detail: String,
+}
+
+/// Whether a candidate's function ran, as coverage can tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverageStatus {
+    /// A test's coverage shows the function entered at least once.
+    Invoked,
+    /// The function has a coverage record and no test entered it.
+    NeverInvoked,
+    /// Coverage cannot say; see the reason.
+    NotMeasurable(NotMeasurable),
+}
+
+/// One candidate joined to every test's coverage.
+#[derive(Debug, Clone)]
+pub struct CandidateCoverage {
+    /// Whether the function ran. `invoked` in reports is
+    /// `status == Invoked`; it uses the same span join as
+    /// `observations`.
+    pub status: CoverageStatus,
+    /// Observations from every test, in test order. Empty when the
+    /// candidate is not measurable.
+    pub observations: Vec<ConditionObservation>,
+    /// Report name from the coverage symbols ([`crate::coverage_index::display_name`]),
+    /// when the join found one.
+    pub display_name: Option<String>,
+    /// Keys of the coverage functions the candidate resolved to
+    /// (one per distinct key across tests).
+    pub function_keys: Vec<FunctionId>,
+}
+
+impl CandidateCoverage {
+    /// A candidate classified before any join was attempted.
+    pub fn not_measurable(reason: NotMeasurableReason, detail: String) -> Self {
+        CandidateCoverage {
+            status: CoverageStatus::NotMeasurable(NotMeasurable { reason, detail }),
+            observations: Vec::new(),
+            display_name: None,
+            function_keys: Vec::new(),
+        }
+    }
+
+    /// `true` iff [`Self::status`] is [`CoverageStatus::Invoked`].
+    pub fn invoked(&self) -> bool {
+        self.status == CoverageStatus::Invoked
+    }
+}
+
+/// Classify a candidate from its MIR alone, before any join.
+///
+/// - [`NotMeasurableReason::Uninstrumented`]: `mir_instrumented` is
+///   `true` (the MIR came from the `-Cinstrument-coverage`
+///   compilation, so rustc printed coverage mappings for the bodies
+///   it instrumented) and this body has none
+///   ([`MirFunction::coverage_mappings`] is 0). This is rustc's own
+///   decision, not a heuristic over names or spans.
+/// - [`NotMeasurableReason::ExternalMacro`]: `workspace` is `true`
+///   (paths are normalised against the workspace root) and every
+///   decision span lies outside the root.
+///
+/// `None` when neither applies; the join then decides.
+pub fn mir_not_measurable(
+    prepared: &PreparedMir<'_>,
+    fn_idx: usize,
+    tree: &DecisionTree,
+    mir_instrumented: bool,
+    paths: Option<&PathNormaliser>,
+) -> Option<NotMeasurable> {
     let f = prepared.mir.functions.get(fn_idx)?;
-    let spans = prepared.function_spans.get(fn_idx)?;
-    let cov_fn = prepared_cov.find(&f.name)?;
-    let mut inputs = BTreeMap::new();
-    for (name, span) in spans {
-        if let Some(branch) = cov_fn.branches.iter().find(|b| spans_match(&b.span, span)) {
-            if branch.true_count > 0 {
-                inputs.insert(name.clone(), true);
-            } else if branch.false_count > 0 {
-                inputs.insert(name.clone(), false);
+    if mir_instrumented && f.coverage_mappings == 0 {
+        return Some(NotMeasurable {
+            reason: NotMeasurableReason::Uninstrumented,
+            detail: "rustc emitted no coverage mapping for this body (automatically \
+                     derived impl, #[coverage(off)], or macro-expanded code); llvm-cov \
+                     has no record of it"
+                .to_string(),
+        });
+    }
+    let paths = paths?;
+    let spans = prepared.decision_spans(fn_idx, tree);
+    if !spans.is_empty() && spans.iter().all(|s| paths.is_outside_root(&s.file)) {
+        return Some(NotMeasurable {
+            reason: NotMeasurableReason::ExternalMacro,
+            detail: format!(
+                "the decision's conditions are expanded from a macro defined outside \
+                 the workspace ({}); llvm-cov maps that code to the call site",
+                spans[0].file
+            ),
+        });
+    }
+    None
+}
+
+/// Join one candidate to every test's [`CoverageIndex`].
+///
+/// The same per-test join ([`join_test`]) gives both the
+/// observations and the status, so `invoked` and the observations
+/// can never disagree about which coverage function is the
+/// candidate's:
+///
+/// - any test's spans resolve ambiguously →
+///   [`NotMeasurableReason::AmbiguousSpans`], observations dropped;
+/// - no test has a record at the spans →
+///   [`NotMeasurableReason::NoCoverageRecord`];
+/// - otherwise [`CoverageStatus::Invoked`] if a found function's
+///   (merged) entry count is non-zero in some test, else
+///   [`CoverageStatus::NeverInvoked`].
+pub fn join_candidate(
+    prepared: &PreparedMir<'_>,
+    fn_idx: usize,
+    tree: &DecisionTree,
+    tests: &[(String, CoverageIndex)],
+) -> CandidateCoverage {
+    let mut observations = Vec::new();
+    let mut function_keys: Vec<FunctionId> = Vec::new();
+    let mut display_name = None;
+    let mut ambiguous: Option<String> = None;
+    let mut invoked = false;
+    for (test_name, index) in tests {
+        let join = join_test(Some(test_name.clone()), prepared, fn_idx, index, tree);
+        match join.matched {
+            FunctionMatch::Missing => {}
+            FunctionMatch::Ambiguous(why) => {
+                ambiguous.get_or_insert(why);
+            }
+            FunctionMatch::Found(f) => {
+                invoked |= f.count > 0;
+                if display_name.is_none() {
+                    display_name = Some(f.display_name().to_string());
+                }
+                if !function_keys.contains(f.id()) {
+                    function_keys.push(f.id().clone());
+                }
+            }
+        }
+        observations.extend(join.observations);
+    }
+    let status = if let Some(detail) = ambiguous {
+        observations.clear();
+        CoverageStatus::NotMeasurable(NotMeasurable {
+            reason: NotMeasurableReason::AmbiguousSpans,
+            detail,
+        })
+    } else if function_keys.is_empty() {
+        CoverageStatus::NotMeasurable(NotMeasurable {
+            reason: NotMeasurableReason::NoCoverageRecord,
+            detail: format!(
+                "no record in the coverage of {} test(s) has a code or branch region at \
+                 the decision's spans",
+                tests.len()
+            ),
+        })
+    } else if invoked {
+        CoverageStatus::Invoked
+    } else {
+        CoverageStatus::NeverInvoked
+    };
+    CandidateCoverage {
+        status,
+        observations,
+        display_name,
+        function_keys,
+    }
+}
+
+/// Mark candidates that share a coverage function with a candidate
+/// of a different MIR name as [`NotMeasurableReason::AmbiguousSpans`]
+/// and drop their observations.
+///
+/// `candidates` pairs each candidate's MIR function name with its
+/// join. Two MIR bodies with the same name and the same coverage
+/// function are one source function seen twice (a `const fn`'s
+/// runtime body and its `MIR FOR CTFE` body, or a module compiled
+/// into several test crates). Different names on one coverage
+/// function mean the spans do not identify the function (for
+/// example a body whose MIR carries spans inlined from another
+/// function), so neither candidate's counters can be trusted.
+pub fn mark_shared_coverage(candidates: &mut [(&str, &mut CandidateCoverage)]) {
+    let mut names_by_key: HashMap<&FunctionId, BTreeSet<&str>> = HashMap::new();
+    for (name, c) in candidates.iter() {
+        for key in &c.function_keys {
+            names_by_key.entry(key).or_default().insert(name);
+        }
+    }
+    let shared: Vec<(FunctionId, Vec<String>)> = names_by_key
+        .into_iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(key, names)| (key.clone(), names.into_iter().map(String::from).collect()))
+        .collect();
+    for (key, names) in shared {
+        for (_, c) in candidates.iter_mut() {
+            if c.function_keys.contains(&key) {
+                c.observations.clear();
+                c.status = CoverageStatus::NotMeasurable(NotMeasurable {
+                    reason: NotMeasurableReason::AmbiguousSpans,
+                    detail: format!(
+                        "candidates {} resolve to the same coverage function",
+                        names.join(", ")
+                    ),
+                });
             }
         }
     }
-    let decision_node = tree.decisions.first()?;
-    let result = decision::evaluate_partial(decision_node, &inputs)?;
-    Some(ConditionObservation {
-        test_name,
-        inputs,
-        result,
-    })
-}
-
-/// Per-test coverage lookup accelerator.
-///
-/// `find_matching_function` on a bare `CoverageReport` is a linear
-/// scan over every function in the coverage, demangling each name
-/// on every call. On a crate with 100 coverage functions and 1000
-/// tests × 10 candidates, that is 1,000,000 `rustc_demangle` calls.
-/// `PreparedCoverage` pre-computes a tail-indexed lookup once per
-/// test coverage so Pass 3 lookup is O(1) per call.
-pub struct PreparedCoverage<'c> {
-    /// The raw coverage report.
-    pub coverage: &'c CoverageReport,
-    /// `tail(demangled)` → index into `coverage.functions`. The tail
-    /// is the final `::`-segment or the segment after a legacy
-    /// `::h` hash strip; it matches a MIR function name directly.
-    tail_lookup: std::collections::HashMap<String, usize>,
-}
-
-impl<'c> PreparedCoverage<'c> {
-    /// O(1) analogue of a linear scan over `coverage.functions`.
-    pub fn find(&self, mir_name: &str) -> Option<&FunctionCoverage> {
-        // Exact name first (fast path for coverage symbols that
-        // happen to match the mir name verbatim).
-        if let Some(f) = self.coverage.functions.iter().find(|c| c.name == mir_name) {
-            return Some(f);
-        }
-        let idx = *self.tail_lookup.get(mir_name)?;
-        self.coverage.functions.get(idx)
-    }
-}
-
-/// Pre-compute [`PreparedCoverage`] for one coverage report.
-pub fn prepare_coverage_lookup(coverage: &CoverageReport) -> PreparedCoverage<'_> {
-    let mut tail_lookup: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::with_capacity(coverage.functions.len() * 2);
-    for (idx, c) in coverage.functions.iter().enumerate() {
-        let demangled = rustc_demangle::demangle(&c.name).to_string();
-        let trimmed = demangled
-            .rsplit_once("::h")
-            .map(|(prefix, _)| prefix)
-            .unwrap_or(demangled.as_str())
-            .to_string();
-        // Full trimmed name (useful when `mir_name == trimmed`).
-        tail_lookup.entry(trimmed.clone()).or_insert(idx);
-        // Suffix matches: last `::`-separated segment, and tail
-        // starting at any `::`. These mirror the matching strategy
-        // in `find_matching_function` so lookup produces the same
-        // result for every mir_name that function would accept.
-        if let Some(last) = trimmed.rsplit("::").next() {
-            tail_lookup.entry(last.to_string()).or_insert(idx);
-        }
-        // Also index each suffix `::<...>` so `mir_name` that
-        // starts midway through a path (e.g. an impl bracket) still
-        // lands. We walk the string and index each `::` suffix.
-        let mut rest = trimmed.as_str();
-        while let Some(pos) = rest.find("::") {
-            rest = &rest[pos + 2..];
-            tail_lookup.entry(rest.to_string()).or_insert(idx);
-        }
-    }
-    PreparedCoverage {
-        coverage,
-        tail_lookup,
-    }
-}
-
-/// Deprecated: use [`observation_from_prepared_coverage`] with
-/// [`prepare_coverage_lookup`] for cheap Pass 3 correlation. Kept
-/// because the single-source mode and the public API still rely
-/// on it.
-#[allow(dead_code)]
-fn _unused_old_prepared_observation() {}
-
-/// Collect a `name -> SourceSpan` map for every named condition that
-/// appears in the function's MIR.
-///
-/// Both `switchInt` discriminants (condition tests) and `AssignCopy`
-/// sources (condition reads) are considered. First occurrence wins.
-///
-/// Two source spans match if the line/col coordinates are identical
-/// AND the file paths are compatible: equal, or one is a suffix of
-/// the other. The suffix case handles the common cargo project
-/// asymmetry where MIR emits relative paths (`src/lib.rs:2:5: 2:6`)
-/// while `llvm-cov export` reports absolute paths
-/// (`/abs/.../src/lib.rs:2:5: 2:6`).
-fn spans_match(a: &SourceSpan, b: &SourceSpan) -> bool {
-    if (a.start_line, a.start_col, a.end_line, a.end_col)
-        != (b.start_line, b.start_col, b.end_line, b.end_col)
-    {
-        return false;
-    }
-    a.file == b.file || a.file.ends_with(&b.file) || b.file.ends_with(&a.file)
 }
 
 /// Build a [`crate::masking::DecisionProvenance`] for a MIR function
@@ -335,9 +709,16 @@ pub fn provenance_for(f: &MirFunction) -> crate::masking::DecisionProvenance {
         function_name: Some(f.name.clone()),
         source_file: earliest.map(|s| s.file.clone()),
         line: earliest.map(|s| s.start_line),
+        display_name: None,
     }
 }
 
+/// Collect a `name -> SourceSpan` map for every named condition that
+/// appears in the function's MIR.
+///
+/// Both `switchInt` discriminants (condition tests) and `AssignCopy`
+/// sources (condition reads) are considered. First occurrence wins.
+/// Spans are as rustc printed them; [`prepare_mir`] normalises them.
 fn collect_condition_spans(f: &MirFunction) -> BTreeMap<String, SourceSpan> {
     let mut spans = BTreeMap::new();
     for block in &f.blocks {
@@ -428,38 +809,6 @@ fn collect_condition_spans(f: &MirFunction) -> BTreeMap<String, SourceSpan> {
         }
     }
     spans
-}
-
-/// Find the [`crate::profile::FunctionCoverage`] entry whose
-/// (demangled) symbol name matches the given MIR function name.
-///
-/// Matching strategy, in order:
-/// 1. Exact match on the symbol as it appears in coverage.
-/// 2. Demangle via [`rustc_demangle`] and match the tail
-///    (`<crate>::<...>::<name>` or `<crate>::<name>`) on either the
-///    final path segment or by ending with `::<name>`.
-fn find_matching_function<'a>(
-    mir_name: &str,
-    coverage: &'a CoverageReport,
-) -> Option<&'a crate::profile::FunctionCoverage> {
-    coverage
-        .functions
-        .iter()
-        .find(|c| c.name == mir_name)
-        .or_else(|| {
-            coverage.functions.iter().find(|c| {
-                let demangled = rustc_demangle::demangle(&c.name).to_string();
-                // Strip a hash suffix (e.g. "::h0123...") if present in legacy
-                // mangling output, then compare the final path segment.
-                let trimmed = demangled
-                    .rsplit_once("::h")
-                    .map(|(prefix, _)| prefix)
-                    .unwrap_or(demangled.as_str());
-                trimmed == mir_name
-                    || trimmed.ends_with(&format!("::{mir_name}"))
-                    || trimmed.rsplit("::").next() == Some(mir_name)
-            })
-        })
 }
 
 // ---------------------------------------------------------------------------
@@ -581,11 +930,16 @@ fn decide(_1: bool, _2: bool) -> bool {
     }
     "#;
 
+    /// The scout fixture has absolute paths on both sides.
+    fn scout_paths() -> PathNormaliser {
+        PathNormaliser::new(None)
+    }
+
     #[test]
     fn correlate_produces_one_function_entry() {
         let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
         let cov = profile::parse(COVERAGE_JSON).expect("coverage parses");
-        let map = correlate(&mir, &cov);
+        let map = correlate(&mir, &cov, &scout_paths());
         assert_eq!(map.functions.len(), 1);
         assert_eq!(map.functions[0].name, "decide");
     }
@@ -594,7 +948,7 @@ fn decide(_1: bool, _2: bool) -> bool {
     fn correlate_joins_a_and_b_counts() {
         let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
         let cov = profile::parse(COVERAGE_JSON).expect("coverage parses");
-        let map = correlate(&mir, &cov);
+        let map = correlate(&mir, &cov, &scout_paths());
         let f = &map.functions[0];
 
         // From the per-test data:
@@ -616,26 +970,835 @@ fn decide(_1: bool, _2: bool) -> bool {
     }
 
     #[test]
-    fn correlate_matches_demangled_function_name() {
-        // The fixture's coverage entry uses the Rust v0-mangled symbol.
-        // correlate must demangle and match the tail "decide".
+    fn correlate_joins_by_span_whatever_the_symbol_says() {
+        // The join never reads the symbol: a record whose name has
+        // nothing in common with `decide` still joins by its spans.
         let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
-        let cov = profile::parse(COVERAGE_JSON).expect("coverage parses");
-        // sanity check the mangled prefix is in the JSON
-        assert!(cov.functions[0].name.starts_with("_R"));
-        let map = correlate(&mir, &cov);
-        assert!(!map.functions[0].conditions.is_empty());
+        let renamed = COVERAGE_JSON.replace("6decide", "8different");
+        let cov = profile::parse(&renamed).expect("coverage parses");
+        let map = correlate(&mir, &cov, &scout_paths());
+        assert_eq!(map.functions[0].conditions.len(), 2);
     }
 
     #[test]
-    fn correlate_drops_unmatched_function() {
-        // Coverage references a function that isn't in the MIR.
+    fn correlate_drops_function_whose_spans_have_no_record() {
+        // Same symbol, same lines, but the record is for another
+        // file: no record contains decide's spans.
         let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
-        let coverage_with_other = COVERAGE_JSON.replace("6decide", "8different");
-        let cov = profile::parse(&coverage_with_other).expect("coverage parses");
-        let map = correlate(&mir, &cov);
+        let elsewhere = COVERAGE_JSON.replace("/tmp/floyd-runtime-scout/", "/tmp/elsewhere/");
+        let cov = profile::parse(&elsewhere).expect("coverage parses");
+        let map = correlate(&mir, &cov, &scout_paths());
         // decide is in MIR but not in coverage; we get an entry with no conditions populated.
         assert_eq!(map.functions.len(), 1);
         assert!(map.functions[0].conditions.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // observations_from_counts: when aggregate counters yield a vector
+    // -----------------------------------------------------------------------
+
+    fn cond(name: &str) -> Node {
+        Node::Condition {
+            name: name.to_string(),
+        }
+    }
+
+    fn konst(value: bool) -> Node {
+        Node::Const { value }
+    }
+
+    fn ite(c: &str, then_branch: Node, else_branch: Node) -> Node {
+        Node::Ite {
+            cond: c.to_string(),
+            then_branch: Box::new(then_branch),
+            else_branch: Box::new(else_branch),
+        }
+    }
+
+    /// `a && b`.
+    fn and_node() -> Node {
+        ite("a", cond("b"), konst(false))
+    }
+
+    fn counts(entries: &[(&str, u64, u64)]) -> BTreeMap<String, BranchCounts> {
+        entries
+            .iter()
+            .map(|(n, t, f)| {
+                (
+                    n.to_string(),
+                    BranchCounts {
+                        true_count: *t,
+                        false_count: *f,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn inputs(entries: &[(&str, bool)]) -> BTreeMap<String, bool> {
+        entries.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn single_evaluation_yields_the_vector() {
+        // (T,F) -> F, evaluated once.
+        let obs = observations_from_counts(
+            Some("once_tf".into()),
+            &and_node(),
+            &counts(&[("a", 1, 0), ("b", 0, 1)]),
+            Some(1),
+        );
+        assert_eq!(obs.len(), 1);
+        let o = &obs[0];
+        assert!(!o.ambiguous);
+        assert_eq!(o.inputs, inputs(&[("a", true), ("b", false)]));
+        assert_eq!(o.result, Some(false));
+        assert_eq!(o.evaluations, Some(1));
+        assert!(o.counts.is_empty());
+    }
+
+    #[test]
+    fn single_evaluation_omits_short_circuited_condition() {
+        // (F,-) -> F: b never evaluated.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 0, 1), ("b", 0, 0)]),
+            Some(1),
+        );
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].inputs, inputs(&[("a", false)]));
+        assert_eq!(obs[0].result, Some(false));
+    }
+
+    #[test]
+    fn multi_evaluation_multi_condition_is_ambiguous() {
+        // (T,T) then (F,-): the old collapse recorded (T,T) and lost
+        // the (F,-) evaluation.
+        let obs = observations_from_counts(
+            Some("loop_tt_then_f".into()),
+            &and_node(),
+            &counts(&[("a", 1, 1), ("b", 1, 0)]),
+            Some(1),
+        );
+        assert_eq!(obs.len(), 1);
+        let o = &obs[0];
+        assert!(o.ambiguous);
+        assert!(o.inputs.is_empty(), "no vector may be invented");
+        assert_eq!(o.result, None);
+        assert_eq!(o.evaluations, Some(2));
+        assert_eq!(o.counts, counts(&[("a", 1, 1), ("b", 1, 0)]));
+    }
+
+    #[test]
+    fn base64_is_valid_b64_symbol_counts_are_ambiguous() {
+        // rust-base64 `byte >= 32 && byte <= 126`, test
+        // symbol_matches_char_for_all_valid_symbols (256 calls):
+        // byte >= 32 = [224 T, 32 F], byte <= 126 = [95 T, 129 F].
+        let decision = ite("byte >= 32", cond("byte <= 126"), konst(false));
+        let raw = counts(&[("byte >= 32", 224, 32), ("byte <= 126", 95, 129)]);
+        let obs = observations_from_counts(
+            Some("symbol_matches_char_for_all_valid_symbols".into()),
+            &decision,
+            &raw,
+            Some(256),
+        );
+        assert_eq!(obs.len(), 1);
+        let o = &obs[0];
+        assert!(o.ambiguous);
+        assert!(o.inputs.is_empty());
+        assert_eq!(o.result, None);
+        assert_eq!(o.evaluations, Some(256));
+        assert_eq!(o.counts, raw);
+    }
+
+    #[test]
+    fn single_condition_decision_in_a_loop_is_credited_both_ways() {
+        // `if x { true } else { false }` evaluated 5 times: 3 T, 2 F.
+        let decision = ite("x", konst(true), konst(false));
+        let obs = observations_from_counts(
+            Some("loop".into()),
+            &decision,
+            &counts(&[("x", 3, 2)]),
+            Some(5),
+        );
+        assert_eq!(obs.len(), 2);
+        assert!(obs.iter().all(|o| !o.ambiguous && o.evaluations == Some(5)));
+        assert_eq!(obs[0].inputs, inputs(&[("x", true)]));
+        assert_eq!(obs[0].result, Some(true));
+        assert_eq!(obs[1].inputs, inputs(&[("x", false)]));
+        assert_eq!(obs[1].result, Some(false));
+
+        // And the pair is demonstrated by this one test.
+        let tree = DecisionTree {
+            decisions: vec![decision],
+        };
+        let r = crate::masking::analyze_with_runtime(&tree, &obs, crate::masking::Variant::Masking);
+        assert!(matches!(
+            r.condition_status["x"],
+            crate::masking::ConditionStatus::Exercised(_)
+        ));
+    }
+
+    #[test]
+    fn uniform_repeated_evaluations_yield_the_vector() {
+        // (T,F) three times: every condition one-sided, so every
+        // evaluation took the same path with the same values.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 3, 0), ("b", 0, 3)]),
+            Some(3),
+        );
+        assert_eq!(obs.len(), 1);
+        assert!(!obs[0].ambiguous);
+        assert_eq!(obs[0].inputs, inputs(&[("a", true), ("b", false)]));
+        assert_eq!(obs[0].result, Some(false));
+        assert_eq!(obs[0].evaluations, Some(3));
+    }
+
+    #[test]
+    fn evaluation_count_comes_from_the_root_not_the_function_count() {
+        // Decision evaluated twice in ONE call (loop in the body):
+        // function count 1 must not make it look single-evaluation.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 2, 0), ("b", 1, 1)]),
+            Some(1),
+        );
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+        assert_eq!(obs[0].evaluations, Some(2));
+    }
+
+    #[test]
+    fn inconsistent_counters_are_ambiguous() {
+        // Root says one evaluation, but b counted twice.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 1, 0), ("b", 2, 0)]),
+            Some(1),
+        );
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+
+        // Decision evaluated but the function was never entered.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 1, 0), ("b", 1, 0)]),
+            Some(0),
+        );
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+    }
+
+    #[test]
+    fn unevaluated_decision_yields_no_observation() {
+        assert!(observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 0, 0), ("b", 0, 0)]),
+            Some(0),
+        )
+        .is_empty());
+        // Root has no counters at all (span did not join).
+        assert!(
+            observations_from_counts(None, &and_node(), &counts(&[("b", 1, 0)]), None).is_empty()
+        );
+    }
+
+    #[test]
+    fn merged_two_evaluation_coverage_is_ambiguous() {
+        // COVERAGE_JSON is `ff` and `tt` merged into one profile:
+        // two evaluations, a = [1, 1], b = [1, 0]. The old collapse
+        // reported it as the single vector (T,T).
+        let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
+        let cov = profile::parse(COVERAGE_JSON).expect("coverage parses");
+        let tree = decision::decompose(&mir);
+        let prepared = prepare_mir(&mir, &scout_paths());
+        let index = CoverageIndex::build(&cov, &scout_paths());
+        let obs =
+            observations_from_prepared_coverage(Some("merged".into()), &prepared, 0, &index, &tree);
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+        assert_eq!(obs[0].evaluations, Some(2));
+    }
+
+    #[test]
+    fn prepared_path_uses_function_count_and_yields_vector_for_single_call() {
+        // Same function, one call evaluating (T,T).
+        let single = COVERAGE_JSON
+            .replace("\"count\": 2", "\"count\": 1")
+            .replace("[2, 5, 2, 6, 1, 1, 0, 0, 4]", "[2, 5, 2, 6, 1, 0, 0, 0, 4]");
+        let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
+        let cov = profile::parse(&single).expect("coverage parses");
+        let tree = decision::decompose(&mir);
+        let prepared = prepare_mir(&mir, &scout_paths());
+        let index = CoverageIndex::build(&cov, &scout_paths());
+        let obs =
+            observations_from_prepared_coverage(Some("tt".into()), &prepared, 0, &index, &tree);
+        assert_eq!(obs.len(), 1);
+        assert!(!obs[0].ambiguous);
+        assert_eq!(obs[0].inputs, inputs(&[("a", true), ("b", true)]));
+        assert_eq!(obs[0].result, Some(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // Span join on real chrono / can-dbc MIR and coverage
+    // -----------------------------------------------------------------------
+
+    /// From chrono's lib unit-test MIR (`--emit=mir
+    /// -Zmir-include-spans` in the instrumented compilation, so the
+    /// coverage mappings are printed): the inherent method
+    /// `RuleDay::julian_0`, the trait method `<NaiveTime as
+    /// Timelike>::with_nanosecond`, and the `MIR FOR CTFE` body of
+    /// the `const fn` `FixedOffset::east_opt` (which decomposes to a
+    /// condition `secs` read through a copy at 63:22-63:26, a span
+    /// no coverage region covers).
+    const CHRONO_MIR: &str = r#"
+fn rule::<impl at src/offset/local/tz_info/rule.rs:460:1: 460:13>::julian_0(_1: u16) -> Result<RuleDay, tz_info::Error> {
+    debug julian_day_0 => _1;            // in scope 0 at src/offset/local/tz_info/rule.rs:500:23: 500:35
+    let mut _0: std::result::Result<offset::local::tz_info::rule::RuleDay, offset::local::tz_info::Error>; // return place in scope 0 at src/offset/local/tz_info/rule.rs:500:45: 500:64
+    let mut _2: bool;                    // in scope 0 at src/offset/local/tz_info/rule.rs:501:12: 501:30
+    let mut _3: offset::local::tz_info::Error; // in scope 0 at src/offset/local/tz_info/rule.rs:502:24: 502:76
+    let mut _4: offset::local::tz_info::rule::RuleDay; // in scope 0 at src/offset/local/tz_info/rule.rs:505:12: 505:50
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/offset/local/tz_info/rule.rs:501:12: 501:30 (#0)
+
+    coverage Code { bcb: bcb0 } => src/offset/local/tz_info/rule.rs:500:5: 500:64 (#0);
+    coverage Code { bcb: bcb0 } => src/offset/local/tz_info/rule.rs:501:12: 501:30 (#0);
+    coverage Code { bcb: bcb1 } => src/offset/local/tz_info/rule.rs:502:13: 502:77 (#0);
+    coverage Code { bcb: bcb3 } => src/offset/local/tz_info/rule.rs:503:9: 503:10 (#0);
+    coverage Code { bcb: bcb3 } => src/offset/local/tz_info/rule.rs:505:9: 505:51 (#0);
+    coverage Code { bcb: bcb2 } => src/offset/local/tz_info/rule.rs:506:5: 506:6 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => src/offset/local/tz_info/rule.rs:501:12: 501:30 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/offset/local/tz_info/rule.rs:501:12: 501:30
+        _2 = Gt(copy _1, const 365_u16); // scope 0 at src/offset/local/tz_info/rule.rs:501:12: 501:30
+        switchInt(move _2) -> [0: bb2, otherwise: bb1]; // scope 0 at src/offset/local/tz_info/rule.rs:501:12: 501:30
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/offset/local/tz_info/rule.rs:502:76: 502:77
+        _3 = tz_info::Error::TransitionRule(const "invalid rule day julian day"); // scope 0 at src/offset/local/tz_info/rule.rs:502:24: 502:76
+        _0 = Result::<RuleDay, tz_info::Error>::Err(move _3); // scope 0 at src/offset/local/tz_info/rule.rs:502:20: 502:77
+        goto -> bb3;                     // scope 0 at src/offset/local/tz_info/rule.rs:506:6: 506:6
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/offset/local/tz_info/rule.rs:506:6: 506:6
+        _4 = RuleDay::Julian0WithLeap(copy _1); // scope 0 at src/offset/local/tz_info/rule.rs:505:12: 505:50
+        _0 = Result::<RuleDay, tz_info::Error>::Ok(move _4); // scope 0 at src/offset/local/tz_info/rule.rs:505:9: 505:51
+        goto -> bb3;                     // scope 0 at src/offset/local/tz_info/rule.rs:506:6: 506:6
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/offset/local/tz_info/rule.rs:506:6: 506:6
+        return;                          // scope 0 at src/offset/local/tz_info/rule.rs:506:6: 506:6
+    }
+}
+
+fn naive::time::<impl at src/naive/time/mod.rs:902:1: 902:28>::with_nanosecond(_1: &NaiveTime, _2: u32) -> Option<NaiveTime> {
+    debug self => _1;                    // in scope 0 at src/naive/time/mod.rs:1109:24: 1109:29
+    debug nano => _2;                    // in scope 0 at src/naive/time/mod.rs:1109:31: 1109:35
+    let mut _0: std::option::Option<naive::time::NaiveTime>; // return place in scope 0 at src/naive/time/mod.rs:1109:45: 1109:62
+    let mut _3: bool;                    // in scope 0 at src/naive/time/mod.rs:1110:12: 1110:33
+    let mut _4: naive::time::NaiveTime;  // in scope 0 at src/naive/time/mod.rs:1113:14: 1113:47
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/naive/time/mod.rs:1110:12: 1110:33 (#0)
+
+    coverage Code { bcb: bcb0 } => src/naive/time/mod.rs:1109:5: 1109:62 (#0);
+    coverage Code { bcb: bcb0 } => src/naive/time/mod.rs:1110:12: 1110:33 (#0);
+    coverage Code { bcb: bcb1 } => src/naive/time/mod.rs:1111:13: 1111:24 (#0);
+    coverage Code { bcb: bcb3 } => src/naive/time/mod.rs:1112:9: 1112:10 (#0);
+    coverage Code { bcb: bcb3 } => src/naive/time/mod.rs:1113:9: 1113:48 (#0);
+    coverage Code { bcb: bcb2 } => src/naive/time/mod.rs:1114:5: 1114:6 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => src/naive/time/mod.rs:1110:12: 1110:33 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/naive/time/mod.rs:1110:12: 1110:33
+        _3 = Ge(copy _2, const 2000000000_u32); // scope 0 at src/naive/time/mod.rs:1110:12: 1110:33
+        switchInt(move _3) -> [0: bb2, otherwise: bb1]; // scope 0 at src/naive/time/mod.rs:1110:12: 1110:33
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/naive/time/mod.rs:1114:6: 1114:6
+        _0 = Option::<NaiveTime>::None;  // scope 0 at src/naive/time/mod.rs:1111:20: 1111:24
+        goto -> bb3;                     // scope 0 at src/naive/time/mod.rs:1114:6: 1114:6
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/naive/time/mod.rs:1114:6: 1114:6
+        _4 = NaiveTime { secs: copy ((*_1).0: u32), frac: copy _2 }; // scope 0 at src/naive/time/mod.rs:1113:14: 1113:47
+        _0 = Option::<NaiveTime>::Some(move _4); // scope 0 at src/naive/time/mod.rs:1113:9: 1113:48
+        goto -> bb3;                     // scope 0 at src/naive/time/mod.rs:1114:6: 1114:6
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/naive/time/mod.rs:1114:6: 1114:6
+        return;                          // scope 0 at src/naive/time/mod.rs:1114:6: 1114:6
+    }
+}
+
+// MIR FOR CTFE
+fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -> Option<offset::fixed::FixedOffset> {
+    debug secs => _1;                    // in scope 0 at src/offset/fixed.rs:62:27: 62:31
+    let mut _0: std::option::Option<offset::fixed::FixedOffset>; // return place in scope 0 at src/offset/fixed.rs:62:41: 62:60
+    let mut _2: bool;                    // in scope 0 at src/offset/fixed.rs:63:12: 63:26
+    let mut _3: i32;                     // in scope 0 at src/offset/fixed.rs:63:22: 63:26
+    let mut _4: bool;                    // in scope 0 at src/offset/fixed.rs:63:30: 63:43
+    let mut _5: i32;                     // in scope 0 at src/offset/fixed.rs:63:30: 63:34
+    let mut _6: offset::fixed::FixedOffset; // in scope 0 at src/offset/fixed.rs:64:18: 64:55
+    let mut _7: i32;                     // in scope 0 at src/offset/fixed.rs:64:49: 64:53
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/offset/fixed.rs:63:12: 63:26 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/offset/fixed.rs:63:30: 63:43 (#0)
+
+    coverage Code { bcb: bcb0 } => src/offset/fixed.rs:62:5: 62:60 (#0);
+    coverage Code { bcb: bcb0 } => src/offset/fixed.rs:63:12: 63:26 (#0);
+    coverage Code { bcb: bcb1 } => src/offset/fixed.rs:63:30: 63:43 (#0);
+    coverage Code { bcb: bcb2 } => src/offset/fixed.rs:64:13: 64:56 (#0);
+    coverage Code { bcb: bcb5 } => src/offset/fixed.rs:66:13: 66:17 (#0);
+    coverage Code { bcb: bcb3 } => src/offset/fixed.rs:68:5: 68:6 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb6 } => src/offset/fixed.rs:63:12: 63:26 (#0);
+    coverage Branch { true_bcb: bcb2, false_bcb: bcb4 } => src/offset/fixed.rs:63:30: 63:43 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/offset/fixed.rs:63:12: 63:26
+        StorageLive(_2);                 // scope 0 at src/offset/fixed.rs:63:12: 63:26
+        StorageLive(_3);                 // scope 0 at src/offset/fixed.rs:63:22: 63:26
+        _3 = copy _1;                    // scope 0 at src/offset/fixed.rs:63:22: 63:26
+        _2 = Lt(const -86400_i32, move _3); // scope 0 at src/offset/fixed.rs:63:12: 63:26
+        switchInt(move _2) -> [0: bb2, otherwise: bb1]; // scope 0 at src/offset/fixed.rs:63:12: 63:26
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/offset/fixed.rs:63:30: 63:43
+        StorageDead(_3);                 // scope 0 at src/offset/fixed.rs:63:25: 63:26
+        StorageLive(_4);                 // scope 0 at src/offset/fixed.rs:63:30: 63:43
+        StorageLive(_5);                 // scope 0 at src/offset/fixed.rs:63:30: 63:34
+        _5 = copy _1;                    // scope 0 at src/offset/fixed.rs:63:30: 63:34
+        _4 = Lt(move _5, const 86400_i32); // scope 0 at src/offset/fixed.rs:63:30: 63:43
+        switchInt(move _4) -> [0: bb4, otherwise: bb3]; // scope 0 at src/offset/fixed.rs:63:30: 63:43
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at no-location
+        StorageDead(_3);                 // scope 0 at src/offset/fixed.rs:63:25: 63:26
+        goto -> bb5;                     // scope 0 at no-location
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/offset/fixed.rs:63:9: 67:10
+        StorageDead(_5);                 // scope 0 at src/offset/fixed.rs:63:42: 63:43
+        StorageLive(_6);                 // scope 0 at src/offset/fixed.rs:64:18: 64:55
+        StorageLive(_7);                 // scope 0 at src/offset/fixed.rs:64:49: 64:53
+        _7 = copy _1;                    // scope 0 at src/offset/fixed.rs:64:49: 64:53
+        _6 = offset::fixed::FixedOffset { local_minus_utc: move _7 }; // scope 0 at src/offset/fixed.rs:64:18: 64:55
+        StorageDead(_7);                 // scope 0 at src/offset/fixed.rs:64:54: 64:55
+        _0 = Option::<offset::fixed::FixedOffset>::Some(move _6); // scope 0 at src/offset/fixed.rs:64:13: 64:56
+        StorageDead(_6);                 // scope 0 at src/offset/fixed.rs:64:55: 64:56
+        goto -> bb6;                     // scope 0 at src/offset/fixed.rs:63:9: 67:10
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at no-location
+        StorageDead(_5);                 // scope 0 at src/offset/fixed.rs:63:42: 63:43
+        goto -> bb5;                     // scope 0 at no-location
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/offset/fixed.rs:63:9: 67:10
+        _0 = Option::<offset::fixed::FixedOffset>::None; // scope 0 at src/offset/fixed.rs:66:13: 66:17
+        goto -> bb6;                     // scope 0 at src/offset/fixed.rs:63:9: 67:10
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/offset/fixed.rs:68:6: 68:6
+        StorageDead(_4);                 // scope 0 at src/offset/fixed.rs:67:9: 67:10
+        StorageDead(_2);                 // scope 0 at src/offset/fixed.rs:67:9: 67:10
+        return;                          // scope 0 at src/offset/fixed.rs:68:6: 68:6
+    }
+}
+"#;
+
+    const CHRONO_ROOT: &str = "/home/ubuntu/work/verify-span/chrono/src-copy";
+
+    fn chrono_paths() -> PathNormaliser {
+        PathNormaliser::new(Some(std::path::Path::new(CHRONO_ROOT)))
+    }
+
+    /// Real whole-suite record for `RuleDay::julian_0` (8 calls, the
+    /// condition always false), with the entry count and the
+    /// condition's counters substitutable.
+    fn julian_0_record(count: u64, cond: (u64, u64)) -> String {
+        format!(
+            r#"{{"name": "_RNvMs2_NtNtNtNtCseI4Ere5mNTx_6chrono6offset5local7tz_info4ruleNtB5_7RuleDay8julian_0", "count": {count}, "filenames": ["/home/ubuntu/work/verify-span/chrono/src-copy/src/offset/local/tz_info/rule.rs"], "regions": [[500, 5, 500, 64, {count}, 0, 0, 0], [501, 12, 501, 30, {count}, 0, 0, 0], [502, 13, 502, 77, {}, 0, 0, 0], [503, 9, 503, 10, {}, 0, 0, 0], [505, 9, 505, 51, {}, 0, 0, 0], [506, 5, 506, 6, {count}, 0, 0, 0]], "branches": [[501, 12, 501, 30, {}, {}, 0, 0, 4]]}}"#,
+            cond.0, cond.1, cond.1, cond.0, cond.1
+        )
+    }
+
+    const WITH_NANOSECOND_RECORD: &str = r#"{"name": "_RNvXs_NtNtCseI4Ere5mNTx_6chrono5naive4timeNtB4_9NaiveTimeNtNtB8_6traits8Timelike15with_nanosecondB8_", "count": 66, "filenames": ["/home/ubuntu/work/verify-span/chrono/src-copy/src/naive/time/mod.rs"], "regions": [[1109, 5, 1109, 62, 66, 0, 0, 0], [1110, 12, 1110, 33, 66, 0, 0, 0], [1111, 13, 1111, 24, 0, 0, 0, 0], [1112, 9, 1112, 10, 66, 0, 0, 0], [1113, 9, 1113, 48, 66, 0, 0, 0], [1114, 5, 1114, 6, 66, 0, 0, 0]], "branches": [[1110, 12, 1110, 33, 0, 66, 0, 0, 4]]}"#;
+
+    /// Real single-test record (`offset::fixed::tests::test_date_extreme_offset`).
+    const EAST_OPT_RECORD: &str = r#"{"name": "_RNvMNtNtCseI4Ere5mNTx_6chrono6offset5fixedNtB2_11FixedOffset8east_opt", "count": 2, "filenames": ["/home/ubuntu/work/verify-span/chrono/src-copy/src/offset/fixed.rs"], "regions": [[62, 5, 62, 60, 2, 0, 0, 0], [63, 12, 63, 26, 2, 0, 0, 0], [63, 30, 63, 43, 2, 0, 0, 0], [64, 13, 64, 56, 2, 0, 0, 0], [66, 13, 66, 17, 0, 0, 0, 0], [68, 5, 68, 6, 2, 0, 0, 0]], "branches": [[63, 12, 63, 26, 2, 0, 0, 0, 4], [63, 30, 63, 43, 2, 0, 0, 0, 4]]}"#;
+
+    fn export(functions: &[&str]) -> CoverageReport {
+        let json = format!(
+            r#"{{"data": [{{"files": [], "functions": [{}], "totals": {{}}}}],
+                "type": "llvm.coverage.json.export", "version": "2.0.1"}}"#,
+            functions.join(",")
+        );
+        profile::parse(&json).expect("coverage parses")
+    }
+
+    fn chrono_candidate(mir: &Mir, name_part: &str) -> (usize, DecisionTree) {
+        let (idx, f) = mir
+            .functions
+            .iter()
+            .enumerate()
+            .find(|(_, f)| f.name.contains(name_part))
+            .expect("function in fixture");
+        let node = decision::decompose_function(f).expect("decomposes");
+        (
+            idx,
+            DecisionTree {
+                decisions: vec![node],
+            },
+        )
+    }
+
+    #[test]
+    fn mir_counts_coverage_mappings_not_branch_markers() {
+        let mir = mir::parse_text(CHRONO_MIR).expect("MIR parses");
+        let counts: Vec<usize> = mir.functions.iter().map(|f| f.coverage_mappings).collect();
+        assert_eq!(counts, [7, 7, 8]);
+        let first = &mir.functions[0].coverage_spans[0];
+        assert_eq!(first.file, "src/offset/local/tz_info/rule.rs");
+        assert_eq!(
+            (
+                first.start_line,
+                first.start_col,
+                first.end_line,
+                first.end_col
+            ),
+            (500, 5, 500, 64)
+        );
+    }
+
+    #[test]
+    fn impl_method_is_invoked_and_observed_through_the_span_join() {
+        // MIR name `rule::<impl at src/offset/local/tz_info/rule.rs:460:1: 460:13>::julian_0`
+        // never matched `<chrono::offset::local::tz_info::rule::RuleDay>::julian_0`
+        // by name, so the baseline reported it never invoked.
+        let mir = mir::parse_text(CHRONO_MIR).expect("MIR parses");
+        let paths = chrono_paths();
+        let prepared = prepare_mir(&mir, &paths);
+        let (idx, tree) = chrono_candidate(&mir, "julian_0");
+        let tests = vec![(
+            "offset::local::tz_info::rule::tests::test_rule_day".to_string(),
+            CoverageIndex::build(&export(&[&julian_0_record(1, (0, 1))]), &paths),
+        )];
+        let c = join_candidate(&prepared, idx, &tree, &tests);
+        assert_eq!(c.status, CoverageStatus::Invoked);
+        assert_eq!(
+            c.display_name.as_deref(),
+            Some("<chrono::offset::local::tz_info::rule::RuleDay>::julian_0")
+        );
+        assert_eq!(c.observations.len(), 1);
+        assert!(!c.observations[0].ambiguous);
+        assert_eq!(c.observations[0].evaluations, Some(1));
+        assert_eq!(c.observations[0].result, Some(false));
+    }
+
+    #[test]
+    fn trait_impl_method_is_invoked_and_observed_through_the_span_join() {
+        let mir = mir::parse_text(CHRONO_MIR).expect("MIR parses");
+        let paths = chrono_paths();
+        let prepared = prepare_mir(&mir, &paths);
+        let (idx, tree) = chrono_candidate(&mir, "with_nanosecond");
+        let tests = vec![(
+            "suite".to_string(),
+            CoverageIndex::build(&export(&[WITH_NANOSECOND_RECORD]), &paths),
+        )];
+        let c = join_candidate(&prepared, idx, &tree, &tests);
+        assert_eq!(c.status, CoverageStatus::Invoked);
+        assert_eq!(
+            c.display_name.as_deref(),
+            Some("<chrono::naive::time::NaiveTime as chrono::traits::Timelike>::with_nanosecond")
+        );
+        // Single condition, 66 evaluations, always false: one vector.
+        assert_eq!(c.observations.len(), 1);
+        assert_eq!(c.observations[0].evaluations, Some(66));
+        assert_eq!(c.observations[0].result, Some(false));
+    }
+
+    #[test]
+    fn mapping_spans_find_the_record_when_the_condition_span_has_none() {
+        // The CTFE body's decision `secs` sits at 63:22-63:26, which
+        // no region covers. Its coverage mappings still locate
+        // east_opt's record: the function ran (invoked), and the
+        // decision has no counters (no observations).
+        let mir = mir::parse_text(CHRONO_MIR).expect("MIR parses");
+        let paths = chrono_paths();
+        let mut prepared = prepare_mir(&mir, &paths);
+        let (idx, tree) = chrono_candidate(&mir, "east_opt");
+        let tests = vec![(
+            "offset::fixed::tests::test_date_extreme_offset".to_string(),
+            CoverageIndex::build(&export(&[EAST_OPT_RECORD]), &paths),
+        )];
+        let c = join_candidate(&prepared, idx, &tree, &tests);
+        assert_eq!(c.status, CoverageStatus::Invoked);
+        assert!(c.observations.is_empty());
+        assert_eq!(
+            c.display_name.as_deref(),
+            Some("<chrono::offset::fixed::FixedOffset>::east_opt")
+        );
+        // Without the mappings the decision span alone finds nothing.
+        prepared.mapping_spans[idx].clear();
+        let c = join_candidate(&prepared, idx, &tree, &tests);
+        assert!(matches!(
+            c.status,
+            CoverageStatus::NotMeasurable(NotMeasurable {
+                reason: NotMeasurableReason::NoCoverageRecord,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn invoked_and_observations_come_from_the_same_join() {
+        let mir = mir::parse_text(CHRONO_MIR).expect("MIR parses");
+        let paths = chrono_paths();
+        let prepared = prepare_mir(&mir, &paths);
+        let (idx, tree) = chrono_candidate(&mir, "julian_0");
+        // t0 does not call julian_0 (record present, count 0); t1
+        // calls it once; t2's binary does not link it.
+        let tests = vec![
+            (
+                "t0".to_string(),
+                CoverageIndex::build(&export(&[&julian_0_record(0, (0, 0))]), &paths),
+            ),
+            (
+                "t1".to_string(),
+                CoverageIndex::build(&export(&[&julian_0_record(1, (1, 0))]), &paths),
+            ),
+            (
+                "t2".to_string(),
+                CoverageIndex::build(&export(&[WITH_NANOSECOND_RECORD]), &paths),
+            ),
+        ];
+        let c = join_candidate(&prepared, idx, &tree, &tests);
+        assert!(c.invoked());
+        let tests_with_obs: Vec<_> = c
+            .observations
+            .iter()
+            .filter_map(|o| o.test_name.as_deref())
+            .collect();
+        assert_eq!(tests_with_obs, ["t1"]);
+        assert_eq!(c.function_keys.len(), 1);
+
+        // Only t0: a record exists and nobody entered it.
+        let c = join_candidate(&prepared, idx, &tree, &tests[..1]);
+        assert_eq!(c.status, CoverageStatus::NeverInvoked);
+        assert!(c.observations.is_empty());
+    }
+
+    #[test]
+    fn candidate_without_any_record_is_not_measurable_not_unreached() {
+        let mir = mir::parse_text(CHRONO_MIR).expect("MIR parses");
+        let paths = chrono_paths();
+        let prepared = prepare_mir(&mir, &paths);
+        let (idx, tree) = chrono_candidate(&mir, "julian_0");
+        let tests = vec![(
+            "t".to_string(),
+            CoverageIndex::build(&export(&[WITH_NANOSECOND_RECORD]), &paths),
+        )];
+        let c = join_candidate(&prepared, idx, &tree, &tests);
+        let CoverageStatus::NotMeasurable(nm) = &c.status else {
+            panic!("expected not measurable, got {:?}", c.status);
+        };
+        assert_eq!(nm.reason, NotMeasurableReason::NoCoverageRecord);
+        assert!(!c.invoked());
+    }
+
+    /// can-dbc's serde-derived `__FieldVisitor::visit_u64` for
+    /// `AttrDefault` (src/ast/attr_default.rs:5, `#[derive(Deserialize)]`),
+    /// from the same instrumented MIR as instrumented functions: no
+    /// coverage mapping, because rustc skips
+    /// `#[automatically_derived]` impls.
+    const DBC_DERIVE_MIR: &str = r#"
+fn attr_default::_::<impl at src/ast/attr_default.rs:5:56: 5:74>::deserialize::<impl at src/ast/attr_default.rs:5:56: 5:74>::visit_u64(_1: attr_default::_::<impl Deserialize<'de> for AttrDefault>::deserialize::__FieldVisitor, _2: u64) -> Result<attr_default::_::<impl Deserialize<'de> for AttrDefault>::deserialize::__Field, __E> {
+    debug self => const attr_default::_::<impl Deserialize<'de> for AttrDefault>::deserialize::__FieldVisitor; // in scope 0 at src/ast/attr_default.rs:5:56: 5:74
+    debug __value => _2;                 // in scope 0 at src/ast/attr_default.rs:5:56: 5:74
+    let mut _0: std::result::Result<ast::attr_default::_::<impl serde::Deserialize<'de> for ast::attr_default::AttrDefault>::deserialize::__Field, __E>; // return place in scope 0 at src/ast/attr_default.rs:5:56: 5:74
+    let mut _3: ast::attr_default::_::<impl serde::Deserialize<'de> for ast::attr_default::AttrDefault>::deserialize::__Field; // in scope 0 at src/ast/attr_default.rs:5:56: 5:74
+    let mut _4: ast::attr_default::_::<impl serde::Deserialize<'de> for ast::attr_default::AttrDefault>::deserialize::__Field; // in scope 0 at src/ast/attr_default.rs:5:56: 5:74
+    let mut _5: ast::attr_default::_::<impl serde::Deserialize<'de> for ast::attr_default::AttrDefault>::deserialize::__Field; // in scope 0 at src/ast/attr_default.rs:5:56: 5:74
+
+    bb0: {
+        switchInt(copy _2) -> [0: bb3, 1: bb2, otherwise: bb1]; // scope 0 at src/ast/attr_default.rs:5:56: 5:74
+    }
+
+    bb1: {
+        _5 = attr_default::_::<impl Deserialize<'de> for AttrDefault>::deserialize::__Field::__ignore; // scope 0 at src/ast/attr_default.rs:5:56: 5:74
+        _0 = Result::<attr_default::_::<impl Deserialize<'de> for AttrDefault>::deserialize::__Field, __E>::Ok(move _5); // scope 0 at src/ast/attr_default.rs:5:56: 5:74
+        goto -> bb4;                     // scope 0 at src/ast/attr_default.rs:5:73: 5:74
+    }
+
+    bb2: {
+        _4 = attr_default::_::<impl Deserialize<'de> for AttrDefault>::deserialize::__Field::__field1; // scope 0 at src/ast/attr_default.rs:5:56: 5:74
+        _0 = Result::<attr_default::_::<impl Deserialize<'de> for AttrDefault>::deserialize::__Field, __E>::Ok(move _4); // scope 0 at src/ast/attr_default.rs:5:56: 5:74
+        goto -> bb4;                     // scope 0 at src/ast/attr_default.rs:5:73: 5:74
+    }
+
+    bb3: {
+        _3 = attr_default::_::<impl Deserialize<'de> for AttrDefault>::deserialize::__Field::__field0; // scope 0 at src/ast/attr_default.rs:5:56: 5:74
+        _0 = Result::<attr_default::_::<impl Deserialize<'de> for AttrDefault>::deserialize::__Field, __E>::Ok(move _3); // scope 0 at src/ast/attr_default.rs:5:56: 5:74
+        goto -> bb4;                     // scope 0 at src/ast/attr_default.rs:5:73: 5:74
+    }
+
+    bb4: {
+        return;                          // scope 0 at src/ast/attr_default.rs:5:74: 5:74
+    }
+}
+"#;
+
+    #[test]
+    fn derive_body_without_coverage_mapping_is_uninstrumented() {
+        let text = format!("{CHRONO_MIR}\n{DBC_DERIVE_MIR}");
+        let mir = mir::parse_text(&text).expect("MIR parses");
+        let paths = chrono_paths();
+        let prepared = prepare_mir(&mir, &paths);
+        let derive_idx = mir
+            .functions
+            .iter()
+            .position(|f| f.name.ends_with("::visit_u64"))
+            .expect("derive body parsed");
+        assert_eq!(mir.functions[derive_idx].coverage_mappings, 0);
+        let instrumented = mir.functions.iter().any(|f| f.coverage_mappings > 0);
+        assert!(instrumented);
+        let tree = DecisionTree::default();
+        let nm = mir_not_measurable(&prepared, derive_idx, &tree, instrumented, Some(&paths))
+            .expect("not measurable");
+        assert_eq!(nm.reason, NotMeasurableReason::Uninstrumented);
+        // An instrumented body is left to the join.
+        let (east, east_tree) = chrono_candidate(&mir, "julian_0");
+        assert_eq!(
+            mir_not_measurable(&prepared, east, &east_tree, instrumented, Some(&paths)),
+            None
+        );
+        // MIR from an uninstrumented compilation carries no
+        // mappings at all; the signal is then not used.
+        assert_eq!(
+            mir_not_measurable(&prepared, derive_idx, &tree, false, Some(&paths)),
+            None
+        );
+    }
+
+    #[test]
+    fn decision_expanded_from_a_dependency_macro_is_external() {
+        // An instrumented closure whose condition spans are all in a
+        // registry crate's macro (shape of can-dbc's insta
+        // `with_settings!` closure in tests/snapshots.rs).
+        let text = r#"
+fn parse_one_file::{closure#0}(_1: bool) -> bool {
+    debug check => _1;                   // in scope 0 at /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/insta-1.49.0/src/macros.rs:11:19: 11:29
+    let mut _0: bool;
+
+    coverage Code { bcb: bcb0 } => tests/snapshots.rs:170:17: 170:29 (#0);
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 0 at /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/insta-1.49.0/src/macros.rs:11:19: 11:29
+    }
+
+    bb1: {
+        _0 = const true;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const false;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+        let mir = mir::parse_text(text).expect("MIR parses");
+        let paths = PathNormaliser::new(Some(std::path::Path::new(
+            "/home/ubuntu/work/verify-span/dbc-parser/src-copy",
+        )));
+        let prepared = prepare_mir(&mir, &paths);
+        let node = decision::decompose_function(&mir.functions[0]).expect("decomposes");
+        let tree = DecisionTree {
+            decisions: vec![node],
+        };
+        let nm = mir_not_measurable(&prepared, 0, &tree, true, Some(&paths)).expect("classified");
+        assert_eq!(nm.reason, NotMeasurableReason::ExternalMacro);
+        // Without a workspace root (single-file mode) it is left to
+        // the join.
+        assert_eq!(mir_not_measurable(&prepared, 0, &tree, true, None), None);
+    }
+
+    #[test]
+    fn two_candidates_on_one_coverage_function_are_not_measurable() {
+        let mir = mir::parse_text(CHRONO_MIR).expect("MIR parses");
+        let paths = chrono_paths();
+        let prepared = prepare_mir(&mir, &paths);
+        let (idx, tree) = chrono_candidate(&mir, "julian_0");
+        let tests = vec![(
+            "t".to_string(),
+            CoverageIndex::build(&export(&[&julian_0_record(1, (0, 1))]), &paths),
+        )];
+        let mut a = join_candidate(&prepared, idx, &tree, &tests);
+        let mut b = a.clone();
+        let mut same_name = a.clone();
+        assert_eq!(a.status, CoverageStatus::Invoked);
+
+        // A `const fn`'s runtime and CTFE bodies share a name: one
+        // source function, still measured.
+        mark_shared_coverage(&mut [("julian_0", &mut a), ("julian_0", &mut same_name)]);
+        assert_eq!(a.status, CoverageStatus::Invoked);
+        assert_eq!(same_name.status, CoverageStatus::Invoked);
+
+        // Different MIR functions on one coverage function: neither
+        // may be credited.
+        mark_shared_coverage(&mut [("julian_0", &mut a), ("other", &mut b)]);
+        for c in [&a, &b] {
+            let CoverageStatus::NotMeasurable(nm) = &c.status else {
+                panic!("expected not measurable, got {:?}", c.status);
+            };
+            assert_eq!(nm.reason, NotMeasurableReason::AmbiguousSpans);
+            assert!(c.observations.is_empty());
+            assert!(!c.invoked());
+        }
+    }
+
+    #[test]
+    fn ambiguous_resolution_drops_observations() {
+        // Two distinct records at julian_0's spans with different
+        // names (as macro-generated twins would have).
+        let mir = mir::parse_text(CHRONO_MIR).expect("MIR parses");
+        let paths = chrono_paths();
+        let prepared = prepare_mir(&mir, &paths);
+        let (idx, tree) = chrono_candidate(&mir, "julian_0");
+        let twin = julian_0_record(1, (0, 1)).replace("8julian_0", "8julian_1");
+        let tests = vec![(
+            "t".to_string(),
+            CoverageIndex::build(&export(&[&julian_0_record(1, (0, 1)), &twin]), &paths),
+        )];
+        let c = join_candidate(&prepared, idx, &tree, &tests);
+        let CoverageStatus::NotMeasurable(nm) = &c.status else {
+            panic!("expected not measurable, got {:?}", c.status);
+        };
+        assert_eq!(nm.reason, NotMeasurableReason::AmbiguousSpans);
+        assert!(c.observations.is_empty());
     }
 }

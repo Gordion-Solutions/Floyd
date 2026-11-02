@@ -76,13 +76,25 @@ pub fn analyze(tree: &DecisionTree) -> IndependenceMatrix {
     analyze_with_variant(tree, Variant::Masking)
 }
 
-/// One condition assignment observed in a single test execution.
+/// One condition assignment observed in a single test execution,
+/// or the record that a test's evidence could not be reduced to one.
 ///
 /// Built by upstream stages (the `runner` per ADR-0002 produces one
 /// per test invocation). Floyd treats observations as opaque inputs
 /// to [`analyze_with_runtime`]; how they are obtained — per-test
 /// `profraw` parsing, instrumented harness, manually constructed for
 /// integration tests — is the caller's responsibility.
+///
+/// An observation is either a **condition vector** (`ambiguous ==
+/// false`: `inputs` and `result` describe evaluations that really
+/// occurred) or **ambiguous** (`ambiguous == true`: the test
+/// evaluated the decision several times with differing condition
+/// values, so per-condition aggregate counters cannot say which
+/// vectors occurred). Ambiguous observations carry no `inputs` and
+/// no `result`, only the raw [`Self::counts`]; [`analyze_with_runtime`]
+/// never uses them to demonstrate an independence pair. See
+/// [`crate::correlate::observations_from_counts`] for the rule that
+/// decides between the two.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConditionObservation {
     /// Optional test identifier, preserved for diagnostic output.
@@ -92,10 +104,76 @@ pub struct ConditionObservation {
     /// Short-circuited conditions are *omitted* — only conditions
     /// actually evaluated in this test appear. Callers that wish to
     /// represent unevaluated conditions explicitly should leave them
-    /// out of this map rather than inventing a value.
+    /// out of this map rather than inventing a value. Empty for an
+    /// ambiguous observation.
     pub inputs: BTreeMap<String, bool>,
-    /// The decision outcome under these inputs.
-    pub result: bool,
+    /// The decision outcome under these inputs. `None` for an
+    /// ambiguous observation, whose outcome is not attributable to
+    /// any one condition vector.
+    pub result: Option<bool>,
+    /// True when the test's coverage counters could not be reduced
+    /// to condition vectors known to have occurred. Excluded from
+    /// pair finding.
+    #[serde(default)]
+    pub ambiguous: bool,
+    /// How many times the test evaluated the decision, when known
+    /// (runtime-derived observations always set it; hand-built ones
+    /// may leave it `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluations: Option<u64>,
+    /// Raw per-condition counters of an ambiguous observation, keyed
+    /// by condition name. Empty for a condition vector.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub counts: BTreeMap<String, BranchCounts>,
+}
+
+impl ConditionObservation {
+    /// A condition vector that occurred: `inputs` evaluated to
+    /// `result`.
+    pub fn vector(test_name: Option<String>, inputs: BTreeMap<String, bool>, result: bool) -> Self {
+        Self {
+            test_name,
+            inputs,
+            result: Some(result),
+            ambiguous: false,
+            evaluations: None,
+            counts: BTreeMap::new(),
+        }
+    }
+
+    /// A test whose aggregate counters do not identify the condition
+    /// vectors it evaluated. Keeps the raw counters for reporting.
+    pub fn ambiguous(
+        test_name: Option<String>,
+        evaluations: u64,
+        counts: BTreeMap<String, BranchCounts>,
+    ) -> Self {
+        Self {
+            test_name,
+            inputs: BTreeMap::new(),
+            result: None,
+            ambiguous: true,
+            evaluations: Some(evaluations),
+            counts,
+        }
+    }
+}
+
+/// Aggregate runtime counters for one condition within one test:
+/// how many of its evaluations were true and how many false.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BranchCounts {
+    /// Evaluations of the condition that were true.
+    pub true_count: u64,
+    /// Evaluations of the condition that were false.
+    pub false_count: u64,
+}
+
+impl BranchCounts {
+    /// Total number of evaluations of the condition.
+    pub fn total(&self) -> u64 {
+        self.true_count.saturating_add(self.false_count)
+    }
 }
 
 /// Whether the test suite as observed demonstrates MC/DC independence
@@ -111,6 +189,16 @@ pub enum ConditionStatus {
     /// from one of the unexercised pairs in
     /// [`IndependenceMatrix::independence_pairs`].
     Unexercised,
+    /// Not demonstrated by any condition-vector observation, but the
+    /// condition WAS evaluated in at least one ambiguous observation
+    /// (a test that evaluated the decision more than once with
+    /// differing values). Whether those evaluations formed an
+    /// independence pair is unknown from aggregate counters, so the
+    /// condition is neither credited nor reported as unexercised.
+    Ambiguous {
+        /// Names of the ambiguous tests that evaluated the condition.
+        tests: Vec<String>,
+    },
 }
 
 /// Where a decision came from in source.
@@ -129,9 +217,18 @@ pub struct DecisionProvenance {
     /// the crate root).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_file: Option<String>,
-    /// Rust-level function name the decision lives in.
+    /// Rust-level function name the decision lives in, as rustc
+    /// prints it in the MIR header (impl methods read
+    /// `<impl at FILE:L:C: L:C>::name`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub function_name: Option<String>,
+    /// Report name taken from the coverage symbol the decision's
+    /// source spans joined to: demangled without crate hashes, with
+    /// generic arguments removed (for example
+    /// `<chrono::offset::fixed::FixedOffset>::east_opt`). `None`
+    /// when no coverage record joined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// 1-based line number where the decision starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
@@ -155,6 +252,10 @@ pub struct RuntimeAnalysis {
     /// `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<DecisionProvenance>,
+    /// Number of ambiguous observations excluded from pair finding
+    /// (see [`ConditionObservation::ambiguous`]).
+    #[serde(default)]
+    pub ambiguous_observations: usize,
 }
 
 /// Combine static MC/DC analysis with observed test runs.
@@ -171,26 +272,45 @@ pub struct RuntimeAnalysis {
 /// participate in a pair match — which is the correct MC/DC
 /// behaviour: a condition that was never actually evaluated cannot
 /// be said to have its independence demonstrated.
+///
+/// Ambiguous observations ([`ConditionObservation::ambiguous`]) are
+/// excluded from pair finding under every [`Variant`]. A condition
+/// left undemonstrated whose only remaining evidence is ambiguous is
+/// reported as [`ConditionStatus::Ambiguous`] instead of
+/// [`ConditionStatus::Unexercised`].
 pub fn analyze_with_runtime(
     tree: &DecisionTree,
     observations: &[ConditionObservation],
     variant: Variant,
 ) -> RuntimeAnalysis {
     let matrix = analyze_with_variant(tree, variant);
+    let (ambiguous, vectors): (Vec<&ConditionObservation>, Vec<&ConditionObservation>) =
+        observations.iter().partition(|o| o.ambiguous);
     let mut condition_status = BTreeMap::new();
     for (cond, pairs) in &matrix.independence_pairs {
-        condition_status.insert(cond.clone(), classify_condition(pairs, observations));
+        condition_status.insert(
+            cond.clone(),
+            classify_condition(cond, pairs, &vectors, &ambiguous),
+        );
     }
     RuntimeAnalysis {
         matrix,
         condition_status,
         provenance: None,
+        ambiguous_observations: ambiguous.len(),
     }
 }
 
+/// Classify one condition. Only condition-vector observations
+/// (`observations`) can demonstrate a pair; `ambiguous` observations
+/// only decide whether an undemonstrated condition is reported as
+/// [`ConditionStatus::Ambiguous`] (it was evaluated in one of them)
+/// or [`ConditionStatus::Unexercised`].
 fn classify_condition(
+    cond: &str,
     pairs: &[IndependencePair],
-    observations: &[ConditionObservation],
+    observations: &[&ConditionObservation],
+    ambiguous: &[&ConditionObservation],
 ) -> ConditionStatus {
     for pair in pairs {
         let t1 = observations
@@ -203,7 +323,16 @@ fn classify_condition(
             return ConditionStatus::Exercised(pair.clone());
         }
     }
-    ConditionStatus::Unexercised
+    let tests: Vec<String> = ambiguous
+        .iter()
+        .filter(|o| o.counts.get(cond).is_some_and(|c| c.total() > 0))
+        .map(|o| o.test_name.clone().unwrap_or_else(|| "?".to_string()))
+        .collect();
+    if tests.is_empty() {
+        ConditionStatus::Unexercised
+    } else {
+        ConditionStatus::Ambiguous { tests }
+    }
 }
 
 /// True iff `observation` is compatible with `row` — every condition
@@ -217,7 +346,7 @@ fn classify_condition(
 /// row's input class, regardless of what the missing condition's
 /// source value happened to be.
 fn observation_covers_row(observation: &ConditionObservation, row: &TruthTableRow) -> bool {
-    if observation.result != row.result {
+    if observation.ambiguous || observation.result != Some(row.result) {
         return false;
     }
     observation
@@ -258,7 +387,7 @@ pub fn analyze_with_variant(tree: &DecisionTree, variant: Variant) -> Independen
 
 /// Collect the set of atomic condition names referenced in a [`Node`],
 /// returned in deterministic sorted order.
-fn collect_conditions(node: &Node) -> Vec<String> {
+pub(crate) fn collect_conditions(node: &Node) -> Vec<String> {
     let mut set = BTreeSet::new();
     walk_conditions(node, &mut set);
     set.into_iter().collect()
@@ -617,11 +746,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn obs(name: &str, inputs: &[(&str, bool)], result: bool) -> ConditionObservation {
-        ConditionObservation {
-            test_name: Some(name.to_string()),
-            inputs: inputs.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+        ConditionObservation::vector(
+            Some(name.to_string()),
+            inputs.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             result,
-        }
+        )
     }
 
     #[test]
@@ -744,6 +873,102 @@ mod tests {
         }
     }
 
+    fn ambiguous_obs(
+        name: &str,
+        evaluations: u64,
+        raw: &[(&str, u64, u64)],
+    ) -> ConditionObservation {
+        ConditionObservation::ambiguous(
+            Some(name.to_string()),
+            evaluations,
+            raw.iter()
+                .map(|(k, t, f)| {
+                    (
+                        k.to_string(),
+                        BranchCounts {
+                            true_count: *t,
+                            false_count: *f,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn ambiguous_observations_never_demonstrate_a_pair_in_either_variant() {
+        // Even an ambiguous record whose fields were filled with a
+        // full vector must be ignored: the flag, not the contents,
+        // excludes it.
+        let mut forged = ambiguous_obs("loop", 2, &[("a", 1, 1), ("b", 1, 0)]);
+        forged.inputs = [("a".to_string(), false), ("b".to_string(), true)]
+            .into_iter()
+            .collect();
+        forged.result = Some(false);
+        let obs_list = [forged, obs("tt", &[("a", true), ("b", true)], true)];
+        for variant in [Variant::Masking, Variant::UniqueCause] {
+            let r = analyze_with_runtime(&and_tree(), &obs_list, variant);
+            assert_eq!(r.ambiguous_observations, 1);
+            for c in ["a", "b"] {
+                match &r.condition_status[c] {
+                    ConditionStatus::Ambiguous { tests } => {
+                        assert_eq!(tests, &vec!["loop".to_string()], "{variant:?} {c}")
+                    }
+                    other => panic!("{variant:?} {c}: expected Ambiguous, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_status_only_for_conditions_the_ambiguous_test_evaluated() {
+        // The ambiguous test never evaluated b (b = [0, 0]): b's gap
+        // is a genuine Unexercised, not an ambiguity.
+        let obs_list = [
+            ambiguous_obs("loop", 2, &[("a", 1, 1), ("b", 0, 0)]),
+            obs("tt", &[("a", true), ("b", true)], true),
+        ];
+        let r = analyze_with_runtime(&and_tree(), &obs_list, Variant::Masking);
+        assert!(matches!(
+            r.condition_status["a"],
+            ConditionStatus::Ambiguous { .. }
+        ));
+        assert!(matches!(
+            r.condition_status["b"],
+            ConditionStatus::Unexercised
+        ));
+    }
+
+    #[test]
+    fn vector_evidence_wins_over_ambiguous_evidence() {
+        let obs_list = [
+            ambiguous_obs("loop", 2, &[("a", 1, 1), ("b", 1, 0)]),
+            obs("ff", &[("a", false)], false),
+            obs("tt", &[("a", true), ("b", true)], true),
+        ];
+        let r = analyze_with_runtime(&and_tree(), &obs_list, Variant::Masking);
+        assert!(matches!(
+            r.condition_status["a"],
+            ConditionStatus::Exercised(_)
+        ));
+        assert!(matches!(
+            r.condition_status["b"],
+            ConditionStatus::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
+    fn old_observation_json_still_deserializes() {
+        // Pre-ambiguity observation shape: `result` is a bare bool,
+        // no `ambiguous` / `evaluations` / `counts`.
+        let old = r#"{"test_name": "t", "inputs": {"a": true}, "result": true}"#;
+        let o: ConditionObservation = serde_json::from_str(old).expect("parse old shape");
+        assert!(!o.ambiguous);
+        assert_eq!(o.result, Some(true));
+        assert_eq!(o.evaluations, None);
+        assert!(o.counts.is_empty());
+    }
+
     // -----------------------------------------------------------------------
     // Variant semantics
     // -----------------------------------------------------------------------
@@ -774,25 +999,9 @@ mod tests {
         // and check the recovered value equals the original.
         let tree = and_tree();
         let obs = vec![
-            ConditionObservation {
-                test_name: Some("t_ff".to_string()),
-                inputs: [("a".to_string(), false)].into_iter().collect(),
-                result: false,
-            },
-            ConditionObservation {
-                test_name: Some("t_tf".to_string()),
-                inputs: [("a".to_string(), true), ("b".to_string(), false)]
-                    .into_iter()
-                    .collect(),
-                result: false,
-            },
-            ConditionObservation {
-                test_name: Some("t_tt".to_string()),
-                inputs: [("a".to_string(), true), ("b".to_string(), true)]
-                    .into_iter()
-                    .collect(),
-                result: true,
-            },
+            obs("t_ff", &[("a", false)], false),
+            obs("t_tf", &[("a", true), ("b", false)], false),
+            obs("t_tt", &[("a", true), ("b", true)], true),
         ];
 
         let analysis = analyze_with_runtime(&tree, &obs, Variant::Masking);
@@ -826,7 +1035,9 @@ mod tests {
                 function_name: Some("allow_actuation".to_string()),
                 source_file: Some("src/lib.rs".to_string()),
                 line: Some(42),
+                display_name: Some("<brakes::Controller>::allow_actuation".to_string()),
             }),
+            ambiguous_observations: 0,
         };
         let json = serde_json::to_string(&analysis).expect("serialize");
         assert!(json.contains("\"provenance\""));
@@ -838,6 +1049,10 @@ mod tests {
         assert_eq!(p.function_name.as_deref(), Some("allow_actuation"));
         assert_eq!(p.source_file.as_deref(), Some("src/lib.rs"));
         assert_eq!(p.line, Some(42));
+        assert_eq!(
+            p.display_name.as_deref(),
+            Some("<brakes::Controller>::allow_actuation")
+        );
     }
 
     #[test]
@@ -846,6 +1061,7 @@ mod tests {
             matrix: IndependenceMatrix::default(),
             condition_status: BTreeMap::new(),
             provenance: None,
+            ambiguous_observations: 0,
         };
         let json = serde_json::to_string(&analysis).expect("serialize");
         assert!(
