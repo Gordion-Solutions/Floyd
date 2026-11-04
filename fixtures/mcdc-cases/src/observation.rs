@@ -4,8 +4,9 @@
 //! test. A test that evaluates a decision several times with
 //! different values must never be collapsed into one fabricated
 //! vector: Floyd derives its vectors only when the counters
-//! determine them (here: exactly one condition took both values),
-//! and otherwise records the test as ambiguous (no condition vector).
+//! determine them (here: exactly one condition took both values, or
+//! the decision is a tree, whose counters are its edge flows), and
+//! otherwise records the test as ambiguous (no condition vector).
 //! An ambiguous test leaves a condition unknown only if it took the
 //! outcomes a missing independence-pair row needs.
 
@@ -25,35 +26,53 @@ pub fn collapse_and(a: bool, b: bool) -> bool {
     a && b
 }
 
-/// `a && b`, evaluated three times by `ambiguous_and_loop`, (T,T),
-/// (T,F) and (F,-), and once by `ambiguous_and_once_tf`. In the loop
-/// both conditions took both values, so its counters (a = [2 T,
-/// 1 F], b = [1 T, 1 F]) do not determine its vectors.
+/// `a && b`, evaluated three times by `tree_and_loop`: (T,T) -> T,
+/// (T,F) -> F and (F,-) -> F, so a = [2 T, 1 F], b = [1 T, 1 F].
+/// Both conditions took both values, but `a && b` is a tree: b's
+/// total (2) is a's true count, and the three leaves carry one
+/// evaluation each.
 ///
-/// Expected (`--only=ambiguous_and`): verdict `analysed`, two
-/// observations, one ambiguous (`ambiguous_and_loop`,
-/// `evaluations: 3`, empty `inputs`, `result: null`) and one vector
-/// (`a=T, b=F -> F`); both conditions `UNKNOWN`, so
-/// `summary.unknown == 2`, `summary.percentage == null`, text output
-/// says "no percentage", exit code 2.
-pub fn ambiguous_and(a: bool, b: bool) -> bool {
+/// Expected (`--only=tree_and`): verdict `analysed`, three vector
+/// observations from the one test, none ambiguous, each
+/// `evaluations: 1` and `resolved_by: "tree_counters"`; both
+/// conditions exercised, `summary.percentage == 100`, exit 0.
+pub fn tree_and(a: bool, b: bool) -> bool {
     a && b
 }
 
-/// `a && (b || c)`, evaluated three times by
-/// `ruled_out_and_or_loop`: (T,T,-) -> T, (T,F,F) -> F and
-/// (F,-,-) -> F, so a = [2 T, 1 F], b = [1 T, 1 F], c = [0 T, 1 F].
-/// Ambiguous (two two-sided conditions), but `c`'s only pair needs
-/// (T,F,T) -> T and no test ever made `c` true.
+/// `a && (b || c)`, evaluated four times by `and_or_tree_loop`:
+/// (T,T,-) -> T, (T,F,T) -> T, (T,F,F) -> F, (F,-,-) -> F, so
+/// a = [3 T, 1 F], b = [1 T, 2 F], c = [1 T, 1 F]. Every condition
+/// is reached along one path only (a tree), so the counters give
+/// every vector.
 ///
-/// Expected (`--only=ruled_out_and_or`): one ambiguous observation;
-/// `a` and `b` `UNKNOWN`, `c` `UNEXERCISED` with
-/// `analysis.ruled_out.c` naming `ruled_out_and_or_loop`'s zero
-/// `c = T` counter; exit code 2. (`a && b && c` would read more
-/// simply, but rustc's instrumented MIR for a three-operand chain is
-/// a shape the decomposer declines.)
-pub fn ruled_out_and_or(a: bool, b: bool, c: bool) -> bool {
+/// Expected (`--only=and_or_tree`): four vector observations, each
+/// `evaluations: 1` and `resolved_by: "tree_counters"`; all three
+/// conditions exercised, `summary.percentage == 100`, exit 0.
+pub fn and_or_tree(a: bool, b: bool, c: bool) -> bool {
     a && (b || c)
+}
+
+/// `(a || b) && c` (as the `if` of an early return: the bare
+/// `bool` form of this shape is one the decomposer declines),
+/// evaluated twice by `dag_or_and_loop`: (T,-,T) -> T and
+/// (F,T,F) -> F, so a = [1 T, 1 F], b = [1 T, 0 F], c = [1 T, 1 F].
+/// Not a tree: `c` is reached both from `a = T` and from
+/// `a = F, b = T`, and (T,-,F) + (F,T,T) leaves the same counters,
+/// so the test is ambiguous. `a`'s and `b`'s pairs both need
+/// (F,F,-) -> F, and no test ever made `b` false.
+///
+/// Expected (`--only=dag_or_and`): one ambiguous observation
+/// (`evaluations: 2`, empty `inputs`, `result: null`, the raw
+/// `counts`); `c` `UNKNOWN`; `a` and `b` `UNEXERCISED`, with
+/// `analysis.ruled_out.b` naming `dag_or_and_loop`'s zero `b = F`
+/// counter; `summary.unknown == 1`, `summary.percentage == null`,
+/// text output says "no percentage", exit code 2.
+pub fn dag_or_and(a: bool, b: bool, c: bool) -> Option<u8> {
+    if (a || b) && c {
+        return None;
+    }
+    Some(1)
 }
 
 /// `a && b` with three tests that each evaluate it exactly once:
@@ -86,10 +105,10 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_and_loop() {
+    fn tree_and_loop() {
         let mut hits = 0;
         for (a, b) in [(true, true), (true, false), (false, true)] {
-            if ambiguous_and(a, b) {
+            if tree_and(a, b) {
                 hits += 1;
             }
         }
@@ -97,19 +116,26 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_and_once_tf() {
-        assert!(!ambiguous_and(true, false));
-    }
-
-    #[test]
-    fn ruled_out_and_or_loop() {
+    fn and_or_tree_loop() {
         let mut hits = 0;
         for (a, b, c) in [
             (true, true, true),
+            (true, false, true),
             (true, false, false),
             (false, true, true),
         ] {
-            if ruled_out_and_or(a, b, c) {
+            if and_or_tree(a, b, c) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 2);
+    }
+
+    #[test]
+    fn dag_or_and_loop() {
+        let mut hits = 0;
+        for (a, b, c) in [(true, false, true), (false, true, false)] {
+            if dag_or_and(a, b, c).is_none() {
                 hits += 1;
             }
         }

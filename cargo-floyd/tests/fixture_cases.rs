@@ -123,8 +123,9 @@ const fn measured(observations: u64, lift: Option<&'static str>) -> Expect {
 const EXPECTED: &[(&str, Expect)] = &[
     // 1. Observation collapse / ambiguity.
     ("collapse_and", measured(2, None)),
-    ("ambiguous_and", measured(2, None)),
-    ("ruled_out_and_or", measured(1, None)),
+    ("tree_and", measured(1, None)),
+    ("and_or_tree", measured(1, None)),
+    ("dag_or_and", measured(1, Some("value_arms"))),
     ("single_and", measured(3, None)),
     // 2. Name-based correlation.
     ("impl_or", measured(3, None)),
@@ -420,6 +421,83 @@ fn multi_evaluation_test_with_one_two_sided_condition_is_resolved() {
     assert_eq!(looped[1]["inputs"], serde_json::json!({"a": false}));
     assert_eq!(looped[1]["result"].as_bool(), Some(false));
     assert!(looped.iter().all(|o| o["evaluations"].as_u64() == Some(2)));
+    assert!(looped
+        .iter()
+        .all(|o| str_field(o, "resolved_by") == Some("single_two_sided")));
+    assert_eq!(
+        percentage(&run),
+        Some(100.0),
+        "summary: {}",
+        run.json["summary"]
+    );
+    assert_eq!(run.code, 0);
+}
+
+/// The observations of `test` (a test of the `observation` module),
+/// as (inputs, result), checking each is a `tree_counters` vector of
+/// one evaluation.
+fn tree_vectors(obs: &[Value], test: &str) -> Vec<(Value, Option<bool>)> {
+    obs.iter()
+        .filter(|o| str_field(o, "test_name") == Some(&format!("observation::tests::{test}")))
+        .map(|o| {
+            assert_eq!(o["ambiguous"].as_bool(), Some(false), "{o}");
+            assert_eq!(o["evaluations"].as_u64(), Some(1), "{o}");
+            assert_eq!(str_field(o, "resolved_by"), Some("tree_counters"), "{o}");
+            (o["inputs"].clone(), o["result"].as_bool())
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "requires nightly Rust + llvm-tools-preview component"]
+fn multi_evaluation_tree_test_is_resolved_by_tree_counters() {
+    // `tree_and_loop`: both conditions two-sided; `a && b` is a tree.
+    let run = floyd("json", &["--only=tree_and"]);
+    assert_report_shape(&run, "tree_and");
+    assert_eq!(conditions(&run), vec!["a", "b"]);
+    let obs = observations(&run);
+    assert_eq!(obs.len(), 3, "{obs:?}");
+    assert_eq!(
+        tree_vectors(obs, "tree_and_loop"),
+        [
+            (serde_json::json!({"a": true, "b": true}), Some(true)),
+            (serde_json::json!({"a": true, "b": false}), Some(false)),
+            (serde_json::json!({"a": false}), Some(false)),
+        ]
+    );
+    assert_eq!(
+        run.json["analysis"]["ambiguous_observations"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        percentage(&run),
+        Some(100.0),
+        "summary: {}",
+        run.json["summary"]
+    );
+    assert_eq!(run.code, 0);
+
+    // `and_or_tree_loop`: `a && (b || c)`, every condition two-sided.
+    let run = floyd("json", &["--only=and_or_tree"]);
+    assert_report_shape(&run, "and_or_tree");
+    assert_eq!(conditions(&run), vec!["a", "b", "c"]);
+    let obs = observations(&run);
+    assert_eq!(obs.len(), 4, "{obs:?}");
+    assert_eq!(
+        tree_vectors(obs, "and_or_tree_loop"),
+        [
+            (serde_json::json!({"a": true, "b": true}), Some(true)),
+            (
+                serde_json::json!({"a": true, "b": false, "c": true}),
+                Some(true)
+            ),
+            (
+                serde_json::json!({"a": true, "b": false, "c": false}),
+                Some(false)
+            ),
+            (serde_json::json!({"a": false}), Some(false)),
+        ]
+    );
     assert_eq!(
         percentage(&run),
         Some(100.0),
@@ -431,46 +509,36 @@ fn multi_evaluation_test_with_one_two_sided_condition_is_resolved() {
 
 #[test]
 #[ignore = "requires nightly Rust + llvm-tools-preview component"]
-fn multi_evaluation_test_is_ambiguous_and_withholds_the_percentage() {
-    let run = floyd("json", &["--only=ambiguous_and"]);
-    assert_report_shape(&run, "ambiguous_and");
+fn multi_evaluation_dag_test_is_ambiguous_and_withholds_the_percentage() {
+    let run = floyd("json", &["--only=dag_or_and"]);
+    assert_report_shape(&run, "dag_or_and");
     assert_eq!(str_field(&run.json, "verdict"), Some("analysed"));
-    assert_eq!(conditions(&run), vec!["a", "b"]);
+    assert_eq!(conditions(&run), vec!["a", "b", "c"]);
     let obs = observations(&run);
-    assert_eq!(obs.len(), 2, "{obs:?}");
-    let ambiguous: Vec<&Value> = obs
-        .iter()
-        .filter(|o| o["ambiguous"].as_bool() == Some(true))
-        .collect();
-    assert_eq!(ambiguous.len(), 1, "{obs:?}");
-    let looped = ambiguous[0];
+    assert_eq!(obs.len(), 1, "{obs:?}");
+    let looped = &obs[0];
+    assert_eq!(looped["ambiguous"].as_bool(), Some(true));
     assert_eq!(
         str_field(looped, "test_name"),
-        Some("observation::tests::ambiguous_and_loop")
+        Some("observation::tests::dag_or_and_loop")
     );
-    assert_eq!(looped["evaluations"].as_u64(), Some(3));
+    assert_eq!(looped["evaluations"].as_u64(), Some(2));
     assert_eq!(
         looped["inputs"],
         serde_json::json!({}),
         "no fabricated vector"
     );
     assert!(looped["result"].is_null());
-    assert_eq!(looped["counts"]["a"]["true_count"].as_u64(), Some(2));
-    assert_eq!(looped["counts"]["a"]["false_count"].as_u64(), Some(1));
-    assert_eq!(looped["counts"]["b"]["true_count"].as_u64(), Some(1));
-    assert_eq!(looped["counts"]["b"]["false_count"].as_u64(), Some(1));
-    let once = obs
-        .iter()
-        .find(|o| o["ambiguous"].as_bool() == Some(false))
-        .expect("single-evaluation observation");
-    assert_eq!(once["inputs"], serde_json::json!({"a": true, "b": false}));
-    assert_eq!(once["result"].as_bool(), Some(false));
-    assert_eq!(once["evaluations"].as_u64(), Some(1));
+    assert!(looped.get("resolved_by").is_none(), "{looped}");
+    for (c, t, f) in [("a", 1, 1), ("b", 1, 0), ("c", 1, 1)] {
+        assert_eq!(looped["counts"][c]["true_count"].as_u64(), Some(t), "{c}");
+        assert_eq!(looped["counts"][c]["false_count"].as_u64(), Some(f), "{c}");
+    }
     assert_eq!(
         run.json["analysis"]["ambiguous_observations"].as_u64(),
         Some(1)
     );
-    assert_eq!(run.json["summary"]["unknown"].as_u64(), Some(2));
+    assert_eq!(run.json["summary"]["unknown"].as_u64(), Some(1));
     assert_eq!(percentage(&run), None, "summary: {}", run.json["summary"]);
     assert_eq!(run.code, 2);
 }
@@ -478,12 +546,12 @@ fn multi_evaluation_test_is_ambiguous_and_withholds_the_percentage() {
 #[test]
 #[ignore = "requires nightly Rust + llvm-tools-preview component"]
 fn text_report_prints_no_percentage_when_a_condition_is_unknown() {
-    let run = floyd("text", &["--only=ambiguous_and"]);
+    let run = floyd("text", &["--only=dag_or_and"]);
     assert!(run.stdout.contains("AMBIGUOUS"), "{}", run.stdout);
     assert!(run.stdout.contains("UNKNOWN"), "{}", run.stdout);
     assert!(
         run.stdout
-            .contains("2 unknown of 2 conditions (no percentage"),
+            .contains("1 unknown of 3 conditions (no percentage"),
         "{}",
         run.stdout
     );
@@ -494,35 +562,29 @@ fn text_report_prints_no_percentage_when_a_condition_is_unknown() {
 #[test]
 #[ignore = "requires nightly Rust + llvm-tools-preview component"]
 fn outcome_no_test_took_is_unexercised_not_unknown() {
-    let run = floyd("json", &["--only=ruled_out_and_or"]);
-    assert_report_shape(&run, "ruled_out_and_or");
-    assert_eq!(conditions(&run), vec!["a", "b", "c"]);
-    let obs = observations(&run);
-    assert_eq!(obs.len(), 1, "{obs:?}");
-    assert_eq!(obs[0]["ambiguous"].as_bool(), Some(true));
+    let run = floyd("json", &["--only=dag_or_and"]);
     let status = &run.json["analysis"]["condition_status"];
-    assert!(status["a"]["Ambiguous"].is_object(), "{status}");
-    assert!(status["b"]["Ambiguous"].is_object(), "{status}");
-    assert_eq!(status["c"], "Unexercised", "{status}");
-    let why = &run.json["analysis"]["ruled_out"]["c"][0];
+    assert_eq!(status["a"], "Unexercised", "{status}");
+    assert_eq!(status["b"], "Unexercised", "{status}");
+    assert!(status["c"]["Ambiguous"].is_object(), "{status}");
+    let why = &run.json["analysis"]["ruled_out"]["b"][0];
     assert_eq!(
         str_field(why, "test"),
-        Some("observation::tests::ruled_out_and_or_loop"),
+        Some("observation::tests::dag_or_and_loop"),
         "{why}"
     );
-    assert_eq!(str_field(why, "condition"), Some("c"));
-    assert_eq!(why["value"].as_bool(), Some(true));
-    assert_eq!(why["counts"]["true_count"].as_u64(), Some(0));
-    assert_eq!(run.json["summary"]["unknown"].as_u64(), Some(2));
-    assert_eq!(run.json["summary"]["not_exercised"].as_u64(), Some(1));
+    assert_eq!(str_field(why, "condition"), Some("b"));
+    assert_eq!(why["value"].as_bool(), Some(false));
+    assert_eq!(why["counts"]["false_count"].as_u64(), Some(0));
+    assert_eq!(run.json["summary"]["not_exercised"].as_u64(), Some(2));
     assert_eq!(run.code, 2);
 
-    let text = floyd("text", &["--only=ruled_out_and_or"]);
+    let text = floyd("text", &["--only=dag_or_and"]);
     assert!(
-        text.stdout.contains("c: UNEXERCISED")
+        text.stdout.contains("b: UNEXERCISED")
             && text
                 .stdout
-                .contains("ruled_out_and_or_loop (3 evaluations) never took c=T (0T/1F)"),
+                .contains("dag_or_and_loop (2 evaluations) never took b=F (1T/0F)"),
         "{}",
         text.stdout
     );
