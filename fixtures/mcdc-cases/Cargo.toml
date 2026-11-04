@@ -1,0 +1,12 @@
+[package]
+name = "mcdc-cases"
+version = "0.0.0"
+edition = "2021"
+description = "Regression fixture for cargo-floyd: one module per engine bug class."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[test]]
+name = "no_harness"
+path = "tests/no_harness.rs"
+harness = false

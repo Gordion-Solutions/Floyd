@@ -45,6 +45,21 @@ jobs:
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
 
+  e2e:
+    # The #[ignore]d tests that drive the real toolchain:
+    # floyd/tests/end_to_end_001.rs and cargo-floyd/tests/fixture_cases.rs
+    # (`cargo floyd test` on fixtures/mcdc-cases). cargo-floyd builds
+    # with `cargo +nightly`, so the toolchain must be named `nightly`.
+    name: end-to-end (nightly + llvm-tools-preview)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace -- --ignored
+
   docs:
     name: docs (warning-as-error)
     runs-on: ubuntu-latest
