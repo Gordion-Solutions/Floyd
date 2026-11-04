@@ -1,3 +1,6 @@
 [workspace]
 members = ["floyd", "cargo-floyd", "fixtures/mcdc-cases"]
 resolver = "2"
+# Standalone fixtures for cargo-floyd's end-to-end tests; each is its
+# own workspace.
+exclude = ["fixtures/proc-macro-test"]

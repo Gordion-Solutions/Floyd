@@ -1,0 +1,12 @@
+[package]
+name = "proc-macro-test"
+version = "0.0.0"
+edition = "2021"
+description = "Fixture: a proc-macro crate whose test binary links libstd dynamically."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[lib]
+proc-macro = true
