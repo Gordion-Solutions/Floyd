@@ -197,6 +197,7 @@ mod tests {
                 .collect(),
             provenance: None,
             ambiguous_observations: ambiguous,
+            ruled_out: Default::default(),
         }
     }
 

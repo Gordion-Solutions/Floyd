@@ -70,7 +70,7 @@ pub use correlate::DecisionMap;
 pub use decision::DecisionTree;
 pub use masking::{
     BranchCounts, ConditionObservation, ConditionStatus, DecisionProvenance, IndependenceMatrix,
-    RuntimeAnalysis,
+    RuledOut, RuntimeAnalysis,
 };
 pub use mir::Mir;
 pub use profile::CoverageReport;
