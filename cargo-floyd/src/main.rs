@@ -1626,6 +1626,9 @@ fn print_runtime_report_body(
                 } else {
                     println!("  ✗ {cond}: UNEXERCISED (no valid pair available)");
                 }
+                if let Some(note) = ruled_out_note(analysis, cond) {
+                    println!("      {note}");
+                }
             }
         }
     }
@@ -1648,11 +1651,49 @@ fn print_runtime_report_body(
 /// [`summary::TESTS_SHOWN`] named, with their evaluation counts).
 fn unknown_reason(tests: &[String], observations: &[ConditionObservation]) -> String {
     format!(
-        "UNKNOWN — evaluated only in {} test(s) that evaluated the decision more than \
-         once, so no condition vector can be attributed: {}",
+        "UNKNOWN — the outcomes an independence pair still needs were taken only in {} \
+         test(s) that evaluated the decision more than once, so no condition vector can be \
+         attributed: {}",
         tests.len(),
         format_ambiguous_tests(tests, observations)
     )
+}
+
+/// For an unexercised condition that multi-evaluation tests did
+/// evaluate, why none of them counts as unknown evidence: each
+/// never took an outcome the missing pair row needs, with that
+/// test's counters (at most [`summary::TESTS_SHOWN`] tests named).
+/// `None` when no multi-evaluation test evaluated the condition.
+fn ruled_out_note(analysis: &RuntimeAnalysis, cond: &str) -> Option<String> {
+    let why = analysis.ruled_out.get(cond).filter(|w| !w.is_empty())?;
+    let conditions = &analysis.matrix.conditions;
+    let labels: Vec<String> = why
+        .iter()
+        .map(|r| {
+            let evals = r
+                .evaluations
+                .map_or_else(String::new, |n| format!(" ({n} evaluations)"));
+            format!(
+                "{}{evals} never took {}={} ({}T/{}F) as ({}) -> {} needs",
+                r.test,
+                r.condition,
+                bool_glyph(r.value),
+                r.counts.true_count,
+                r.counts.false_count,
+                format_inputs(conditions, &r.row),
+                bool_glyph(r.row.result),
+            )
+        })
+        .collect();
+    Some(format!(
+        "not unknown: no test took the outcome a missing pair row needs; the {} \
+         multi-evaluation test(s) that evaluated it are ruled out by their counters: {}",
+        why.iter()
+            .map(|r| r.test.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        summary::cap_tests(&labels, str::to_string)
+    ))
 }
 
 /// `evaluated 256x: c1=224T/32F  c2=95T/129F` for an ambiguous
@@ -1876,9 +1917,10 @@ fn render_runtime_junit(source: &str, analysis: &RuntimeAnalysis, not_measurable
             Some(ConditionStatus::Ambiguous { tests }) => (
                 "AmbiguousCondition",
                 format!(
-                    "UNKNOWN: evaluated only in {} test(s) that evaluated the decision more \
-                     than once ({}); aggregate counters cannot attribute a condition vector \
-                     to them. Add tests that each evaluate the decision once.",
+                    "UNKNOWN: the outcomes an independence pair still needs were taken only \
+                     in {} test(s) that evaluated the decision more than once ({}); aggregate \
+                     counters cannot attribute a condition vector to them. Add tests that \
+                     each evaluate the decision once.",
                     tests.len(),
                     summary::cap_tests(tests, str::to_string)
                 ),
@@ -1898,6 +1940,10 @@ fn render_runtime_junit(source: &str, analysis: &RuntimeAnalysis, not_measurable
                             bool_glyph(p.test_1.result),
                             bool_glyph(p.test_2.result),
                         )
+                    })
+                    .map(|needs| match ruled_out_note(analysis, cond) {
+                        Some(note) => format!("{needs}; {note}"),
+                        None => needs,
                     })
                     .unwrap_or_else(|| {
                         "no valid independence pair available for this condition".to_string()
@@ -2342,12 +2388,75 @@ mod tests {
         assert!(v["analysis"]["condition_status"]["b"]["Ambiguous"].is_object());
     }
 
+    /// anyhow `src/ensure.rs:60` (`b == 32 || b == 10`) with
+    /// `test_whitespace`'s counters kept as one ambiguous observation.
+    fn ruled_out_analysis() -> RuntimeAnalysis {
+        let tree = floyd::DecisionTree {
+            decisions: vec![decision::Node::Ite {
+                cond: "b == 32".to_string(),
+                then_branch: Box::new(decision::Node::Const { value: true }),
+                else_branch: Box::new(decision::Node::Condition {
+                    name: "b == 10".to_string(),
+                }),
+            }],
+        };
+        let counts = |t, f| floyd::BranchCounts {
+            true_count: t,
+            false_count: f,
+        };
+        let observations = [ConditionObservation::ambiguous(
+            Some("test_whitespace".to_string()),
+            9,
+            [
+                ("b == 32".to_string(), counts(1, 8)),
+                ("b == 10".to_string(), counts(0, 8)),
+            ]
+            .into_iter()
+            .collect(),
+        )];
+        masking::analyze_with_runtime(&tree, &observations, Variant::Masking)
+    }
+
+    #[test]
+    fn unexercised_condition_evaluated_by_an_ambiguous_test_says_why_with_counts() {
+        let analysis = ruled_out_analysis();
+        assert!(matches!(
+            analysis.condition_status.get("b == 10"),
+            Some(ConditionStatus::Unexercised)
+        ));
+        let note = ruled_out_note(&analysis, "b == 10").expect("note");
+        assert!(
+            note.contains(
+                "test_whitespace (9 evaluations) never took b == 10=T (0T/8F) as \
+                 (b == 10=T, b == 32=F) -> T needs"
+            ),
+            "{note}"
+        );
+        assert!(ruled_out_note(&analysis, "b == 32").is_none());
+
+        let xml = render_runtime_junit("lib.rs", &analysis, 0);
+        assert!(xml.contains(r#"type="UnexercisedCondition""#), "{xml}");
+        assert!(xml.contains("never took b == 10=T (0T/8F)"), "{xml}");
+
+        let v = serde_json::to_value(&analysis).unwrap();
+        let r = &v["ruled_out"]["b == 10"][0];
+        assert_eq!(r["test"], "test_whitespace");
+        assert_eq!(r["condition"], "b == 10");
+        assert_eq!(r["value"], true);
+        assert_eq!(r["counts"]["true_count"], 0);
+        assert_eq!(r["counts"]["false_count"], 8);
+        assert_eq!(v["condition_status"]["b == 10"], "Unexercised");
+    }
+
     #[test]
     fn unknown_status_line_says_unknown_and_caps_tests() {
         let tests: Vec<String> = (0..4).map(|i| format!("loop_{i}")).collect();
         let line = unknown_reason(&tests, &[]);
         assert!(
-            line.starts_with("UNKNOWN — evaluated only in 4 test(s)"),
+            line.starts_with(
+                "UNKNOWN — the outcomes an independence pair still needs were taken only in 4 \
+                 test(s)"
+            ),
             "{line}"
         );
         assert!(line.ends_with("loop_0, loop_1, loop_2 (+1 more)"), "{line}");
