@@ -123,6 +123,13 @@ pub struct MirFunction {
     /// this body, so they locate its coverage record even when a
     /// decomposed condition's own span carries no region.
     pub coverage_spans: Vec<SourceSpan>,
+    /// `true` for the body rustc prints under a `// MIR FOR CTFE`
+    /// line: the compile-time-evaluation rendering of a `const fn`,
+    /// which follows its runtime body under the same name. CTFE MIR
+    /// keeps shapes that the runtime body optimises away (operand
+    /// copies, `StorageLive`), and it never runs at runtime; the
+    /// runtime body carries the decision and its coverage.
+    pub is_ctfe: bool,
 }
 
 /// A captured variable from a closure's environment.
@@ -702,6 +709,9 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
     let mut scope_nest: u32 = 0;
     let mut current_fn: Option<MirFunction> = None;
     let mut current_block: Option<MirBlock> = None;
+    // Set by a `// MIR FOR CTFE` line; consumed by the next
+    // top-level item, which is the CTFE body of a `const fn`.
+    let mut next_is_ctfe = false;
 
     for (i, raw) in input.lines().enumerate() {
         let line_no = i + 1;
@@ -712,6 +722,9 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
         // Lines that are *entirely* comments (preamble warnings, etc.)
         // are skipped. Lines with a trailing comment are split below.
         if trimmed.starts_with("//") {
+            if depth == 0 && trimmed == "// MIR FOR CTFE" {
+                next_is_ctfe = true;
+            }
             continue;
         }
 
@@ -736,6 +749,7 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
         // bodies, which carry `debug` and `let` declarations, are
         // captured.
         if code.ends_with('{') && depth == 0 && !code.starts_with("fn ") {
+            next_is_ctfe = false;
             skip_depth = 1;
             continue;
         }
@@ -752,9 +766,10 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
         // Open a brace: either a function or a basic block header.
         if code.ends_with('{') {
             if depth == 0 {
+                let is_ctfe = std::mem::take(&mut next_is_ctfe);
                 match parse_fn_header(code) {
                     Some(f) => {
-                        current_fn = Some(f);
+                        current_fn = Some(MirFunction { is_ctfe, ..f });
                         depth = 1;
                         continue;
                     }

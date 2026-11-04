@@ -479,6 +479,13 @@ pub enum NotMeasurableReason {
     /// another candidate with a different MIR name resolves to the
     /// same coverage function.
     AmbiguousSpans,
+    /// The decision's coverage record exists, but it has no branch
+    /// region at any of the decision's condition spans. rustc emits
+    /// no branch counters for some decisions: `match` arms on an
+    /// enum, `matches!` patterns, and some closure and macro
+    /// bodies. Their arms carry only code regions, and Floyd does not
+    /// derive condition outcomes from those.
+    NoBranchRegion,
 }
 
 /// A candidate whose execution coverage cannot measure, with why.
@@ -517,6 +524,15 @@ pub struct CandidateCoverage {
     /// Keys of the coverage functions the candidate resolved to
     /// (one per distinct key across tests).
     pub function_keys: Vec<FunctionId>,
+    /// `true` when a found coverage function's entry count is
+    /// non-zero in some test, whatever [`Self::status`] says. A
+    /// [`NotMeasurableReason::NoBranchRegion`] candidate can be
+    /// entered or not.
+    pub entered: bool,
+    /// Conditions of the decision with no branch region in any found
+    /// coverage function: their span has no region, or they have no
+    /// span. Empty when no coverage function was found.
+    pub conditions_without_branch_region: Vec<String>,
 }
 
 impl CandidateCoverage {
@@ -527,6 +543,8 @@ impl CandidateCoverage {
             observations: Vec::new(),
             display_name: None,
             function_keys: Vec::new(),
+            entered: false,
+            conditions_without_branch_region: Vec::new(),
         }
     }
 
@@ -592,6 +610,9 @@ pub fn mir_not_measurable(
 ///   [`NotMeasurableReason::AmbiguousSpans`], observations dropped;
 /// - no test has a record at the spans →
 ///   [`NotMeasurableReason::NoCoverageRecord`];
+/// - the found functions have no branch region at any of the
+///   decision's condition spans →
+///   [`NotMeasurableReason::NoBranchRegion`], observations dropped;
 /// - otherwise [`CoverageStatus::Invoked`] if a found function's
 ///   (merged) entry count is non-zero in some test, else
 ///   [`CoverageStatus::NeverInvoked`].
@@ -606,6 +627,15 @@ pub fn join_candidate(
     let mut display_name = None;
     let mut ambiguous: Option<String> = None;
     let mut invoked = false;
+    let conditions: Vec<String> = tree
+        .decisions
+        .first()
+        .map(crate::masking::collect_conditions)
+        .unwrap_or_default();
+    let condition_spans = prepared.function_spans.get(fn_idx);
+    let span_of = |c: &String| condition_spans.and_then(|spans| spans.get(c));
+    let mut with_branch: BTreeSet<&str> = BTreeSet::new();
+    let mut other_branches = false;
     for (test_name, index) in tests {
         let join = join_test(Some(test_name.clone()), prepared, fn_idx, index, tree);
         match join.matched {
@@ -615,6 +645,12 @@ pub fn join_candidate(
             }
             FunctionMatch::Found(f) => {
                 invoked |= f.count > 0;
+                for c in &conditions {
+                    if span_of(c).is_some_and(|s| f.branch_counts(s).is_some()) {
+                        with_branch.insert(c.as_str());
+                    }
+                }
+                other_branches |= !f.branches.is_empty();
                 if display_name.is_none() {
                     display_name = Some(f.display_name().to_string());
                 }
@@ -625,6 +661,15 @@ pub fn join_candidate(
         }
         observations.extend(join.observations);
     }
+    let conditions_without_branch_region: Vec<String> = if function_keys.is_empty() {
+        Vec::new()
+    } else {
+        conditions
+            .iter()
+            .filter(|c| !with_branch.contains(c.as_str()))
+            .cloned()
+            .collect()
+    };
     let status = if let Some(detail) = ambiguous {
         observations.clear();
         CoverageStatus::NotMeasurable(NotMeasurable {
@@ -640,6 +685,22 @@ pub fn join_candidate(
                 tests.len()
             ),
         })
+    } else if with_branch.is_empty() {
+        observations.clear();
+        CoverageStatus::NotMeasurable(NotMeasurable {
+            reason: NotMeasurableReason::NoBranchRegion,
+            detail: format!(
+                "the coverage record has no branch region at the decision's condition \
+                 spans{} (rustc emits none for `match` arms on enums, `matches!` patterns \
+                 and some closures and macros); the function was {}",
+                if other_branches {
+                    ", only elsewhere in the function"
+                } else {
+                    ""
+                },
+                if invoked { "entered" } else { "never entered" }
+            ),
+        })
     } else if invoked {
         CoverageStatus::Invoked
     } else {
@@ -650,6 +711,8 @@ pub fn join_candidate(
         observations,
         display_name,
         function_keys,
+        entered: invoked,
+        conditions_without_branch_region,
     }
 }
 
@@ -709,6 +772,7 @@ pub fn provenance_for(f: &MirFunction) -> crate::masking::DecisionProvenance {
         source_file: earliest.map(|s| s.file.clone()),
         line: earliest.map(|s| s.start_line),
         display_name: None,
+        lift: None,
     }
 }
 
@@ -1543,8 +1607,8 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -
         // The decision `julian_day_0 > 365` sits at 501:12-501:30,
         // which no region of this record covers. The body's coverage
         // mappings still locate julian_0's record: the function ran
-        // (invoked), and the decision has no counters (no
-        // observations).
+        // (entered). The record has no branch region for the
+        // decision, so it is not measurable (no observations).
         let mir = mir::parse_text(CHRONO_MIR).expect("MIR parses");
         let paths = chrono_paths();
         let mut prepared = prepare_mir(&mir, &paths);
@@ -1554,7 +1618,12 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -
             CoverageIndex::build(&export(&[JULIAN_0_RECORD_NO_CONDITION_REGION]), &paths),
         )];
         let c = join_candidate(&prepared, idx, &tree, &tests);
-        assert_eq!(c.status, CoverageStatus::Invoked);
+        let CoverageStatus::NotMeasurable(nm) = &c.status else {
+            panic!("expected not measurable, got {:?}", c.status);
+        };
+        assert_eq!(nm.reason, NotMeasurableReason::NoBranchRegion);
+        assert!(c.entered);
+        assert_eq!(c.function_keys.len(), 1);
         assert!(c.observations.is_empty());
         assert_eq!(
             c.display_name.as_deref(),
@@ -1583,7 +1652,23 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -
             .iter()
             .find(|f| f.name.contains("east_opt"))
             .expect("function in fixture");
-        assert_eq!(decision::decompose_function(f), None);
+        // The two comparisons are its conditions (value-arm lift),
+        // and `secs` is not one.
+        let node = decision::decompose_function(f).expect("value arms lift");
+        assert_eq!(
+            crate::masking::collect_conditions(&node),
+            ["-86400 < secs", "secs < 86400"]
+        );
+        // It is the `// MIR FOR CTFE` body, so it is declined as a
+        // candidate before decomposition; the two runtime bodies
+        // before it are not tagged.
+        assert!(f.is_ctfe);
+        assert_eq!(
+            decision::try_decompose_candidate(f),
+            Err(decision::DeclineReason::CtfeBody)
+        );
+        let tagged: Vec<bool> = mir.functions.iter().map(|f| f.is_ctfe).collect();
+        assert_eq!(tagged, [false, false, true]);
     }
 
     #[test]
@@ -1610,6 +1695,7 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -
         ];
         let c = join_candidate(&prepared, idx, &tree, &tests);
         assert!(c.invoked());
+        assert!(c.conditions_without_branch_region.is_empty());
         let tests_with_obs: Vec<_> = c
             .observations
             .iter()
@@ -1816,5 +1902,259 @@ fn parse_one_file::{closure#0}(_1: bool) -> bool {
         };
         assert_eq!(nm.reason, NotMeasurableReason::AmbiguousSpans);
         assert!(c.observations.is_empty());
+    }
+
+    /// BLAKE3 `src/lib.rs`, `cargo floyd test` MIR (comment-only
+    /// lines stripped) for
+    ///
+    /// ```text
+    /// impl IncrementCounter {
+    ///     fn yes(&self) -> bool {
+    ///         match self {
+    ///             IncrementCounter::Yes => true,
+    ///             IncrementCounter::No => false,
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    const INCREMENT_COUNTER_YES_MIR: &str = r#"
+fn <impl at src/lib.rs:699:1: 699:22>::yes(_1: &IncrementCounter) -> bool {
+    debug self => _1;                    // in scope 0 at src/lib.rs:701:12: 701:17
+    let mut _0: bool;                    // return place in scope 0 at src/lib.rs:701:22: 701:26
+    let mut _2: isize;                   // in scope 0 at src/lib.rs:703:13: 703:34
+
+    coverage Code { bcb: bcb0 } => src/lib.rs:701:5: 701:26 (#0);
+    coverage Code { bcb: bcb0 } => src/lib.rs:702:15: 702:19 (#0);
+    coverage Code { bcb: bcb3 } => src/lib.rs:703:38: 703:42 (#0);
+    coverage Code { bcb: bcb1 } => src/lib.rs:704:37: 704:42 (#0);
+    coverage Code { bcb: bcb2 } => src/lib.rs:706:5: 706:6 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/lib.rs:702:9: 702:19
+        _2 = discriminant((*_1));        // scope 0 at src/lib.rs:702:15: 702:19
+        switchInt(move _2) -> [0: bb2, 1: bb3, otherwise: bb1]; // scope 0 at src/lib.rs:702:9: 702:19
+    }
+
+    bb1: {
+        unreachable;                     // scope 0 at src/lib.rs:702:15: 702:19
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/lib.rs:703:13: 703:34
+        _0 = const true;                 // scope 0 at src/lib.rs:703:38: 703:42
+        goto -> bb4;                     // scope 0 at src/lib.rs:703:38: 703:42
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/lib.rs:704:37: 704:42
+        _0 = const false;                // scope 0 at src/lib.rs:704:37: 704:42
+        goto -> bb4;                     // scope 0 at src/lib.rs:704:37: 704:42
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/lib.rs:706:6: 706:6
+        return;                          // scope 0 at src/lib.rs:706:6: 706:6
+    }
+}
+"#;
+
+    /// Its record in `avx2::test::test_hash_many`'s coverage: code
+    /// regions only (the two arms 96 / 96), no branch region.
+    const INCREMENT_COUNTER_YES_RECORD: &str = r#"{"name": "_RNvMsf_CsgejNOghg1Tz_6blake3NtB5_16IncrementCounter3yesB5_", "count": 192, "filenames": ["/home/ubuntu/work/validation/BLAKE3/src/lib.rs"], "regions": [[701, 5, 701, 26, 192, 0, 0, 0], [702, 15, 702, 19, 192, 0, 0, 0], [703, 38, 703, 42, 96, 0, 0, 0], [704, 37, 704, 42, 96, 0, 0, 0], [706, 5, 706, 6, 192, 0, 0, 0]], "branches": []}"#;
+
+    #[test]
+    fn enum_match_without_a_branch_region_is_not_measurable() {
+        let mir = mir::parse_text(INCREMENT_COUNTER_YES_MIR).expect("MIR parses");
+        let paths = PathNormaliser::new(Some(std::path::Path::new(
+            "/home/ubuntu/work/validation/BLAKE3",
+        )));
+        let prepared = prepare_mir(&mir, &paths);
+        let node = decision::try_decompose_candidate(&mir.functions[0]).expect("a candidate");
+        let tree = DecisionTree {
+            decisions: vec![node],
+        };
+        let tests = vec![(
+            "avx2::test::test_hash_many".to_string(),
+            CoverageIndex::build(&export(&[INCREMENT_COUNTER_YES_RECORD]), &paths),
+        )];
+        let c = join_candidate(&prepared, 0, &tree, &tests);
+        let CoverageStatus::NotMeasurable(nm) = &c.status else {
+            panic!("expected not measurable, got {:?}", c.status);
+        };
+        assert_eq!(nm.reason, NotMeasurableReason::NoBranchRegion);
+        assert!(
+            nm.detail.ends_with("the function was entered"),
+            "{}",
+            nm.detail
+        );
+        assert!(c.entered);
+        assert!(!c.invoked());
+        assert!(c.observations.is_empty());
+        assert_eq!(
+            c.conditions_without_branch_region,
+            crate::masking::collect_conditions(&tree.decisions[0])
+        );
+        assert_eq!(
+            serde_json::to_value(NotMeasurableReason::NoBranchRegion).unwrap(),
+            "no_branch_region"
+        );
+
+        // Not entered by any test: still not measurable, and the
+        // detail says so.
+        let idle = INCREMENT_COUNTER_YES_RECORD
+            .replace("192", "0")
+            .replace("96", "0");
+        let tests = vec![(
+            "t".to_string(),
+            CoverageIndex::build(&export(&[&idle]), &paths),
+        )];
+        let c = join_candidate(&prepared, 0, &tree, &tests);
+        let CoverageStatus::NotMeasurable(nm) = &c.status else {
+            panic!("expected not measurable, got {:?}", c.status);
+        };
+        assert_eq!(nm.reason, NotMeasurableReason::NoBranchRegion);
+        assert!(nm.detail.ends_with("never entered"), "{}", nm.detail);
+        assert!(!c.entered);
+    }
+
+    /// The runtime body of chrono's `const fn FixedOffset::east_opt`
+    /// (`if -86_400 < secs && secs < 86_400 { Some(..) } else { None
+    /// }`), from the same compilation as [`CHRONO_MIR`], comment
+    /// lines stripped.
+    const EAST_OPT_RUNTIME_MIR: &str = r#"
+fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -> Option<offset::fixed::FixedOffset> {
+    debug secs => _1;                    // in scope 0 at src/offset/fixed.rs:62:27: 62:31
+    let mut _0: std::option::Option<offset::fixed::FixedOffset>; // return place in scope 0 at src/offset/fixed.rs:62:41: 62:60
+    let mut _2: bool;                    // in scope 0 at src/offset/fixed.rs:63:12: 63:26
+    let mut _3: bool;                    // in scope 0 at src/offset/fixed.rs:63:30: 63:43
+    let mut _4: offset::fixed::FixedOffset; // in scope 0 at src/offset/fixed.rs:64:18: 64:55
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/offset/fixed.rs:63:12: 63:26 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/offset/fixed.rs:63:30: 63:43 (#0)
+
+    coverage Code { bcb: bcb0 } => src/offset/fixed.rs:62:5: 62:60 (#0);
+    coverage Code { bcb: bcb0 } => src/offset/fixed.rs:63:12: 63:26 (#0);
+    coverage Code { bcb: bcb1 } => src/offset/fixed.rs:63:30: 63:43 (#0);
+    coverage Code { bcb: bcb2 } => src/offset/fixed.rs:64:13: 64:56 (#0);
+    coverage Code { bcb: bcb5 } => src/offset/fixed.rs:66:13: 66:17 (#0);
+    coverage Code { bcb: bcb3 } => src/offset/fixed.rs:68:5: 68:6 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb6 } => src/offset/fixed.rs:63:12: 63:26 (#0);
+    coverage Branch { true_bcb: bcb2, false_bcb: bcb4 } => src/offset/fixed.rs:63:30: 63:43 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/offset/fixed.rs:63:12: 63:26
+        _2 = Lt(const -86400_i32, copy _1); // scope 0 at src/offset/fixed.rs:63:12: 63:26
+        switchInt(move _2) -> [0: bb2, otherwise: bb1]; // scope 0 at src/offset/fixed.rs:63:12: 63:26
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/offset/fixed.rs:63:30: 63:43
+        _3 = Lt(copy _1, const 86400_i32); // scope 0 at src/offset/fixed.rs:63:30: 63:43
+        switchInt(move _3) -> [0: bb4, otherwise: bb3]; // scope 0 at src/offset/fixed.rs:63:30: 63:43
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at no-location
+        goto -> bb5;                     // scope 0 at no-location
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/offset/fixed.rs:63:9: 67:10
+        _4 = offset::fixed::FixedOffset { local_minus_utc: copy _1 }; // scope 0 at src/offset/fixed.rs:64:18: 64:55
+        _0 = Option::<offset::fixed::FixedOffset>::Some(move _4); // scope 0 at src/offset/fixed.rs:64:13: 64:56
+        goto -> bb6;                     // scope 0 at src/offset/fixed.rs:63:9: 67:10
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at no-location
+        goto -> bb5;                     // scope 0 at no-location
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/offset/fixed.rs:63:9: 67:10
+        _0 = Option::<offset::fixed::FixedOffset>::None; // scope 0 at src/offset/fixed.rs:66:13: 66:17
+        goto -> bb6;                     // scope 0 at src/offset/fixed.rs:63:9: 67:10
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/offset/fixed.rs:68:6: 68:6
+        return;                          // scope 0 at src/offset/fixed.rs:68:6: 68:6
+    }
+}
+"#;
+
+    /// `east_opt`'s whole-suite record from chrono's `llvm-cov
+    /// export`: branch regions at both condition spans.
+    const EAST_OPT_SUITE_RECORD: &str = r#"{"branches": [[63, 12, 63, 26, 2338, 1, 0, 0, 4], [63, 30, 63, 43, 2337, 1, 0, 0, 4]], "count": 2339, "filenames": ["/home/ubuntu/work/verify-span/chrono/src-copy/src/offset/fixed.rs"], "mcdc_records": [], "name": "_RNvMNtNtCseI4Ere5mNTx_6chrono6offset5fixedNtB2_11FixedOffset8east_opt", "regions": [[62, 5, 62, 60, 2339, 0, 0, 0], [63, 12, 63, 26, 2339, 0, 0, 0], [63, 30, 63, 43, 2338, 0, 0, 0], [64, 13, 64, 56, 2337, 0, 0, 0], [66, 13, 66, 17, 2, 0, 0, 0], [68, 5, 68, 6, 2339, 0, 0, 0]]}"#;
+
+    /// [`EAST_OPT_SUITE_RECORD`] for one call, with the two
+    /// conditions' `(true, false)` counters substitutable.
+    fn east_opt_record(a: (u64, u64), b: (u64, u64)) -> String {
+        EAST_OPT_SUITE_RECORD
+            .replace(
+                "[[63, 12, 63, 26, 2338, 1, 0, 0, 4], [63, 30, 63, 43, 2337, 1, 0, 0, 4]]",
+                &format!(
+                    "[[63, 12, 63, 26, {}, {}, 0, 0, 4], [63, 30, 63, 43, {}, {}, 0, 0, 4]]",
+                    a.0, a.1, b.0, b.1
+                ),
+            )
+            .replace("2339", "1")
+    }
+
+    #[test]
+    fn value_arm_chain_joins_both_conditions_by_span() {
+        let mir = mir::parse_text(EAST_OPT_RUNTIME_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        assert!(!f.is_ctfe);
+        let (node, lift) = decision::try_decompose_candidate_lifted(f).expect("a candidate");
+        assert_eq!(lift, Some(decision::Lift::ValueArms));
+        assert_eq!(
+            crate::masking::collect_conditions(&node),
+            ["-86400 < secs", "secs < 86400"]
+        );
+        let tree = DecisionTree {
+            decisions: vec![node],
+        };
+        let paths = chrono_paths();
+        let prepared = prepare_mir(&mir, &paths);
+        let tests = vec![
+            (
+                "suite".to_string(),
+                CoverageIndex::build(&export(&[EAST_OPT_SUITE_RECORD]), &paths),
+            ),
+            (
+                "in_range".to_string(),
+                CoverageIndex::build(&export(&[&east_opt_record((1, 0), (1, 0))]), &paths),
+            ),
+            (
+                "too_low".to_string(),
+                CoverageIndex::build(&export(&[&east_opt_record((0, 1), (0, 0))]), &paths),
+            ),
+            (
+                "too_high".to_string(),
+                CoverageIndex::build(&export(&[&east_opt_record((1, 0), (0, 1))]), &paths),
+            ),
+        ];
+        let c = join_candidate(&prepared, 0, &tree, &tests);
+        assert_eq!(c.status, CoverageStatus::Invoked);
+        assert!(c.conditions_without_branch_region.is_empty());
+        assert_eq!(
+            c.display_name.as_deref(),
+            Some("<chrono::offset::fixed::FixedOffset>::east_opt")
+        );
+        // The suite's totals mix 2339 evaluations of two conditions:
+        // ambiguous. Each single-call test yields its vector, and
+        // the arm taken is the outcome.
+        assert_eq!(c.observations.len(), 4);
+        assert!(c.observations[0].ambiguous);
+        let results: Vec<Option<bool>> = c.observations[1..].iter().map(|o| o.result).collect();
+        assert_eq!(results, [Some(true), Some(false), Some(false)]);
+        assert_eq!(
+            c.observations[3].inputs,
+            BTreeMap::from([
+                ("-86400 < secs".to_string(), true),
+                ("secs < 86400".to_string(), false)
+            ])
+        );
     }
 }

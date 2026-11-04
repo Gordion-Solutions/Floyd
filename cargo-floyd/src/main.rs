@@ -58,6 +58,11 @@ struct DeclinedFunction {
     name: String,
     source_file: Option<String>,
     line: Option<u32>,
+    /// Why the decomposer declined it: `unsupported_shape`,
+    /// `non_bool_leaf` when an arm's value is a named local that is
+    /// not `bool`, `no_conditions` when the tree tests no condition,
+    /// or `ctfe_body` for a `const fn`'s `MIR FOR CTFE` body.
+    reason: decision::DeclineReason,
 }
 
 /// One decomposable candidate the engine considered, with whether
@@ -88,6 +93,23 @@ struct CandidateSummary {
     /// never-invoked.
     #[serde(skip_serializing_if = "Option::is_none")]
     not_measurable: Option<correlate::NotMeasurable>,
+    /// Present when no test Floyd ran entered the function and its
+    /// package has `harness = false` test targets Floyd skipped
+    /// (see `skipped_no_harness`): names those targets, which may
+    /// be what exercises it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    /// Conditions of the decision with no branch region in the
+    /// coverage record the join found (their span has none, or they
+    /// have no span). Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conditions_without_branch_region: Vec<String>,
+    /// The lift that made the decision a candidate, when one did:
+    /// `call_arms` (both arms end in non-panic calls) or
+    /// `value_arms` (both arms write one non-`bool` value and
+    /// join). Omitted for a decision over Boolean leaves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lift: Option<decision::Lift>,
 }
 
 impl CandidateSummary {
@@ -106,7 +128,196 @@ impl CandidateSummary {
                 correlate::CoverageStatus::NotMeasurable(nm) => Some(nm.clone()),
                 _ => None,
             },
+            note: None,
+            conditions_without_branch_region: join.conditions_without_branch_region.clone(),
+            lift: prov.lift,
         }
+    }
+
+    /// `display_name (file:line)` for report lines.
+    fn label(&self) -> String {
+        let name = self
+            .display_name
+            .as_deref()
+            .or(self.function_name.as_deref())
+            .unwrap_or("<unknown>");
+        match (&self.source_file, self.line) {
+            (Some(file), Some(line)) => format!("`{name}` ({file}:{line})"),
+            _ => format!("`{name}`"),
+        }
+    }
+}
+
+/// The stderr explanation of an all-unobserved verdict, one line per
+/// element: what each group of candidates is and why it produced no
+/// observation.
+///
+/// An invoked candidate is blamed on Floyd's span correlation only
+/// when its record has branch regions for some of the decision's
+/// conditions and none at the span of another
+/// (`conditions_without_branch_region` non-empty). A record without
+/// any branch region for the decision is `no_branch_region`, not
+/// measurable, and is explained as such; an invoked candidate whose
+/// condition spans all have branch regions was entered but its
+/// decision never evaluated.
+fn all_unobserved_explanation(candidates: &[CandidateSummary]) -> Vec<String> {
+    let mut lines = vec![
+        "cargo-floyd: Floyd found decomposable boolean decisions in your code, but no \
+         test produced a usable observation for any of them."
+            .to_string(),
+    ];
+    let notes = |lines: &mut Vec<String>, group: &[&CandidateSummary]| {
+        for c in group {
+            if let Some(note) = &c.note {
+                lines.push(format!("    {}: {note}", c.label()));
+            }
+        }
+    };
+    let (drift, unevaluated): (Vec<&CandidateSummary>, Vec<&CandidateSummary>) = candidates
+        .iter()
+        .filter(|c| c.invoked)
+        .partition(|c| !c.conditions_without_branch_region.is_empty());
+    if !drift.is_empty() {
+        lines.push(format!(
+            "  {} candidate(s) WERE invoked at runtime, and their coverage record has \
+             branch regions for some of the decision's conditions but none at the span of \
+             others. This is most likely a Floyd correlation bug (rustc span drift); please \
+             file an issue with --format=json's `candidates` list.",
+            drift.len()
+        ));
+        for c in &drift {
+            let conds: Vec<String> = c
+                .conditions_without_branch_region
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect();
+            lines.push(format!(
+                "    {}: no branch region for {}",
+                c.label(),
+                conds.join(", ")
+            ));
+        }
+    }
+    if !unevaluated.is_empty() {
+        lines.push(format!(
+            "  {} candidate(s) WERE invoked at runtime, and coverage has a branch region \
+             for every condition of their decision, but no test that entered the function \
+             evaluated the decision (its branch counters are zero), or the counters are \
+             inconsistent with the decision.",
+            unevaluated.len()
+        ));
+        for c in &unevaluated {
+            lines.push(format!("    {}", c.label()));
+        }
+    }
+    let never: Vec<&CandidateSummary> = candidates
+        .iter()
+        .filter(|c| !c.invoked && c.not_measurable.is_none())
+        .collect();
+    if !never.is_empty() {
+        lines.push(format!(
+            "  {} candidate(s) were never invoked by any test — add a test that calls one \
+             of your top-level `pub fn` decisions, or verify which candidates were \
+             considered via --format=json's `candidates` list.",
+            never.len()
+        ));
+        notes(&mut lines, &never);
+    }
+    let not_measurable: Vec<&CandidateSummary> = candidates
+        .iter()
+        .filter(|c| c.not_measurable.is_some())
+        .collect();
+    if !not_measurable.is_empty() {
+        let mut reasons: std::collections::BTreeMap<&str, usize> = Default::default();
+        for nm in not_measurable
+            .iter()
+            .filter_map(|c| c.not_measurable.as_ref())
+        {
+            *reasons
+                .entry(summary::reason_label(&nm.reason))
+                .or_default() += 1;
+        }
+        let reasons: Vec<String> = reasons.iter().map(|(r, n)| format!("{r}: {n}")).collect();
+        lines.push(format!(
+            "  {} candidate(s) are not measurable by coverage ({}): code rustc does not \
+             instrument (such as derive output), code expanded from a dependency's macro, \
+             or decisions rustc emits no branch region for (such as a `match` on an enum). \
+             Whether their decision was evaluated is unknown, not a test gap. See \
+             `not_measurable` in --format=json's `candidates` list.",
+            not_measurable.len(),
+            reasons.join(", ")
+        ));
+        notes(&mut lines, &not_measurable);
+    }
+    lines
+}
+
+/// The note for a candidate that no test Floyd ran entered, when
+/// `package` (the package whose MIR the candidate came from) has
+/// `harness = false` test targets that Floyd skipped: such a target
+/// may be the only code that exercises it (rust-url's `valid_value`
+/// runs only from `data-url/tests/wpt.rs`).
+///
+/// Applies to a never-invoked candidate and to a not-measurable one
+/// whose record was not found or has no branch region, provided no
+/// test entered the function. `None` otherwise.
+fn harness_free_note(
+    join: &correlate::CandidateCoverage,
+    package: &str,
+    skipped_no_harness: &[NoHarnessTarget],
+) -> Option<String> {
+    use correlate::{CoverageStatus, NotMeasurableReason};
+    if join.entered {
+        return None;
+    }
+    let eligible = match &join.status {
+        CoverageStatus::NeverInvoked => true,
+        CoverageStatus::NotMeasurable(nm) => matches!(
+            nm.reason,
+            NotMeasurableReason::NoBranchRegion | NotMeasurableReason::NoCoverageRecord
+        ),
+        CoverageStatus::Invoked => false,
+    };
+    if !eligible {
+        return None;
+    }
+    let mut targets: Vec<String> = skipped_no_harness
+        .iter()
+        .filter(|t| t.package == package)
+        .map(|t| format!("`{}`", t.target))
+        .collect();
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "no test Floyd ran entered this function; it may be exercised by the \
+         `harness = false` test target(s) {} of package `{}`, which Floyd \
+         does not run",
+        targets.join(", "),
+        package_display_name(package)
+    ))
+}
+
+/// The package name in a cargo package id: `data-url` for
+/// `path+file:///w/data-url#0.3.2`, `serde` for
+/// `registry+https://..#serde@1.0.0`, `foo` for the legacy
+/// `foo 0.1.0 (path+file:///w)`. Anything else is returned as is.
+fn package_display_name(id: &str) -> &str {
+    if let Some((name, _)) = id.split_once(' ') {
+        return name;
+    }
+    let Some((url, fragment)) = id.rsplit_once('#') else {
+        return id;
+    };
+    match fragment.split_once('@') {
+        Some((name, _)) => name,
+        None => url
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(id),
     }
 }
 
@@ -491,6 +702,7 @@ fn run_test_mode_cargo(
         mir: floyd::Mir,
         binary_path: std::path::PathBuf,
         tests: Vec<String>,
+        package: String,
     }
 
     struct RawCandidate {
@@ -588,63 +800,68 @@ fn run_test_mode_cargo(
             // are "no boolean decision at all", so they do not
             // belong in the OOS report.
             if decision::has_switchint(f) {
-                if let Some(node) = decision::decompose_function(f) {
-                    let prov = correlate::provenance_for(f);
-                    // `--only=<pattern>` scopes Floyd to the
-                    // functions the user named. On real embedded
-                    // crates the whole-crate scan is both slow and
-                    // noisy — a qualification engineer typically
-                    // has a specific list of safety-critical gates
-                    // they need to prove MC/DC on. If any --only
-                    // pattern is present and this function's name
-                    // doesn't contain any of them, drop it before
-                    // scoring; it will not appear in the verdict
-                    // or in the honest-scope report.
-                    if !only_patterns.is_empty() {
-                        let fn_name = prov.function_name.as_deref().unwrap_or(&f.name);
-                        let hit = only_patterns
-                            .iter()
-                            .any(|pat| fn_name.contains(pat.as_str()));
-                        if !hit {
-                            continue;
-                        }
-                    }
-                    // Reject candidates whose decision spans come
-                    // from inlined-stdlib macro expansions.
-                    // Rustc paths of the form `/rustc/<hash>/library/
-                    // core/src/macros/mod.rs` are the hygiene
-                    // bindings of `assert_eq!`, `debug_assert!`,
-                    // `panic!`, and friends — not user-written
-                    // decisions. On blake3 and other
-                    // test-heavy crates, every `#[test] fn x() {
-                    // assert_eq!(a, b); }` was being flagged as a
-                    // candidate whose "conditions" `left_val` and
-                    // `right_val` are the macro's own locals,
-                    // producing reached-but-unobserved false
-                    // positives in the AllUnobserved verdict.
-                    if is_stdlib_macro_span(prov.source_file.as_deref()) {
+                let (node, lift) = match decision::try_decompose_candidate_lifted(f) {
+                    Ok(decomposed) => decomposed,
+                    Err(reason) => {
+                        // Has a switchInt (so some kind of decision)
+                        // but the decomposer did not match any
+                        // supported pattern. Honest-scope report entry.
+                        let prov = correlate::provenance_for(f);
+                        declined.push(DeclinedFunction {
+                            name: prov.function_name.unwrap_or_default(),
+                            source_file: prov.source_file,
+                            line: prov.line,
+                            reason,
+                        });
                         continue;
                     }
-                    raw_candidates.push(RawCandidate {
-                        tree: floyd::DecisionTree {
-                            decisions: vec![node],
-                        },
-                        prov,
-                        artifact_idx: art_idx,
-                        fn_idx,
-                    });
+                };
+                let prov = floyd::DecisionProvenance {
+                    lift,
+                    ..correlate::provenance_for(f)
+                };
+                // `--only=<pattern>` scopes Floyd to the
+                // functions the user named. On real embedded
+                // crates the whole-crate scan is both slow and
+                // noisy — a qualification engineer typically
+                // has a specific list of safety-critical gates
+                // they need to prove MC/DC on. If any --only
+                // pattern is present and this function's name
+                // doesn't contain any of them, drop it before
+                // scoring; it will not appear in the verdict
+                // or in the honest-scope report.
+                if !only_patterns.is_empty() {
+                    let fn_name = prov.function_name.as_deref().unwrap_or(&f.name);
+                    let hit = only_patterns
+                        .iter()
+                        .any(|pat| fn_name.contains(pat.as_str()));
+                    if !hit {
+                        continue;
+                    }
+                }
+                // Reject candidates whose decision spans come
+                // from inlined-stdlib macro expansions.
+                // Rustc paths of the form `/rustc/<hash>/library/
+                // core/src/macros/mod.rs` are the hygiene
+                // bindings of `assert_eq!`, `debug_assert!`,
+                // `panic!`, and friends — not user-written
+                // decisions. On blake3 and other
+                // test-heavy crates, every `#[test] fn x() {
+                // assert_eq!(a, b); }` was being flagged as a
+                // candidate whose "conditions" `left_val` and
+                // `right_val` are the macro's own locals,
+                // producing reached-but-unobserved false
+                // positives in the AllUnobserved verdict.
+                if is_stdlib_macro_span(prov.source_file.as_deref()) {
                     continue;
                 }
-            }
-            if decision::has_switchint(f) {
-                // Has a switchInt (so some kind of decision) but
-                // the decomposer did not match any supported
-                // pattern. Honest-scope report entry.
-                let prov = correlate::provenance_for(f);
-                declined.push(DeclinedFunction {
-                    name: prov.function_name.unwrap_or_default(),
-                    source_file: prov.source_file,
-                    line: prov.line,
+                raw_candidates.push(RawCandidate {
+                    tree: floyd::DecisionTree {
+                        decisions: vec![node],
+                    },
+                    prov,
+                    artifact_idx: art_idx,
+                    fn_idx,
                 });
             }
         }
@@ -652,6 +869,7 @@ fn run_test_mode_cargo(
             mir,
             binary_path: artifact.binary_path.clone(),
             tests,
+            package: artifact.package_name.clone(),
         });
     }
 
@@ -863,7 +1081,14 @@ fn run_test_mode_cargo(
     let candidate_summaries: Vec<CandidateSummary> = raw_candidates
         .iter()
         .zip(&joins)
-        .map(|(raw, join)| CandidateSummary::new(&raw.prov, join))
+        .map(|(raw, join)| CandidateSummary {
+            note: harness_free_note(
+                join,
+                &artifacts[raw.artifact_idx].package,
+                &skipped_no_harness,
+            ),
+            ..CandidateSummary::new(&raw.prov, join)
+        })
         .collect();
     let candidates: Vec<selector::Candidate> = raw_candidates
         .into_iter()
@@ -878,16 +1103,11 @@ fn run_test_mode_cargo(
             }
         })
         .collect();
-    let count_status = |want: fn(&CandidateSummary) -> bool| {
-        candidate_summaries.iter().filter(|c| want(c)).count()
-    };
-    let reached_count = count_status(|c| c.invoked);
     let not_measurable: Vec<&correlate::NotMeasurable> = candidate_summaries
         .iter()
         .filter_map(|c| c.not_measurable.as_ref())
         .collect();
-    let not_measurable_count = count_status(|c| c.not_measurable.is_some());
-    let unreached_count = candidate_summaries.len() - reached_count - not_measurable_count;
+    let not_measurable_count = not_measurable.len();
     let skipped_mirs: Vec<SkippedMir> = skipped_oversize_mirs
         .iter()
         .map(|(path, bytes)| SkippedMir {
@@ -940,39 +1160,8 @@ fn run_test_mode_cargo(
     let chosen = match selector::pick_best(candidates) {
         selector::PickResult::Picked(c) => c,
         selector::PickResult::AllUnobserved => {
-            eprintln!(
-                "cargo-floyd: Floyd found decomposable boolean \
-                 decisions in your code, but no test produced a \
-                 usable observation for any of them."
-            );
-            if reached_count > 0 {
-                eprintln!(
-                    "  {reached_count} candidate(s) WERE invoked at \
-                     runtime, but Floyd's span-match could not join \
-                     them to a coverage branch region. This is most \
-                     likely a Floyd correlation bug (rustc span \
-                     drift under optimisation); please file an \
-                     issue with --format=json's provenance block."
-                );
-            }
-            if unreached_count > 0 {
-                eprintln!(
-                    "  {unreached_count} candidate(s) were never \
-                     invoked by any test — add a test that calls \
-                     one of your top-level `pub fn` decisions, or \
-                     verify which candidates were considered via \
-                     --format=json's `candidates` list."
-                );
-            }
-            if not_measurable_count > 0 {
-                eprintln!(
-                    "  {not_measurable_count} candidate(s) are not \
-                     measurable by coverage (code rustc does not \
-                     instrument, such as derive output, or code \
-                     expanded from a dependency's macro); whether \
-                     they ran is unknown, not a test gap. See \
-                     `not_measurable` in --format=json's `candidates` list."
-                );
+            for line in all_unobserved_explanation(&candidate_summaries) {
+                eprintln!("{line}");
             }
             return emit_decline(RuntimeVerdict::AllUnobserved);
         }
@@ -1097,12 +1286,15 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     let mut artifact_candidates: Vec<(floyd::DecisionTree, floyd::DecisionProvenance, usize)> =
         Vec::new();
     for (fn_idx, f) in mir.functions.iter().enumerate() {
-        if let Some(node) = decision::decompose_function(f) {
+        if let Ok((node, lift)) = decision::try_decompose_candidate_lifted(f) {
             artifact_candidates.push((
                 floyd::DecisionTree {
                     decisions: vec![node],
                 },
-                correlate::provenance_for(f),
+                floyd::DecisionProvenance {
+                    lift,
+                    ..correlate::provenance_for(f)
+                },
                 fn_idx,
             ));
         }
@@ -1760,6 +1952,7 @@ mod tests {
             name: "crate::f".to_string(),
             source_file: Some("src/lib.rs".to_string()),
             line: Some(7),
+            reason: decision::DeclineReason::NonBoolLeaf,
         }];
         let candidates = vec![
             CandidateSummary {
@@ -1770,6 +1963,9 @@ mod tests {
                 invoked: false,
                 observations: 0,
                 not_measurable: None,
+                note: Some("may be exercised by `wpt`".to_string()),
+                conditions_without_branch_region: Vec::new(),
+                lift: Some(decision::Lift::ValueArms),
             },
             CandidateSummary {
                 function_name: Some(
@@ -1788,6 +1984,9 @@ mod tests {
                     reason: correlate::NotMeasurableReason::Uninstrumented,
                     detail: "no coverage mapping".to_string(),
                 }),
+                note: None,
+                conditions_without_branch_region: Vec::new(),
+                lift: None,
             },
         ];
         let skipped = vec![SkippedMir {
@@ -1815,10 +2014,15 @@ mod tests {
         assert_eq!(v["observations"].as_array().unwrap().len(), 0);
         assert_eq!(v["out_of_scope"][0]["name"], "crate::f");
         assert_eq!(v["out_of_scope"][0]["line"], 7);
+        assert_eq!(v["out_of_scope"][0]["reason"], "non_bool_leaf");
         assert_eq!(v["candidates"][0]["function_name"], "crate::g");
         assert_eq!(v["candidates"][0]["invoked"], false);
         assert_eq!(v["candidates"][0]["display_name"], "crate::g");
         assert!(v["candidates"][0].get("not_measurable").is_none());
+        assert_eq!(v["candidates"][0]["note"], "may be exercised by `wpt`");
+        assert!(v["candidates"][1].get("note").is_none());
+        assert_eq!(v["candidates"][0]["lift"], "value_arms");
+        assert!(v["candidates"][1].get("lift").is_none());
         assert_eq!(v["candidates"][1]["invoked"], false);
         assert_eq!(
             v["candidates"][1]["not_measurable"]["reason"],
@@ -1828,6 +2032,134 @@ mod tests {
         assert_eq!(v["summary"]["conditions_total"], 0);
         assert_eq!(v["summary"]["not_measurable"], 1);
         assert!(v["summary"]["percentage"].is_null());
+    }
+
+    fn coverage(status: correlate::CoverageStatus, entered: bool) -> correlate::CandidateCoverage {
+        correlate::CandidateCoverage {
+            status,
+            observations: Vec::new(),
+            display_name: None,
+            function_keys: Vec::new(),
+            entered,
+            conditions_without_branch_region: Vec::new(),
+        }
+    }
+
+    fn cand_summary(
+        name: &str,
+        invoked: bool,
+        not_measurable: Option<correlate::NotMeasurableReason>,
+        missing: &[&str],
+    ) -> CandidateSummary {
+        CandidateSummary {
+            function_name: Some(name.to_string()),
+            display_name: Some(name.to_string()),
+            source_file: Some("src/lib.rs".to_string()),
+            line: Some(1),
+            invoked,
+            observations: 0,
+            not_measurable: not_measurable.map(|reason| correlate::NotMeasurable {
+                reason,
+                detail: String::new(),
+            }),
+            note: None,
+            conditions_without_branch_region: missing.iter().map(|s| s.to_string()).collect(),
+            lift: None,
+        }
+    }
+
+    #[test]
+    fn correlation_bug_wording_needs_a_condition_missing_beside_present_ones() {
+        use correlate::NotMeasurableReason::NoBranchRegion;
+        let bug = "most likely a Floyd correlation bug";
+        // Invoked, every condition span has a branch region: the
+        // decision was never evaluated; not blamed on Floyd.
+        let text = all_unobserved_explanation(&[cand_summary("f", true, None, &[])]).join("\n");
+        assert!(!text.contains(bug), "{text}");
+        assert!(text.contains("no test that entered the function evaluated the decision"));
+        // No branch region for the decision at all: not measurable,
+        // named by reason.
+        let mut c = cand_summary("g", false, Some(NoBranchRegion), &["x"]);
+        c.note = Some("may be exercised by `wpt`".to_string());
+        let text = all_unobserved_explanation(&[c]).join("\n");
+        assert!(!text.contains(bug), "{text}");
+        assert!(text.contains("(no_branch_region: 1)"), "{text}");
+        assert!(
+            text.contains("    `g` (src/lib.rs:1): may be exercised by `wpt`"),
+            "{text}"
+        );
+        // One condition span missing from a record that has branch
+        // regions for the others: the only correlation-bug case.
+        let text = all_unobserved_explanation(&[cand_summary("h", true, None, &["b"])]).join("\n");
+        assert!(text.contains(bug), "{text}");
+        assert!(
+            text.contains("`h` (src/lib.rs:1): no branch region for `b`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn harness_free_note_names_the_skipped_targets_of_the_package() {
+        use correlate::{CoverageStatus, NotMeasurable, NotMeasurableReason};
+        let skipped = vec![
+            NoHarnessTarget {
+                package: "data-url".to_string(),
+                target: "wpt".to_string(),
+                binary: "target/debug/deps/wpt-1".to_string(),
+            },
+            NoHarnessTarget {
+                package: "idna".to_string(),
+                target: "bench".to_string(),
+                binary: "target/debug/deps/bench-1".to_string(),
+            },
+        ];
+        let no_branch = |entered| {
+            coverage(
+                CoverageStatus::NotMeasurable(NotMeasurable {
+                    reason: NotMeasurableReason::NoBranchRegion,
+                    detail: String::new(),
+                }),
+                entered,
+            )
+        };
+        let note = harness_free_note(&no_branch(false), "data-url", &skipped).expect("a note");
+        assert!(note.contains("`wpt`"), "{note}");
+        assert!(note.contains("`data-url`"), "{note}");
+        assert_eq!(
+            package_display_name("path+file:///w/rust-url/data-url#0.3.2"),
+            "data-url"
+        );
+        assert_eq!(
+            package_display_name(
+                "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0"
+            ),
+            "serde"
+        );
+        assert_eq!(package_display_name("foo 0.1.0 (path+file:///w)"), "foo");
+        assert_eq!(package_display_name("data-url"), "data-url");
+        assert!(!note.contains("bench"), "{note}");
+        let never = coverage(CoverageStatus::NeverInvoked, false);
+        assert!(harness_free_note(&never, "data-url", &skipped).is_some());
+        // Entered by a test Floyd ran, another package, or a reason
+        // unrelated to whether it ran: no note.
+        assert_eq!(
+            harness_free_note(&no_branch(true), "data-url", &skipped),
+            None
+        );
+        assert_eq!(harness_free_note(&never, "url", &skipped), None);
+        let invoked = coverage(CoverageStatus::Invoked, true);
+        assert_eq!(harness_free_note(&invoked, "data-url", &skipped), None);
+        let uninstrumented = coverage(
+            CoverageStatus::NotMeasurable(NotMeasurable {
+                reason: NotMeasurableReason::Uninstrumented,
+                detail: String::new(),
+            }),
+            false,
+        );
+        assert_eq!(
+            harness_free_note(&uninstrumented, "data-url", &skipped),
+            None
+        );
     }
 
     #[test]

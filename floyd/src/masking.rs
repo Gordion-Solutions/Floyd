@@ -232,6 +232,10 @@ pub struct DecisionProvenance {
     /// 1-based line number where the decision starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
+    /// The lift that turned the decision's non-Boolean arms into its
+    /// outcome ([`crate::decision::Lift`]), when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lift: Option<crate::decision::Lift>,
 }
 
 /// Static MC/DC analysis combined with runtime evidence: which
@@ -1036,6 +1040,7 @@ mod tests {
                 source_file: Some("src/lib.rs".to_string()),
                 line: Some(42),
                 display_name: Some("<brakes::Controller>::allow_actuation".to_string()),
+                lift: None,
             }),
             ambiguous_observations: 0,
         };

@@ -23,14 +23,118 @@
 //! Phase 0 recovers arbitrarily-nested combinations of `&&`, `||`,
 //! and `!` from rustc-emitted MIR — anything that lowers to a CFG
 //! of `switchInt`-on-boolean blocks terminating at `const true /
-//! const false / copy <debug-named-local>` leaves. The remaining
+//! const false / copy <debug-named-local>` leaves. A copied leaf is a
+//! condition only when its local is declared `bool` (or, for a
+//! dereference copy, a reference or pointer to `bool`); see
+//! [`DeclineReason::NonBoolLeaf`]. The remaining
 //! handlers (`if let`, `match`, match guards, `?`) are stubs that
 //! graduate alongside their corpus patterns.
+//!
+//! ## Lifts: conditions whose arms are not Boolean
+//!
+//! For MC/DC the decision is the Boolean condition expression; what
+//! its arms compute does not matter. When the arms of a `bool`
+//! `switchInt` produce no Boolean leaf, two lifts take the arm taken
+//! as the decision's outcome (`then` arm `true`, `else` arm
+//! `false`), and the conditions' `llvm-cov` branch counters supply
+//! the observations exactly as for a Boolean-leaf decision. Which
+//! lift fired is reported as a [`Lift`].
+//!
+//! - **Call arms** ([`Lift::CallArms`]): both arms of one `switchInt`
+//!   end in non-panic calls or checked-operation `assert`s that
+//!   rejoin without diverging (`arms_are_non_panic_calls`).
+//! - **Value arms** ([`Lift::ValueArms`]): tried only at the
+//!   decomposition root, and only when every other handler declined.
+//!   The root's `bool` `switchInt`, and every `bool` `switchInt` it
+//!   reaches through coverage-only `goto` blocks, form a
+//!   short-circuit condition chain; the chain must end in exactly two
+//!   arm blocks that run through `goto`s and checked-arithmetic
+//!   `assert`s only (no call, branch or return) into one join block
+//!   outside the chain, and
+//!   both arms must write one common non-`bool` local before the
+//!   join (`if upper { 7 } else { 39 }`, `if -86400 < secs && secs <
+//!   86400 { Some(..) } else { None }`). A third arm (an `if` nested
+//!   in an arm, an `else if`), an arm that loops, calls or returns,
+//!   arms writing different locals, an `if` without `else`, and a
+//!   `bool` join value all decline. See `lift_value_arms`.
+//!
+//! Both lifts label outcomes by `switchInt` edge, so for a negated
+//! last condition (`if a && !b`) the source `else` arm is the `true`
+//! outcome. Independence pairs are the same under either labelling.
+//! Leaves stay Boolean: a non-`bool` local is never a condition.
+
+use std::cell::Cell;
 
 use crate::mir::{
     BlockId, CompareOp, LocalId, MirBlock, MirFunction, MirStatement, MirTerminator, Operand,
 };
 use crate::Mir;
+
+/// Why the decomposer declined a function that has a `switchInt`.
+///
+/// Serialised in snake case (`unsupported_shape`, `non_bool_leaf`,
+/// `no_conditions`, `ctfe_body`)
+/// as the `reason` of each `out_of_scope` entry in
+/// `cargo floyd test --format=json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclineReason {
+    /// The control flow does not match any decision shape the
+    /// engine's handlers recognise.
+    UnsupportedShape,
+    /// An arm's value is a debug-named local that is not `bool`
+    /// (for example `if sh == 0 { a } else { .. }` returning a
+    /// struct `a`). The value is not a Boolean condition, so the
+    /// arm, and with it the decision, is declined instead of
+    /// reporting the local as a condition.
+    NonBoolLeaf,
+    /// The function decomposed, but the tree tests no condition (a
+    /// bare `Const`). There is nothing for MC/DC to measure; such a
+    /// tree comes from a body whose entry block reaches a constant
+    /// without branching, not from a Boolean decision.
+    NoConditions,
+    /// The body is the `// MIR FOR CTFE` rendering of a `const fn`
+    /// ([`MirFunction::is_ctfe`]). It is not decomposed: it never
+    /// runs at runtime, and the function's runtime body, parsed
+    /// separately under the same name, is the candidate.
+    CtfeBody,
+}
+
+/// Which lift turned a Boolean condition with non-Boolean arms into
+/// a decision whose outcome is the arm taken.
+///
+/// Recorded per candidate (`lift` in `cargo floyd test
+/// --format=json`) for triage. Serialised in snake case
+/// (`call_arms`, `value_arms`). A decision with no lift reads its
+/// outcome from Boolean leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lift {
+    /// Both arms of a `bool` `switchInt` end in non-panic calls or
+    /// checked-operation `assert`s (see `arms_are_non_panic_calls`).
+    CallArms,
+    /// Both arms of a `bool` condition (or a short-circuit chain of
+    /// them) are straight-line blocks writing one non-`bool` value
+    /// before they join (see `lift_value_arms`).
+    ValueArms,
+}
+
+thread_local! {
+    /// Set when the call-arm lift fires during the current
+    /// [`decompose_from_block`] call. Read only when that call
+    /// returns a decision.
+    static CALL_ARMS_LIFT_SEEN: Cell<bool> = const { Cell::new(false) };
+    /// Set when [`extract_terminal_value`] rejects a non-`bool` leaf
+    /// during the current [`try_decompose_from_block`] call. Read
+    /// only when that call declines, to report
+    /// [`DeclineReason::NonBoolLeaf`].
+    static NON_BOOL_LEAF_SEEN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Record that a leaf was declined because its local is not `bool`.
+fn note_non_bool_leaf() {
+    NON_BOOL_LEAF_SEEN.with(|seen| seen.set(true));
+}
 
 /// A set of per-decision condition trees recovered from a single
 /// translation unit's MIR.
@@ -202,10 +306,82 @@ pub fn decompose_function(f: &MirFunction) -> Option<Node> {
 /// recognised as a decision by any decomposer handler, or when
 /// `block_id` does not identify a block in `f`.
 pub fn decompose_from_block(f: &MirFunction, block_id: BlockId) -> Option<Node> {
+    decompose_from_block_lifted(f, block_id).map(|(node, _)| node)
+}
+
+/// [`decompose_from_block`], with the [`Lift`] that produced the
+/// decision, if any. The ordinary handlers run first; only when they
+/// decline is the value-arm lift tried at `block_id`.
+fn decompose_from_block_lifted(f: &MirFunction, block_id: BlockId) -> Option<(Node, Option<Lift>)> {
     if !f.blocks.iter().any(|b| b.id == block_id) {
         return None;
     }
-    build_decision_from_block(block_id, f)
+    CALL_ARMS_LIFT_SEEN.with(|seen| seen.set(false));
+    let node = build_decision_from_block(block_id, f);
+    let call_arms = CALL_ARMS_LIFT_SEEN.with(|seen| seen.replace(false));
+    match node {
+        Some(node) => Some((node, call_arms.then_some(Lift::CallArms))),
+        None => lift_value_arms(block_id, f).map(|node| (node, Some(Lift::ValueArms))),
+    }
+}
+
+/// [`decompose_function`], with the reason when it declines.
+pub fn try_decompose_function(f: &MirFunction) -> Result<Node, DeclineReason> {
+    match f.blocks.first() {
+        Some(entry) => try_decompose_from_block(f, entry.id),
+        None => Err(DeclineReason::UnsupportedShape),
+    }
+}
+
+/// [`decompose_from_block`], with the reason when it declines.
+///
+/// The reason is [`DeclineReason::NonBoolLeaf`] when a leaf on the
+/// attempted decomposition was rejected because its local is not
+/// `bool`, otherwise [`DeclineReason::UnsupportedShape`].
+pub fn try_decompose_from_block(f: &MirFunction, block_id: BlockId) -> Result<Node, DeclineReason> {
+    try_decompose_from_block_lifted(f, block_id).map(|(node, _)| node)
+}
+
+/// [`try_decompose_from_block`], with the [`Lift`] that produced the
+/// decision, if any.
+fn try_decompose_from_block_lifted(
+    f: &MirFunction,
+    block_id: BlockId,
+) -> Result<(Node, Option<Lift>), DeclineReason> {
+    NON_BOOL_LEAF_SEEN.with(|seen| seen.set(false));
+    let node = decompose_from_block_lifted(f, block_id);
+    let non_bool_leaf = NON_BOOL_LEAF_SEEN.with(|seen| seen.replace(false));
+    node.ok_or(if non_bool_leaf {
+        DeclineReason::NonBoolLeaf
+    } else {
+        DeclineReason::UnsupportedShape
+    })
+}
+
+/// Decompose `f` as an MC/DC candidate: decline a CTFE body
+/// ([`DeclineReason::CtfeBody`]) without decomposing it, otherwise
+/// [`try_decompose_function`], then decline a tree that tests no
+/// condition ([`DeclineReason::NoConditions`]).
+pub fn try_decompose_candidate(f: &MirFunction) -> Result<Node, DeclineReason> {
+    try_decompose_candidate_lifted(f).map(|(node, _)| node)
+}
+
+/// [`try_decompose_candidate`], with the [`Lift`] that produced the
+/// decision, if any.
+pub fn try_decompose_candidate_lifted(
+    f: &MirFunction,
+) -> Result<(Node, Option<Lift>), DeclineReason> {
+    if f.is_ctfe {
+        return Err(DeclineReason::CtfeBody);
+    }
+    let Some(entry) = f.blocks.first() else {
+        return Err(DeclineReason::UnsupportedShape);
+    };
+    let (node, lift) = try_decompose_from_block_lifted(f, entry.id)?;
+    if crate::masking::collect_conditions(&node).is_empty() {
+        return Err(DeclineReason::NoConditions);
+    }
+    Ok((node, lift))
 }
 
 /// Guard for the branch-taken-as-result lift: both arms of a
@@ -250,6 +426,260 @@ fn arms_are_non_panic_calls(f: &MirFunction, else_arm_id: BlockId, then_arm_id: 
     let else_path = arm_continuation(f, else_arm_id);
     let then_path = arm_continuation(f, then_arm_id);
     !private_path_diverges(&else_path, &then_path) && !private_path_diverges(&then_path, &else_path)
+}
+
+/// Most condition blocks [`lift_value_arms`] accepts in one decision.
+const MAX_VALUE_ARM_CONDITIONS: usize = 16;
+
+/// Most blocks [`value_arm_chain`] and [`skip_inert_gotos`] follow.
+const MAX_VALUE_ARM_BLOCKS: usize = 32;
+
+/// Value-arm lift: a Boolean decision whose two outcomes are plain
+/// non-`bool` values (`if upper { 7 } else { 39 }`, `if -86400 < secs
+/// && secs < 86400 { Some(..) } else { None }`).
+///
+/// Tried only at the decomposition root, and only after the ordinary
+/// handlers (the call-arm lift included) declined it, so it never
+/// replaces a decision they recover and its result is never nested
+/// inside another decision. The rule, all of which must hold:
+///
+/// 1. `root` ends in a `switchInt` on a `bool` local with a nameable
+///    condition (a debug name or an inline comparison). Following
+///    the `switchInt` targets, skipping blocks that hold only
+///    coverage / storage markers and a `goto`, every further block
+///    that is itself such a `switchInt` is another condition of the
+///    same short-circuit chain. Blocks of the chain do not write the
+///    return place `_0`, and the chain has at most
+///    [`MAX_VALUE_ARM_CONDITIONS`] conditions and no cycle.
+/// 2. The chain ends in exactly two distinct arm blocks. A third
+///    arm, as `if a { if b { .. } else { .. } } else { .. }` has,
+///    means an arm holds a decision of its own: the function is
+///    declined, not lifted.
+/// 3. Each arm runs straight-line through `goto`s and checked-
+///    operation `assert`s only (no call, no `switchInt`, no return)
+///    into a join block that both arms reach, and neither arm, nor
+///    the join, is a block of the condition chain (a loop back
+///    edge).
+/// 4. Both arms write one common local before the join (the return
+///    place, or the `let` the `if` initialises), and that local is
+///    not `bool`. A `bool` value is the ordinary handlers' job; a
+///    `bool` write on both arms is typically a drop flag.
+/// 5. Every condition `switchInt` whose two targets are both arms
+///    sends its `otherwise` edge to the same arm. That arm is
+///    outcome `true`, the other `false`.
+///
+/// The outcome labels follow the `switchInt` edges, like the
+/// call-arm lift: for `if a && !b` the source `else` arm is labelled
+/// `true`. MC/DC independence pairs do not depend on which outcome
+/// is called `true`, only on the two being told apart, which they
+/// are.
+fn lift_value_arms(root: BlockId, f: &MirFunction) -> Option<Node> {
+    let mut conditions: Vec<(BlockId, String, BlockId, BlockId)> = Vec::new();
+    let mut arms: Vec<BlockId> = Vec::new();
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
+        if conditions.iter().any(|c| c.0 == id) {
+            continue;
+        }
+        match value_arm_condition(id, f) {
+            Some((name, else_id, then_id)) => {
+                if conditions.len() >= MAX_VALUE_ARM_CONDITIONS {
+                    return None;
+                }
+                let else_id = skip_inert_gotos(f, else_id);
+                let then_id = skip_inert_gotos(f, then_id);
+                conditions.push((id, name, else_id, then_id));
+                pending.push(else_id);
+                pending.push(then_id);
+            }
+            None if id == root => return None,
+            None => {
+                if !arms.contains(&id) {
+                    arms.push(id);
+                }
+            }
+        }
+    }
+    if arms.len() != 2 {
+        return None;
+    }
+    let mut orientation: Option<(BlockId, BlockId)> = None;
+    for &(_, _, else_id, then_id) in &conditions {
+        if arms.contains(&else_id) && arms.contains(&then_id) {
+            if else_id == then_id || orientation.is_some_and(|o| o != (then_id, else_id)) {
+                return None;
+            }
+            orientation = Some((then_id, else_id));
+        }
+    }
+    let (then_arm, else_arm) = orientation?;
+    if !arms_join_with_value(f, then_arm, else_arm, &conditions) {
+        return None;
+    }
+    value_arm_tree(root, &conditions, then_arm, &mut Vec::new())
+}
+
+/// A block of a value-arm condition chain: its `switchInt` tests a
+/// nameable `bool` local (`[0: else, otherwise: then]`) and no
+/// statement writes `_0`. Returns the condition name and the
+/// `else` and `then` targets.
+fn value_arm_condition(id: BlockId, f: &MirFunction) -> Option<(String, BlockId, BlockId)> {
+    let block = f.blocks.iter().find(|b| b.id == id)?;
+    let MirTerminator::SwitchInt {
+        discr,
+        targets,
+        otherwise,
+        ..
+    } = &block.terminator
+    else {
+        return None;
+    };
+    if local_type(f, *discr) != Some("bool") || targets.len() != 1 || targets[0].0 != 0 {
+        return None;
+    }
+    let writes_return_place = block
+        .statements
+        .iter()
+        .any(|s| statement_dst(s).or_else(|| other_statement_dst(s)) == Some(RETURN_PLACE));
+    if writes_return_place {
+        return None;
+    }
+    let name = match f.debug_names.get(discr) {
+        Some(name) => name.clone(),
+        None => synthesize_compare_name(block, *discr, f)?,
+    };
+    Some((name, targets[0].1, *otherwise))
+}
+
+/// Is `stmt` a marker with no value: a coverage counter,
+/// `StorageLive`, `StorageDead`, or any other unparsed statement
+/// that is not an assignment?
+fn is_inert_statement(stmt: &MirStatement) -> bool {
+    matches!(stmt, MirStatement::Other { text, .. } if !text.contains(" = "))
+}
+
+/// Follow `goto`s out of `start` through blocks that hold only
+/// inert statements ([`is_inert_statement`]), and return the first
+/// block that does something else. rustc emits such a block per
+/// short-circuit exit (`bb2: { Coverage::VirtualCounter(bcb6); goto
+/// -> bb5; }`), so the `else` arm of `a && b` is reached through two
+/// of them.
+fn skip_inert_gotos(f: &MirFunction, start: BlockId) -> BlockId {
+    let mut current = start;
+    let mut seen = Vec::new();
+    while seen.len() < MAX_VALUE_ARM_BLOCKS && !seen.contains(&current) {
+        seen.push(current);
+        let Some(block) = f.blocks.iter().find(|b| b.id == current) else {
+            break;
+        };
+        match &block.terminator {
+            MirTerminator::Goto { target, .. }
+                if block.statements.iter().all(is_inert_statement) =>
+            {
+                current = *target;
+            }
+            _ => break,
+        }
+    }
+    current
+}
+
+/// The blocks control runs through from `start` along `goto`s and
+/// the `success` edges of rustc's checked-operation `assert`s
+/// (overflow, bounds, division by zero): each such block and then
+/// the first block that is neither (or the first block seen twice).
+///
+/// A checked-operation `assert` is part of computing the arm's value
+/// (`Some(FixedOffset { local_minus_utc: -secs })` checks the
+/// negation); rustc never lowers a user `assert!` to one, that is a
+/// `switchInt` and a panic call.
+fn value_arm_chain(f: &MirFunction, start: BlockId) -> Vec<BlockId> {
+    let mut chain = Vec::new();
+    let mut current = start;
+    while chain.len() < MAX_VALUE_ARM_BLOCKS && !chain.contains(&current) {
+        chain.push(current);
+        let Some(block) = f.blocks.iter().find(|b| b.id == current) else {
+            break;
+        };
+        match &block.terminator {
+            MirTerminator::Goto { target, .. } => current = *target,
+            MirTerminator::Assert { success, .. } => current = *success,
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// Rules 3 and 4 of [`lift_value_arms`]: the two arms run through
+/// `goto`s and checked-operation `assert`s ([`value_arm_chain`])
+/// into a common join block outside the condition chain and
+/// both write a common non-`bool` local on the way.
+fn arms_join_with_value(
+    f: &MirFunction,
+    then_arm: BlockId,
+    else_arm: BlockId,
+    conditions: &[(BlockId, String, BlockId, BlockId)],
+) -> bool {
+    let then_chain = value_arm_chain(f, then_arm);
+    let else_chain = value_arm_chain(f, else_arm);
+    let Some(else_join) = else_chain.iter().position(|b| then_chain.contains(b)) else {
+        return false;
+    };
+    let join = else_chain[else_join];
+    let then_join = then_chain
+        .iter()
+        .position(|b| *b == join)
+        .expect("join is on the then chain");
+    if then_join == 0 || else_join == 0 {
+        // One arm is the join itself: an `if` without `else`.
+        return false;
+    }
+    let then_private = &then_chain[..then_join];
+    let else_private = &else_chain[..else_join];
+    let in_chain = |b: &BlockId| conditions.iter().any(|c| c.0 == *b);
+    if then_private.iter().chain(else_private).any(in_chain) || in_chain(&join) {
+        return false;
+    }
+    let writes = |blocks: &[BlockId]| -> Vec<LocalId> {
+        blocks
+            .iter()
+            .filter_map(|id| f.blocks.iter().find(|b| b.id == *id))
+            .flat_map(|b| b.statements.iter())
+            .filter_map(|s| statement_dst(s).or_else(|| other_statement_dst(s)))
+            .collect()
+    };
+    let else_writes = writes(else_private);
+    writes(then_private).iter().any(|local| {
+        else_writes.contains(local) && local_type(f, *local).is_some_and(|ty| !is_bool_type(ty))
+    })
+}
+
+/// Build the lifted tree from condition block `id`: an [`Node::Ite`]
+/// per condition, [`Node::Const`] `true` at `then_arm` and `false`
+/// at the other arm. `None` on a cycle through `path`.
+fn value_arm_tree(
+    id: BlockId,
+    conditions: &[(BlockId, String, BlockId, BlockId)],
+    then_arm: BlockId,
+    path: &mut Vec<BlockId>,
+) -> Option<Node> {
+    let Some((_, name, else_id, then_id)) = conditions.iter().find(|c| c.0 == id) else {
+        return Some(Node::Const {
+            value: id == then_arm,
+        });
+    };
+    if path.contains(&id) {
+        return None;
+    }
+    path.push(id);
+    let then_branch = value_arm_tree(*then_id, conditions, then_arm, path)?;
+    let else_branch = value_arm_tree(*else_id, conditions, then_arm, path)?;
+    path.pop();
+    Some(Node::Ite {
+        cond: name.clone(),
+        then_branch: Box::new(then_branch),
+        else_branch: Box::new(else_branch),
+    })
 }
 
 /// Is `func_text` (a call's function expression) one of rustc's
@@ -509,6 +939,7 @@ fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node>
                         // panic/noreturn Calls are rejected via
                         // `arms_are_non_panic_calls` so assert /
                         // unwrap / expect patterns do not fire.
+                        CALL_ARMS_LIFT_SEEN.with(|seen| seen.set(true));
                         return Some(handle_boolean(&BoolExpr {
                             cond,
                             then_branch: Node::Const { value: true },
@@ -532,8 +963,9 @@ fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node>
 }
 
 /// Type of a local as declared in the function header or `let`
-/// declarations. Returns `None` for synthetic locals (return place,
-/// temporaries) that don't appear in either list.
+/// declarations. rustc declares every local it uses, the return
+/// place `_0` and temporaries included, so `None` means the local
+/// is not part of `f`.
 pub(crate) fn local_type(f: &MirFunction, local: LocalId) -> Option<&str> {
     f.args
         .iter()
@@ -545,6 +977,43 @@ pub(crate) fn local_type(f: &MirFunction, local: LocalId) -> Option<&str> {
                 .find(|l| l.local == local)
                 .map(|l| l.ty.as_str())
         })
+}
+
+/// Is the MIR type text `ty` exactly `bool`?
+fn is_bool_type(ty: &str) -> bool {
+    ty.trim() == "bool"
+}
+
+/// The pointee of a reference or raw-pointer type as MIR prints it
+/// (`&T`, `&mut T`, `&'a T`, `&'a mut T`, `*const T`, `*mut T`), or
+/// `None` for any other type. Only one level is removed, so the
+/// pointee of `&&bool` is `&bool`.
+fn pointee_type(ty: &str) -> Option<&str> {
+    let ty = ty.trim();
+    let pointee = if let Some(rest) = ty.strip_prefix('&') {
+        let rest = rest.trim_start();
+        let rest = match rest.strip_prefix('\'') {
+            Some(lifetime) => lifetime.split_once(' ')?.1,
+            None => rest,
+        };
+        rest.strip_prefix("mut ").unwrap_or(rest)
+    } else if let Some(rest) = ty.strip_prefix("*const ") {
+        rest
+    } else {
+        ty.strip_prefix("*mut ")?
+    };
+    Some(pointee.trim())
+}
+
+/// Does reading `local` (its pointee when `deref`) produce a `bool`?
+/// False when the local's type is not declared in `f`: a leaf of
+/// unknown type is never assumed to be Boolean.
+fn reads_bool(f: &MirFunction, local: LocalId, deref: bool) -> bool {
+    match local_type(f, local) {
+        Some(ty) if deref => pointee_type(ty).is_some_and(is_bool_type),
+        Some(ty) => is_bool_type(ty),
+        None => false,
+    }
 }
 
 /// Recover a literal `match` decision rooted at `block`.
@@ -1123,6 +1592,15 @@ const RETURN_PLACE: LocalId = 0;
 /// Writes to an intermediate local that flow out through a `goto`
 /// (`_6 = copy _2; goto -> bb7` with `bb7: _0 = Some(move _6)`)
 /// remain values.
+///
+/// A leaf read from a debug-named local (a copy, a dereference copy,
+/// a `Not`, a by-value closure capture) is a [`Node::Condition`]
+/// only when the value read is declared `bool`. Otherwise the block's
+/// value is not Boolean (`_0 = copy _1` with `_1: I256`, `_0 =
+/// Not(copy _2)` on an integer, a call result of type `u32`): the
+/// block yields `None`, so the arm and the decision decline, and the
+/// decline is recorded as [`DeclineReason::NonBoolLeaf`]. Comparisons
+/// produce `bool` by construction and need no check.
 fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
     // An assignment is a terminal value only if its destination
     // doesn't feed a `switchInt` — either this block's own terminator
@@ -1216,6 +1694,17 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
         if in_block_switchint.is_some() && dst != RETURN_PLACE {
             return false;
         }
+        // A `goto` block's write to a local other than `_0` is the
+        // block's value only when it reaches `_0` downstream (the
+        // join block reads it into the return place). Otherwise it is
+        // bookkeeping: a drop flag (`_25 = const false; goto -> bb1`
+        // at the top of a loop), or a local the rest of the body
+        // reads for something else.
+        if let MirTerminator::Goto { target, .. } = &block.terminator {
+            if dst != RETURN_PLACE && !feeds_switchint(dst) && !flows_to_return(f, *target, dst) {
+                return false;
+            }
+        }
         !block.statements[idx + 1..]
             .iter()
             .any(|later| statement_reads(later, dst))
@@ -1232,8 +1721,14 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
             MirStatement::AssignConstBool { dst, value, .. } if !feeds_switchint(*dst) => {
                 return Some(Node::Const { value: *value });
             }
-            MirStatement::AssignCopy { dst, src, .. } if !feeds_switchint(*dst) => {
+            MirStatement::AssignCopy {
+                dst, src, deref, ..
+            } if !feeds_switchint(*dst) => {
                 if let Some(name) = f.debug_names.get(src) {
+                    if !reads_bool(f, *src, *deref) {
+                        note_non_bool_leaf();
+                        return None;
+                    }
                     return Some(Node::Condition { name: name.clone() });
                 }
             }
@@ -1249,7 +1744,13 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
                 // inversion, per-test observations would display
                 // the Not's output under the raw-input name,
                 // confusing the reader.)
+                // On an integer, `Not` is bitwise complement, not a
+                // Boolean negation.
                 if let Some(name) = f.debug_names.get(src) {
+                    if !reads_bool(f, *src, false) {
+                        note_non_bool_leaf();
+                        return None;
+                    }
                     return Some(Node::Condition {
                         name: format!("!{name}"),
                     });
@@ -1275,6 +1776,10 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
                 // source-level name, so this dst is the terminal
                 // Condition leaf.
                 if let Some(name) = f.debug_names.get(dst) {
+                    if !reads_bool(f, *dst, false) {
+                        note_non_bool_leaf();
+                        return None;
+                    }
                     return Some(Node::Condition { name: name.clone() });
                 }
             }
@@ -1286,6 +1791,81 @@ fn extract_terminal_value(block: &MirBlock, f: &MirFunction) -> Option<Node> {
         }
     }
     None
+}
+
+/// Most blocks [`flows_to_return`] follows before giving up.
+const FLOW_STEP_CAP: usize = 64;
+
+/// Does the value of `local`, as written just before a `goto` to
+/// `start`, reach the return place `_0`?
+///
+/// Follows the straight-line path from `start` (through `goto`, the
+/// `success` edge of an `assert` and the return edge of a call whose
+/// destination is not `_0`) and tracks `local` and any local it is
+/// copied or moved into. The answer is `true` at the first
+/// statement that writes `_0` and reads a tracked local
+/// (`_0 = copy _6`, `_0 = Option::<bool>::Some(move _6)`), and
+/// `false` when `_0` is written from something else, every tracked
+/// local is overwritten, or the path branches, returns or leaves
+/// the shapes above. A drop flag never reaches `_0`: it is read
+/// only by the drop-elaboration `switchInt`s that guard a `drop`.
+fn flows_to_return(f: &MirFunction, start: BlockId, local: LocalId) -> bool {
+    let mut tracked: Vec<LocalId> = vec![local];
+    let mut seen: Vec<BlockId> = Vec::new();
+    let mut cur = start;
+    for _ in 0..FLOW_STEP_CAP {
+        if seen.contains(&cur) {
+            return false;
+        }
+        seen.push(cur);
+        let Some(block) = f.blocks.iter().find(|b| b.id == cur) else {
+            return false;
+        };
+        for stmt in &block.statements {
+            let reads_tracked = tracked.iter().any(|l| statement_reads(stmt, *l));
+            let Some(dst) = statement_dst(stmt).or_else(|| other_statement_dst(stmt)) else {
+                continue;
+            };
+            if dst == RETURN_PLACE {
+                return reads_tracked;
+            }
+            if reads_tracked {
+                if !tracked.contains(&dst) {
+                    tracked.push(dst);
+                }
+            } else {
+                tracked.retain(|l| *l != dst);
+                if tracked.is_empty() {
+                    return false;
+                }
+            }
+        }
+        cur = match &block.terminator {
+            MirTerminator::Goto { target, .. } => *target,
+            MirTerminator::Assert { success, .. } => *success,
+            MirTerminator::Call { dst, target, .. } if *dst != RETURN_PLACE => {
+                tracked.retain(|l| l != dst);
+                if tracked.is_empty() {
+                    return false;
+                }
+                *target
+            }
+            _ => return false,
+        };
+    }
+    false
+}
+
+/// Destination of an unparsed [`MirStatement::Other`] assignment
+/// (`_0 = Option::<bool>::Some(move _6)`, `_4 = const 0_u64`), read
+/// from its leading `_<N> = `. Projections (`(_1.0: u32) = ..`) and
+/// non-assignments yield `None`.
+fn other_statement_dst(stmt: &MirStatement) -> Option<LocalId> {
+    let MirStatement::Other { text, .. } = stmt else {
+        return None;
+    };
+    let (lhs, _) = text.split_once(" = ")?;
+    parse_plain_local(lhs.trim())
 }
 
 /// Fold a `<intermediate> = ...; goto <succ>` block into the arm of
@@ -3476,6 +4056,730 @@ fn check(_1: usize, _2: &[u8]) -> Vec<u8> {
         assert_eq!(decompose_function(f), None);
     }
 
+    /// `cargo floyd test` MIR (rustc nightly 1.101, coverage flags,
+    /// comment-only lines stripped) for `fixed` 1.x
+    /// `src/int256.rs`:
+    ///
+    /// ```text
+    /// pub const fn shl_i256_max_128(a: I256, sh: u32) -> I256 {
+    ///     if sh == 0 {
+    ///         a
+    ///     } else if sh == 128 {
+    ///         I256 { lo: a.hi as u128, hi: a.hi >> 127 }
+    ///     } else {
+    ///         I256 {
+    ///             lo: (a.lo >> sh) | (a.hi << (128 - sh)) as u128,
+    ///             hi: a.hi >> sh,
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Both renderings rustc prints for a `const fn`: the runtime
+    /// body, then the `// MIR FOR CTFE` body. The `sh == 0` arm is
+    /// `_0 = copy _1` with `_1: int256::I256`.
+    const SHL_I256_MAX_128_MIR: &str = r#"
+fn shl_i256_max_128(_1: int256::I256, _2: u32) -> int256::I256 {
+    debug a => _1;                       // in scope 0 at src/int256.rs:211:31: 211:32
+    debug sh => _2;                      // in scope 0 at src/int256.rs:211:40: 211:42
+    let mut _0: int256::I256;            // return place in scope 0 at src/int256.rs:211:52: 211:56
+    let mut _3: bool;                    // in scope 0 at src/int256.rs:212:8: 212:15
+    let mut _4: bool;                    // in scope 0 at src/int256.rs:214:15: 214:24
+    let mut _5: u128;                    // in scope 0 at src/int256.rs:216:17: 216:29
+    let mut _6: i128;                    // in scope 0 at src/int256.rs:216:17: 216:21
+    let mut _7: i128;                    // in scope 0 at src/int256.rs:217:17: 217:28
+    let mut _8: i128;                    // in scope 0 at src/int256.rs:217:17: 217:21
+    let mut _9: u32;                     // in scope 0 at src/int256.rs:217:17: 217:28
+    let mut _10: bool;                   // in scope 0 at src/int256.rs:217:17: 217:28
+    let mut _11: u128;                   // in scope 0 at src/int256.rs:221:17: 221:60
+    let mut _12: u128;                   // in scope 0 at src/int256.rs:221:17: 221:29
+    let mut _13: u128;                   // in scope 0 at src/int256.rs:221:18: 221:22
+    let mut _14: bool;                   // in scope 0 at src/int256.rs:221:17: 221:29
+    let mut _15: u128;                   // in scope 0 at src/int256.rs:221:32: 221:60
+    let mut _16: i128;                   // in scope 0 at src/int256.rs:221:32: 221:52
+    let mut _17: i128;                   // in scope 0 at src/int256.rs:221:33: 221:37
+    let mut _18: u32;                    // in scope 0 at src/int256.rs:221:41: 221:51
+    let mut _19: (u32, bool);            // in scope 0 at src/int256.rs:221:41: 221:51
+    let mut _20: bool;                   // in scope 0 at src/int256.rs:221:32: 221:52
+    let mut _21: i128;                   // in scope 0 at src/int256.rs:222:17: 222:27
+    let mut _22: i128;                   // in scope 0 at src/int256.rs:222:17: 222:21
+    let mut _23: bool;                   // in scope 0 at src/int256.rs:222:17: 222:27
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/int256.rs:212:8: 212:15 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/int256.rs:214:15: 214:24 (#0)
+
+    coverage Code { bcb: bcb0 } => src/int256.rs:211:1: 211:56 (#0);
+    coverage Code { bcb: bcb0 } => src/int256.rs:212:8: 212:15 (#0);
+    coverage Code { bcb: bcb1 } => src/int256.rs:213:9: 213:10 (#0);
+    coverage Code { bcb: bcb3 } => src/int256.rs:214:15: 214:24 (#0);
+    coverage Code { bcb: bcb4 } => src/int256.rs:216:17: 216:29 (#0);
+    coverage Code { bcb: bcb4 } => src/int256.rs:215:9: 218:10 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:221:17: 221:29 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:221:33: 221:37 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:221:17: 221:60 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:220:9: 223:10 (#0);
+    coverage Code { bcb: bcb2 } => src/int256.rs:225:1: 225:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => src/int256.rs:212:8: 212:15 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb6 } => src/int256.rs:214:15: 214:24 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/int256.rs:212:8: 212:15
+        _3 = Eq(copy _2, const 0_u32);   // scope 0 at src/int256.rs:212:8: 212:15
+        switchInt(move _3) -> [0: bb2, otherwise: bb1]; // scope 0 at src/int256.rs:212:8: 212:15
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/int256.rs:212:5: 224:6
+        _0 = copy _1;                    // scope 0 at src/int256.rs:213:9: 213:10
+        goto -> bb11;                    // scope 0 at src/int256.rs:212:5: 224:6
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/int256.rs:214:15: 214:24
+        _4 = Eq(copy _2, const 128_u32); // scope 0 at src/int256.rs:214:15: 214:24
+        switchInt(move _4) -> [0: bb4, otherwise: bb3]; // scope 0 at src/int256.rs:214:15: 214:24
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at src/int256.rs:217:17: 217:28
+        _6 = copy (_1.1: i128);          // scope 0 at src/int256.rs:216:17: 216:21
+        _5 = move _6 as u128 (IntToInt); // scope 0 at src/int256.rs:216:17: 216:29
+        _8 = copy (_1.1: i128);          // scope 0 at src/int256.rs:217:17: 217:21
+        _9 = const 127_i32 as u32 (IntToInt); // scope 0 at src/int256.rs:217:17: 217:28
+        _10 = Lt(move _9, const 128_u32); // scope 0 at src/int256.rs:217:17: 217:28
+        assert(move _10, "attempt to shift right by `{}`, which would overflow", const 127_i32) -> [success: bb5, unwind continue]; // scope 0 at src/int256.rs:217:17: 217:28
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at src/int256.rs:221:17: 221:29
+        _13 = copy (_1.0: u128);         // scope 0 at src/int256.rs:221:18: 221:22
+        _14 = Lt(copy _2, const 128_u32); // scope 0 at src/int256.rs:221:17: 221:29
+        assert(move _14, "attempt to shift right by `{}`, which would overflow", copy _2) -> [success: bb6, unwind continue]; // scope 0 at src/int256.rs:221:17: 221:29
+    }
+
+    bb5: {
+        _7 = Shr(move _8, const 127_i32); // scope 0 at src/int256.rs:217:17: 217:28
+        _0 = int256::I256 { lo: move _5, hi: move _7 }; // scope 0 at src/int256.rs:215:9: 218:10
+        goto -> bb10;                    // scope 0 at src/int256.rs:214:12: 224:6
+    }
+
+    bb6: {
+        _12 = Shr(move _13, copy _2);    // scope 0 at src/int256.rs:221:17: 221:29
+        _17 = copy (_1.1: i128);         // scope 0 at src/int256.rs:221:33: 221:37
+        _19 = SubWithOverflow(const 128_u32, copy _2); // scope 0 at src/int256.rs:221:41: 221:51
+        assert(!move (_19.1: bool), "attempt to compute `{} - {}`, which would overflow", const 128_u32, copy _2) -> [success: bb7, unwind continue]; // scope 0 at src/int256.rs:221:41: 221:51
+    }
+
+    bb7: {
+        _18 = move (_19.0: u32);         // scope 0 at src/int256.rs:221:41: 221:51
+        _20 = Lt(copy _18, const 128_u32); // scope 0 at src/int256.rs:221:32: 221:52
+        assert(move _20, "attempt to shift left by `{}`, which would overflow", copy _18) -> [success: bb8, unwind continue]; // scope 0 at src/int256.rs:221:32: 221:52
+    }
+
+    bb8: {
+        _16 = Shl(move _17, move _18);   // scope 0 at src/int256.rs:221:32: 221:52
+        _15 = move _16 as u128 (IntToInt); // scope 0 at src/int256.rs:221:32: 221:60
+        _11 = BitOr(move _12, move _15); // scope 0 at src/int256.rs:221:17: 221:60
+        _22 = copy (_1.1: i128);         // scope 0 at src/int256.rs:222:17: 222:21
+        _23 = Lt(copy _2, const 128_u32); // scope 0 at src/int256.rs:222:17: 222:27
+        assert(move _23, "attempt to shift right by `{}`, which would overflow", copy _2) -> [success: bb9, unwind continue]; // scope 0 at src/int256.rs:222:17: 222:27
+    }
+
+    bb9: {
+        _21 = Shr(move _22, copy _2);    // scope 0 at src/int256.rs:222:17: 222:27
+        _0 = int256::I256 { lo: move _11, hi: move _21 }; // scope 0 at src/int256.rs:220:9: 223:10
+        goto -> bb10;                    // scope 0 at src/int256.rs:214:12: 224:6
+    }
+
+    bb10: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/int256.rs:212:5: 224:6
+        goto -> bb11;                    // scope 0 at src/int256.rs:212:5: 224:6
+    }
+
+    bb11: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/int256.rs:225:2: 225:2
+        return;                          // scope 0 at src/int256.rs:225:2: 225:2
+    }
+}
+fn shl_i256_max_128(_1: int256::I256, _2: u32) -> int256::I256 {
+    debug a => _1;                       // in scope 0 at src/int256.rs:211:31: 211:32
+    debug sh => _2;                      // in scope 0 at src/int256.rs:211:40: 211:42
+    let mut _0: int256::I256;            // return place in scope 0 at src/int256.rs:211:52: 211:56
+    let mut _3: bool;                    // in scope 0 at src/int256.rs:212:8: 212:15
+    let mut _4: u32;                     // in scope 0 at src/int256.rs:212:8: 212:10
+    let mut _5: bool;                    // in scope 0 at src/int256.rs:214:15: 214:24
+    let mut _6: u32;                     // in scope 0 at src/int256.rs:214:15: 214:17
+    let mut _7: u128;                    // in scope 0 at src/int256.rs:216:17: 216:29
+    let mut _8: i128;                    // in scope 0 at src/int256.rs:216:17: 216:21
+    let mut _9: i128;                    // in scope 0 at src/int256.rs:217:17: 217:28
+    let mut _10: i128;                   // in scope 0 at src/int256.rs:217:17: 217:21
+    let mut _11: u32;                    // in scope 0 at src/int256.rs:217:17: 217:28
+    let mut _12: bool;                   // in scope 0 at src/int256.rs:217:17: 217:28
+    let mut _13: u128;                   // in scope 0 at src/int256.rs:221:17: 221:60
+    let mut _14: u128;                   // in scope 0 at src/int256.rs:221:17: 221:29
+    let mut _15: u128;                   // in scope 0 at src/int256.rs:221:18: 221:22
+    let mut _16: u32;                    // in scope 0 at src/int256.rs:221:26: 221:28
+    let mut _17: bool;                   // in scope 0 at src/int256.rs:221:17: 221:29
+    let mut _18: u128;                   // in scope 0 at src/int256.rs:221:32: 221:60
+    let mut _19: i128;                   // in scope 0 at src/int256.rs:221:32: 221:52
+    let mut _20: i128;                   // in scope 0 at src/int256.rs:221:33: 221:37
+    let mut _21: u32;                    // in scope 0 at src/int256.rs:221:41: 221:51
+    let mut _22: u32;                    // in scope 0 at src/int256.rs:221:48: 221:50
+    let mut _23: (u32, bool);            // in scope 0 at src/int256.rs:221:41: 221:51
+    let mut _24: bool;                   // in scope 0 at src/int256.rs:221:32: 221:52
+    let mut _25: i128;                   // in scope 0 at src/int256.rs:222:17: 222:27
+    let mut _26: i128;                   // in scope 0 at src/int256.rs:222:17: 222:21
+    let mut _27: u32;                    // in scope 0 at src/int256.rs:222:25: 222:27
+    let mut _28: bool;                   // in scope 0 at src/int256.rs:222:17: 222:27
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/int256.rs:212:8: 212:15 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/int256.rs:214:15: 214:24 (#0)
+
+    coverage Code { bcb: bcb0 } => src/int256.rs:211:1: 211:56 (#0);
+    coverage Code { bcb: bcb0 } => src/int256.rs:212:8: 212:15 (#0);
+    coverage Code { bcb: bcb1 } => src/int256.rs:213:9: 213:10 (#0);
+    coverage Code { bcb: bcb3 } => src/int256.rs:214:15: 214:24 (#0);
+    coverage Code { bcb: bcb4 } => src/int256.rs:216:17: 216:29 (#0);
+    coverage Code { bcb: bcb4 } => src/int256.rs:215:9: 218:10 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:221:17: 221:29 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:221:33: 221:37 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:221:17: 221:60 (#0);
+    coverage Code { bcb: bcb6 } => src/int256.rs:220:9: 223:10 (#0);
+    coverage Code { bcb: bcb2 } => src/int256.rs:225:1: 225:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => src/int256.rs:212:8: 212:15 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb6 } => src/int256.rs:214:15: 214:24 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/int256.rs:212:8: 212:15
+        StorageLive(_3);                 // scope 0 at src/int256.rs:212:8: 212:15
+        StorageLive(_4);                 // scope 0 at src/int256.rs:212:8: 212:10
+        _4 = copy _2;                    // scope 0 at src/int256.rs:212:8: 212:10
+        _3 = Eq(move _4, const 0_u32);   // scope 0 at src/int256.rs:212:8: 212:15
+        switchInt(move _3) -> [0: bb2, otherwise: bb1]; // scope 0 at src/int256.rs:212:8: 212:15
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/int256.rs:212:5: 224:6
+        StorageDead(_4);                 // scope 0 at src/int256.rs:212:14: 212:15
+        _0 = copy _1;                    // scope 0 at src/int256.rs:213:9: 213:10
+        goto -> bb11;                    // scope 0 at src/int256.rs:212:5: 224:6
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/int256.rs:214:15: 214:24
+        StorageDead(_4);                 // scope 0 at src/int256.rs:212:14: 212:15
+        StorageLive(_5);                 // scope 0 at src/int256.rs:214:15: 214:24
+        StorageLive(_6);                 // scope 0 at src/int256.rs:214:15: 214:17
+        _6 = copy _2;                    // scope 0 at src/int256.rs:214:15: 214:17
+        _5 = Eq(move _6, const 128_u32); // scope 0 at src/int256.rs:214:15: 214:24
+        switchInt(move _5) -> [0: bb4, otherwise: bb3]; // scope 0 at src/int256.rs:214:15: 214:24
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at src/int256.rs:217:17: 217:28
+        StorageDead(_6);                 // scope 0 at src/int256.rs:214:23: 214:24
+        StorageLive(_7);                 // scope 0 at src/int256.rs:216:17: 216:29
+        StorageLive(_8);                 // scope 0 at src/int256.rs:216:17: 216:21
+        _8 = copy (_1.1: i128);          // scope 0 at src/int256.rs:216:17: 216:21
+        _7 = move _8 as u128 (IntToInt); // scope 0 at src/int256.rs:216:17: 216:29
+        StorageDead(_8);                 // scope 0 at src/int256.rs:216:28: 216:29
+        StorageLive(_9);                 // scope 0 at src/int256.rs:217:17: 217:28
+        StorageLive(_10);                // scope 0 at src/int256.rs:217:17: 217:21
+        _10 = copy (_1.1: i128);         // scope 0 at src/int256.rs:217:17: 217:21
+        _11 = const 127_i32 as u32 (IntToInt); // scope 0 at src/int256.rs:217:17: 217:28
+        _12 = Lt(move _11, const 128_u32); // scope 0 at src/int256.rs:217:17: 217:28
+        assert(move _12, "attempt to shift right by `{}`, which would overflow", const 127_i32) -> [success: bb5, unwind continue]; // scope 0 at src/int256.rs:217:17: 217:28
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at src/int256.rs:221:17: 221:29
+        StorageDead(_6);                 // scope 0 at src/int256.rs:214:23: 214:24
+        StorageLive(_13);                // scope 0 at src/int256.rs:221:17: 221:60
+        StorageLive(_14);                // scope 0 at src/int256.rs:221:17: 221:29
+        StorageLive(_15);                // scope 0 at src/int256.rs:221:18: 221:22
+        _15 = copy (_1.0: u128);         // scope 0 at src/int256.rs:221:18: 221:22
+        StorageLive(_16);                // scope 0 at src/int256.rs:221:26: 221:28
+        _16 = copy _2;                   // scope 0 at src/int256.rs:221:26: 221:28
+        _17 = Lt(copy _16, const 128_u32); // scope 0 at src/int256.rs:221:17: 221:29
+        assert(move _17, "attempt to shift right by `{}`, which would overflow", copy _16) -> [success: bb6, unwind continue]; // scope 0 at src/int256.rs:221:17: 221:29
+    }
+
+    bb5: {
+        _9 = Shr(move _10, const 127_i32); // scope 0 at src/int256.rs:217:17: 217:28
+        StorageDead(_10);                // scope 0 at src/int256.rs:217:27: 217:28
+        _0 = int256::I256 { lo: move _7, hi: move _9 }; // scope 0 at src/int256.rs:215:9: 218:10
+        StorageDead(_9);                 // scope 0 at src/int256.rs:218:9: 218:10
+        StorageDead(_7);                 // scope 0 at src/int256.rs:218:9: 218:10
+        goto -> bb10;                    // scope 0 at src/int256.rs:214:12: 224:6
+    }
+
+    bb6: {
+        _14 = Shr(move _15, move _16);   // scope 0 at src/int256.rs:221:17: 221:29
+        StorageDead(_16);                // scope 0 at src/int256.rs:221:28: 221:29
+        StorageDead(_15);                // scope 0 at src/int256.rs:221:28: 221:29
+        StorageLive(_18);                // scope 0 at src/int256.rs:221:32: 221:60
+        StorageLive(_19);                // scope 0 at src/int256.rs:221:32: 221:52
+        StorageLive(_20);                // scope 0 at src/int256.rs:221:33: 221:37
+        _20 = copy (_1.1: i128);         // scope 0 at src/int256.rs:221:33: 221:37
+        StorageLive(_21);                // scope 0 at src/int256.rs:221:41: 221:51
+        StorageLive(_22);                // scope 0 at src/int256.rs:221:48: 221:50
+        _22 = copy _2;                   // scope 0 at src/int256.rs:221:48: 221:50
+        _23 = SubWithOverflow(const 128_u32, copy _22); // scope 0 at src/int256.rs:221:41: 221:51
+        assert(!move (_23.1: bool), "attempt to compute `{} - {}`, which would overflow", const 128_u32, move _22) -> [success: bb7, unwind continue]; // scope 0 at src/int256.rs:221:41: 221:51
+    }
+
+    bb7: {
+        _21 = move (_23.0: u32);         // scope 0 at src/int256.rs:221:41: 221:51
+        StorageDead(_22);                // scope 0 at src/int256.rs:221:50: 221:51
+        _24 = Lt(copy _21, const 128_u32); // scope 0 at src/int256.rs:221:32: 221:52
+        assert(move _24, "attempt to shift left by `{}`, which would overflow", copy _21) -> [success: bb8, unwind continue]; // scope 0 at src/int256.rs:221:32: 221:52
+    }
+
+    bb8: {
+        _19 = Shl(move _20, move _21);   // scope 0 at src/int256.rs:221:32: 221:52
+        StorageDead(_21);                // scope 0 at src/int256.rs:221:51: 221:52
+        StorageDead(_20);                // scope 0 at src/int256.rs:221:51: 221:52
+        _18 = move _19 as u128 (IntToInt); // scope 0 at src/int256.rs:221:32: 221:60
+        StorageDead(_19);                // scope 0 at src/int256.rs:221:59: 221:60
+        _13 = BitOr(move _14, move _18); // scope 0 at src/int256.rs:221:17: 221:60
+        StorageDead(_18);                // scope 0 at src/int256.rs:221:59: 221:60
+        StorageDead(_14);                // scope 0 at src/int256.rs:221:59: 221:60
+        StorageLive(_25);                // scope 0 at src/int256.rs:222:17: 222:27
+        StorageLive(_26);                // scope 0 at src/int256.rs:222:17: 222:21
+        _26 = copy (_1.1: i128);         // scope 0 at src/int256.rs:222:17: 222:21
+        StorageLive(_27);                // scope 0 at src/int256.rs:222:25: 222:27
+        _27 = copy _2;                   // scope 0 at src/int256.rs:222:25: 222:27
+        _28 = Lt(copy _27, const 128_u32); // scope 0 at src/int256.rs:222:17: 222:27
+        assert(move _28, "attempt to shift right by `{}`, which would overflow", copy _27) -> [success: bb9, unwind continue]; // scope 0 at src/int256.rs:222:17: 222:27
+    }
+
+    bb9: {
+        _25 = Shr(move _26, move _27);   // scope 0 at src/int256.rs:222:17: 222:27
+        StorageDead(_27);                // scope 0 at src/int256.rs:222:26: 222:27
+        StorageDead(_26);                // scope 0 at src/int256.rs:222:26: 222:27
+        _0 = int256::I256 { lo: move _13, hi: move _25 }; // scope 0 at src/int256.rs:220:9: 223:10
+        StorageDead(_25);                // scope 0 at src/int256.rs:223:9: 223:10
+        StorageDead(_13);                // scope 0 at src/int256.rs:223:9: 223:10
+        goto -> bb10;                    // scope 0 at src/int256.rs:214:12: 224:6
+    }
+
+    bb10: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/int256.rs:212:5: 224:6
+        StorageDead(_5);                 // scope 0 at src/int256.rs:224:5: 224:6
+        goto -> bb11;                    // scope 0 at src/int256.rs:212:5: 224:6
+    }
+
+    bb11: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/int256.rs:225:2: 225:2
+        StorageDead(_3);                 // scope 0 at src/int256.rs:224:5: 224:6
+        return;                          // scope 0 at src/int256.rs:225:2: 225:2
+    }
+}
+"#;
+
+    #[test]
+    fn non_bool_copy_leaf_declines_shl_i256_max_128() {
+        let mir = mir::parse_text(SHL_I256_MAX_128_MIR).expect("MIR parses");
+        assert_eq!(mir.functions.len(), 2, "runtime and CTFE bodies");
+        for f in &mir.functions {
+            assert_eq!(local_type(f, 1), Some("int256::I256"));
+            assert_eq!(local_type(f, 0), Some("int256::I256"));
+            // Not the spurious 3-condition `a`, `sh == 0`, `sh == 128`.
+            assert_eq!(decompose_function(f), None);
+            assert_eq!(try_decompose_function(f), Err(DeclineReason::NonBoolLeaf));
+        }
+    }
+
+    /// Same toolchain and flags as [`SHL_I256_MAX_128_MIR`] (plain
+    /// `rustc --crate-type=lib`, comment-only lines stripped) for
+    ///
+    /// ```text
+    /// #[inline(never)]
+    /// pub fn helper(x: u32) -> u32 { x.rotate_left(3) }
+    /// #[inline(never)]
+    /// pub fn is_even(x: u32) -> bool { x % 2 == 0 }
+    /// pub fn sel(c: bool, a: bool) -> bool { if c { a } else { false } }
+    /// pub fn both(a: &bool, b: bool) -> bool { b && *a }
+    /// pub fn pick_ref(a: &u8, b: &u8, c: bool) -> u8 { if c { *a } else { *b } }
+    /// pub fn call_u32(c: bool, x: u32) -> u32 { let v = helper(x); if c { v } else { x } }
+    /// pub fn call_bool(c: bool, x: u32) -> bool { let v = is_even(x); if c { v } else { false } }
+    /// pub fn not_u32(c: bool, x: u32) -> u32 { if c { !x } else { x } }
+    /// ```
+    const LEAF_TYPES_MIR: &str = r#"
+fn sel(_1: bool, _2: bool) -> bool {
+    debug c => _1;                       // in scope 0 at leaf.rs:5:12: 5:13
+    debug a => _2;                       // in scope 0 at leaf.rs:5:21: 5:22
+    let mut _0: bool;                    // return place in scope 0 at leaf.rs:5:33: 5:37
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => leaf.rs:5:43: 5:44 (#0)
+
+    coverage Code { bcb: bcb0 } => leaf.rs:5:1: 5:37 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:5:43: 5:44 (#0);
+    coverage Code { bcb: bcb1 } => leaf.rs:5:47: 5:48 (#0);
+    coverage Code { bcb: bcb3 } => leaf.rs:5:58: 5:63 (#0);
+    coverage Code { bcb: bcb2 } => leaf.rs:5:66: 5:67 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => leaf.rs:5:43: 5:44 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at leaf.rs:5:43: 5:44
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 0 at leaf.rs:5:43: 5:44
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at leaf.rs:5:40: 5:65
+        _0 = copy _2;                    // scope 0 at leaf.rs:5:47: 5:48
+        goto -> bb3;                     // scope 0 at leaf.rs:5:40: 5:65
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at leaf.rs:5:40: 5:65
+        _0 = const false;                // scope 0 at leaf.rs:5:58: 5:63
+        goto -> bb3;                     // scope 0 at leaf.rs:5:40: 5:65
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at leaf.rs:5:67: 5:67
+        return;                          // scope 0 at leaf.rs:5:67: 5:67
+    }
+}
+
+fn both(_1: &bool, _2: bool) -> bool {
+    debug a => _1;                       // in scope 0 at leaf.rs:6:13: 6:14
+    debug b => _2;                       // in scope 0 at leaf.rs:6:23: 6:24
+    let mut _0: bool;                    // return place in scope 0 at leaf.rs:6:35: 6:39
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => leaf.rs:6:42: 6:43 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => leaf.rs:6:47: 6:49 (#0)
+
+    coverage Code { bcb: bcb0 } => leaf.rs:6:1: 6:39 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:6:42: 6:43 (#0);
+    coverage Code { bcb: bcb1 } => leaf.rs:6:47: 6:49 (#0);
+    coverage Code { bcb: bcb3 } => leaf.rs:6:50: 6:51 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb5 } => leaf.rs:6:42: 6:43 (#0);
+    coverage Branch { true_bcb: bcb2, false_bcb: bcb4 } => leaf.rs:6:47: 6:49 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at leaf.rs:6:42: 6:43
+        switchInt(copy _2) -> [0: bb2, otherwise: bb1]; // scope 0 at leaf.rs:6:42: 6:43
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at leaf.rs:6:47: 6:49
+        _0 = copy (*_1);                 // scope 0 at leaf.rs:6:47: 6:49
+        switchInt(copy _0) -> [0: bb4, otherwise: bb3]; // scope 0 at leaf.rs:6:47: 6:49
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at leaf.rs:6:42: 6:49
+        _0 = const false;                // scope 0 at leaf.rs:6:42: 6:49
+        goto -> bb5;                     // scope 0 at leaf.rs:6:42: 6:49
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at leaf.rs:6:47: 6:49
+        goto -> bb5;                     // scope 0 at leaf.rs:6:47: 6:49
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at leaf.rs:6:47: 6:49
+        goto -> bb5;                     // scope 0 at leaf.rs:6:47: 6:49
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at leaf.rs:6:51: 6:51
+        return;                          // scope 0 at leaf.rs:6:51: 6:51
+    }
+}
+
+fn pick_ref(_1: &u8, _2: &u8, _3: bool) -> u8 {
+    debug a => _1;                       // in scope 0 at leaf.rs:7:17: 7:18
+    debug b => _2;                       // in scope 0 at leaf.rs:7:25: 7:26
+    debug c => _3;                       // in scope 0 at leaf.rs:7:33: 7:34
+    let mut _0: u8;                      // return place in scope 0 at leaf.rs:7:45: 7:47
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => leaf.rs:7:53: 7:54 (#0)
+
+    coverage Code { bcb: bcb0 } => leaf.rs:7:1: 7:47 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:7:53: 7:54 (#0);
+    coverage Code { bcb: bcb1 } => leaf.rs:7:57: 7:59 (#0);
+    coverage Code { bcb: bcb3 } => leaf.rs:7:69: 7:71 (#0);
+    coverage Code { bcb: bcb2 } => leaf.rs:7:74: 7:75 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => leaf.rs:7:53: 7:54 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at leaf.rs:7:53: 7:54
+        switchInt(copy _3) -> [0: bb2, otherwise: bb1]; // scope 0 at leaf.rs:7:53: 7:54
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at leaf.rs:7:50: 7:73
+        _0 = copy (*_1);                 // scope 0 at leaf.rs:7:57: 7:59
+        goto -> bb3;                     // scope 0 at leaf.rs:7:50: 7:73
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at leaf.rs:7:50: 7:73
+        _0 = copy (*_2);                 // scope 0 at leaf.rs:7:69: 7:71
+        goto -> bb3;                     // scope 0 at leaf.rs:7:50: 7:73
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at leaf.rs:7:75: 7:75
+        return;                          // scope 0 at leaf.rs:7:75: 7:75
+    }
+}
+
+fn call_u32(_1: bool, _2: u32) -> u32 {
+    debug c => _1;                       // in scope 0 at leaf.rs:8:17: 8:18
+    debug x => _2;                       // in scope 0 at leaf.rs:8:26: 8:27
+    let mut _0: u32;                     // return place in scope 0 at leaf.rs:8:37: 8:40
+    let _3: u32;                         // in scope 0 at leaf.rs:8:47: 8:48
+    scope 1 {
+        debug v => _3;                   // in scope 1 at leaf.rs:8:47: 8:48
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => leaf.rs:8:65: 8:66 (#0)
+
+    coverage Code { bcb: bcb0 } => leaf.rs:8:1: 8:40 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:8:51: 8:60 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:8:65: 8:66 (#0);
+    coverage Code { bcb: bcb1 } => leaf.rs:8:69: 8:70 (#0);
+    coverage Code { bcb: bcb3 } => leaf.rs:8:80: 8:81 (#0);
+    coverage Code { bcb: bcb2 } => leaf.rs:8:84: 8:85 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => leaf.rs:8:65: 8:66 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at leaf.rs:8:51: 8:60
+        _3 = helper(copy _2) -> [return: bb1, unwind continue]; // scope 0 at leaf.rs:8:51: 8:60
+    }
+
+    bb1: {
+        switchInt(copy _1) -> [0: bb3, otherwise: bb2]; // scope 1 at leaf.rs:8:65: 8:66
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb1);  // scope 1 at leaf.rs:8:62: 8:83
+        _0 = copy _3;                    // scope 1 at leaf.rs:8:69: 8:70
+        goto -> bb4;                     // scope 1 at leaf.rs:8:62: 8:83
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb3);  // scope 1 at leaf.rs:8:62: 8:83
+        _0 = copy _2;                    // scope 1 at leaf.rs:8:80: 8:81
+        goto -> bb4;                     // scope 1 at leaf.rs:8:62: 8:83
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at leaf.rs:8:85: 8:85
+        return;                          // scope 0 at leaf.rs:8:85: 8:85
+    }
+}
+
+fn call_bool(_1: bool, _2: u32) -> bool {
+    debug c => _1;                       // in scope 0 at leaf.rs:9:18: 9:19
+    debug x => _2;                       // in scope 0 at leaf.rs:9:27: 9:28
+    let mut _0: bool;                    // return place in scope 0 at leaf.rs:9:38: 9:42
+    let _3: bool;                        // in scope 0 at leaf.rs:9:49: 9:50
+    scope 1 {
+        debug v => _3;                   // in scope 1 at leaf.rs:9:49: 9:50
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => leaf.rs:9:68: 9:69 (#0)
+
+    coverage Code { bcb: bcb0 } => leaf.rs:9:1: 9:42 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:9:53: 9:63 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:9:68: 9:69 (#0);
+    coverage Code { bcb: bcb1 } => leaf.rs:9:72: 9:73 (#0);
+    coverage Code { bcb: bcb3 } => leaf.rs:9:83: 9:88 (#0);
+    coverage Code { bcb: bcb2 } => leaf.rs:9:91: 9:92 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => leaf.rs:9:68: 9:69 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at leaf.rs:9:53: 9:63
+        _3 = is_even(copy _2) -> [return: bb1, unwind continue]; // scope 0 at leaf.rs:9:53: 9:63
+    }
+
+    bb1: {
+        switchInt(copy _1) -> [0: bb3, otherwise: bb2]; // scope 1 at leaf.rs:9:68: 9:69
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb1);  // scope 1 at leaf.rs:9:65: 9:90
+        _0 = copy _3;                    // scope 1 at leaf.rs:9:72: 9:73
+        goto -> bb4;                     // scope 1 at leaf.rs:9:65: 9:90
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb3);  // scope 1 at leaf.rs:9:65: 9:90
+        _0 = const false;                // scope 1 at leaf.rs:9:83: 9:88
+        goto -> bb4;                     // scope 1 at leaf.rs:9:65: 9:90
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at leaf.rs:9:92: 9:92
+        return;                          // scope 0 at leaf.rs:9:92: 9:92
+    }
+}
+
+fn not_u32(_1: bool, _2: u32) -> u32 {
+    debug c => _1;                       // in scope 0 at leaf.rs:10:16: 10:17
+    debug x => _2;                       // in scope 0 at leaf.rs:10:25: 10:26
+    let mut _0: u32;                     // return place in scope 0 at leaf.rs:10:36: 10:39
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => leaf.rs:10:45: 10:46 (#0)
+
+    coverage Code { bcb: bcb0 } => leaf.rs:10:1: 10:39 (#0);
+    coverage Code { bcb: bcb0 } => leaf.rs:10:45: 10:46 (#0);
+    coverage Code { bcb: bcb1 } => leaf.rs:10:49: 10:51 (#0);
+    coverage Code { bcb: bcb3 } => leaf.rs:10:61: 10:62 (#0);
+    coverage Code { bcb: bcb2 } => leaf.rs:10:65: 10:66 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => leaf.rs:10:45: 10:46 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at leaf.rs:10:45: 10:46
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 0 at leaf.rs:10:45: 10:46
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at leaf.rs:10:42: 10:64
+        _0 = Not(copy _2);               // scope 0 at leaf.rs:10:49: 10:51
+        goto -> bb3;                     // scope 0 at leaf.rs:10:42: 10:64
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at leaf.rs:10:42: 10:64
+        _0 = copy _2;                    // scope 0 at leaf.rs:10:61: 10:62
+        goto -> bb3;                     // scope 0 at leaf.rs:10:42: 10:64
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at leaf.rs:10:66: 10:66
+        return;                          // scope 0 at leaf.rs:10:66: 10:66
+    }
+}
+"#;
+
+    fn leaf_fn<'a>(mir: &'a Mir, name: &str) -> &'a MirFunction {
+        mir.functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("fixture has `{name}`"))
+    }
+
+    #[test]
+    fn bool_copy_leaf_is_a_condition() {
+        let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "sel");
+        assert_eq!(
+            try_decompose_function(f),
+            Ok(ite("c", cond("a"), const_(false)))
+        );
+    }
+
+    #[test]
+    fn deref_bool_copy_leaf_is_a_condition() {
+        // `b && *a` with `a: &bool`: the leaf is `_0 = copy (*_1)`.
+        let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "both");
+        assert!(matches!(
+            f.blocks[1].statements[1],
+            MirStatement::AssignCopy {
+                dst: 0,
+                src: 1,
+                deref: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            try_decompose_function(f),
+            Ok(ite("b", cond("a"), const_(false)))
+        );
+    }
+
+    #[test]
+    fn deref_non_bool_copy_leaf_is_not_a_condition() {
+        // `if c { *a } else { *b }` with `a, b: &u8`. The `u8` arms
+        // are not conditions; the ordinary handlers decline, and the
+        // decision is `c` with the arm taken as its outcome.
+        let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "pick_ref");
+        assert_eq!(build_decision_from_block(0, f), None);
+        assert_eq!(
+            try_decompose_candidate_lifted(f),
+            Ok((ite("c", const_(true), const_(false)), Some(Lift::ValueArms)))
+        );
+    }
+
+    #[test]
+    fn call_result_leaf_is_typed_by_its_destination_local() {
+        // `let v = helper(x)` (`-> u32`) then `if c { v } else { x }`.
+        // bb0 is the call; the decision is rooted at bb1.
+        let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "call_u32");
+        assert_eq!(local_type(f, 3), Some("u32"));
+        assert_eq!(decompose_from_block(f, 2), None, "`v` arm is not a leaf");
+        assert_eq!(build_decision_from_block(1, f), None);
+        // The `u32` arms are lifted as values, not read as `v`.
+        assert_eq!(
+            try_decompose_from_block(f, 1),
+            Ok(ite("c", const_(true), const_(false)))
+        );
+
+        // `let v = is_even(x)` (`-> bool`): the same shape decomposes.
+        let f = leaf_fn(&mir, "call_bool");
+        assert_eq!(local_type(f, 3), Some("bool"));
+        assert_eq!(
+            try_decompose_from_block(f, 1),
+            Ok(ite("c", cond("v"), const_(false)))
+        );
+    }
+
+    #[test]
+    fn not_of_integer_leaf_is_not_a_condition() {
+        // `if c { !x } else { x }` with `x: u32`: bitwise complement,
+        // not a condition `!x`. The arms are lifted as values.
+        let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "not_u32");
+        assert!(matches!(
+            f.blocks[1].statements[1],
+            MirStatement::AssignUnaryNot { dst: 0, src: 2, .. }
+        ));
+        assert_eq!(build_decision_from_block(0, f), None);
+        assert_eq!(
+            try_decompose_candidate_lifted(f),
+            Ok((ite("c", const_(true), const_(false)), Some(Lift::ValueArms)))
+        );
+    }
+
+    #[test]
+    fn other_declines_report_unsupported_shape() {
+        let mir = mir::parse_text(DEBUG_ASSERT_GUARD_MIR).expect("MIR parses");
+        assert_eq!(
+            try_decompose_function(&mir.functions[0]),
+            Err(DeclineReason::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn leaf_type_check_reads_declared_types_only() {
+        assert_eq!(pointee_type("&bool"), Some("bool"));
+        assert_eq!(pointee_type("&mut bool"), Some("bool"));
+        assert_eq!(pointee_type("&'a bool"), Some("bool"));
+        assert_eq!(pointee_type("&'a mut bool"), Some("bool"));
+        assert_eq!(pointee_type("*const bool"), Some("bool"));
+        assert_eq!(pointee_type("*mut bool"), Some("bool"));
+        assert_eq!(pointee_type("&&bool"), Some("&bool"));
+        assert_eq!(pointee_type("bool"), None);
+        assert_eq!(pointee_type("Box<bool>"), None);
+
+        // A local the function does not declare is never assumed bool.
+        let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "sel");
+        assert!(reads_bool(f, 2, false));
+        assert!(!reads_bool(f, 2, true));
+        assert!(!reads_bool(f, 99, false));
+    }
+
     #[test]
     fn decompose_from_block_with_unknown_id_returns_none() {
         // A block id that doesn't identify any block in the function
@@ -3485,5 +4789,2154 @@ fn check(_1: usize, _2: &[u8]) -> Vec<u8> {
         let f = &mir.functions[0];
         let max_id = f.blocks.iter().map(|b| b.id).max().unwrap_or(0);
         assert!(decompose_from_block(f, max_id + 999).is_none());
+    }
+
+    /// BLAKE3 `src/io.rs`, `cargo floyd test` MIR (rustc nightly,
+    /// coverage flags, comment-only lines stripped):
+    ///
+    /// ```text
+    /// pub(crate) fn copy_wide(mut reader: impl io::Read, hasher: &mut crate::Hasher) -> io::Result<u64> {
+    ///     let mut buffer = [0; 65536];
+    ///     let mut total = 0;
+    ///     loop {
+    ///         match reader.read(&mut buffer) {
+    ///             Ok(0) => return Ok(total),
+    ///             Ok(n) => {
+    ///                 hasher.update(&buffer[..n]);
+    ///                 total += n as u64;
+    ///             }
+    ///             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+    ///             Err(e) => return Err(e),
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// bb0 is `_25 = const false; .. goto -> bb1`: `_25` is the drop
+    /// flag of the `Err(e)` binding, and bb1 is the loop head.
+    const COPY_WIDE_MIR: &str = r#"
+fn copy_wide(_1: impl io::Read, _2: &mut Hasher) -> Result<u64, std::io::Error> {
+    debug reader => _1;                  // in scope 0 at src/io.rs:10:25: 10:35
+    debug hasher => _2;                  // in scope 0 at src/io.rs:10:52: 10:58
+    let mut _0: std::result::Result<u64, std::io::Error>; // return place in scope 0 at src/io.rs:10:83: 10:98
+    let mut _3: [u8; 65536];             // in scope 0 at src/io.rs:11:9: 11:19
+    let mut _5: std::result::Result<usize, std::io::Error>; // in scope 0 at src/io.rs:14:15: 14:39
+    let mut _6: &mut impl io::Read;      // in scope 0 at src/io.rs:14:15: 14:21
+    let mut _7: &mut [u8];               // in scope 0 at src/io.rs:14:27: 14:38
+    let mut _8: &mut [u8; 65536];        // in scope 0 at src/io.rs:14:27: 14:38
+    let mut _9: isize;                   // in scope 0 at src/io.rs:15:13: 15:18
+    let mut _10: u64;                    // in scope 0 at src/io.rs:15:32: 15:37
+    let _12: &mut Hasher;                // in scope 0 at src/io.rs:17:17: 17:44
+    let _13: &[u8];                      // in scope 0 at src/io.rs:17:38: 17:43
+    let mut _14: &[u8; 65536];           // in scope 0 at src/io.rs:17:32: 17:38
+    let mut _15: std::ops::RangeTo<usize>; // in scope 0 at src/io.rs:17:39: 17:42
+    let mut _16: u64;                    // in scope 0 at src/io.rs:18:26: 18:34
+    let mut _17: (u64, bool);            // in scope 0 at src/io.rs:18:17: 18:34
+    let mut _20: bool;                   // in scope 0 at src/io.rs:21:23: 21:61
+    let mut _21: &std::io::ErrorKind;    // in scope 0 at src/io.rs:21:23: 21:31
+    let _22: std::io::ErrorKind;         // in scope 0 at src/io.rs:21:23: 21:31
+    let mut _23: &std::io::ErrorKind;    // in scope 0 at src/io.rs:21:35: 21:61
+    let mut _25: bool;                   // in scope 0 at src/io.rs:23:9: 23:10
+    let mut _26: isize;                  // in scope 0 at src/io.rs:23:9: 23:10
+    scope 1 {
+        debug buffer => _3;              // in scope 1 at src/io.rs:11:9: 11:19
+        let mut _4: u64;                 // in scope 1 at src/io.rs:12:9: 12:18
+        scope 2 {
+            debug total => _4;           // in scope 2 at src/io.rs:12:9: 12:18
+            let _11: usize;              // in scope 2 at src/io.rs:16:16: 16:17
+            let _18: std::io::Error;     // in scope 2 at src/io.rs:21:17: 21:18
+            let _19: &std::io::Error;    // in scope 2 at src/io.rs:21:17: 21:18
+            let _24: std::io::Error;     // in scope 2 at src/io.rs:22:17: 22:18
+            scope 3 {
+                debug n => _11;          // in scope 3 at src/io.rs:16:16: 16:17
+            }
+            scope 4 {
+                debug e => _18;          // in scope 4 at src/io.rs:21:17: 21:18
+                debug e => _19;          // in scope 4 at src/io.rs:21:17: 21:18
+            }
+            scope 5 {
+                debug e => _24;          // in scope 5 at src/io.rs:22:17: 22:18
+            }
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/io.rs:21:23: 21:61 (#0)
+
+    coverage Code { bcb: bcb0 } => src/io.rs:10:1: 10:98 (#0);
+    coverage Code { bcb: bcb0 } => src/io.rs:11:22: 11:32 (#0);
+    coverage Code { bcb: bcb0 } => src/io.rs:12:21: 12:22 (#0);
+    coverage Code { bcb: bcb1 } => src/io.rs:14:15: 14:39 (#0);
+    coverage Code { bcb: bcb9 } => src/io.rs:15:22: 15:38 (#0);
+    coverage Code { bcb: bcb8 } => src/io.rs:17:17: 17:23 (#0);
+    coverage Code { bcb: bcb8 } => src/io.rs:17:17: 17:44 (#0);
+    coverage Code { bcb: bcb8 } => src/io.rs:18:17: 18:34 (#0);
+    coverage Code { bcb: bcb2 } => src/io.rs:21:23: 21:61 (#0);
+    coverage Code { bcb: bcb3 } => src/io.rs:21:65: 21:73 (#0);
+    coverage Code { bcb: bcb5 } => src/io.rs:22:23: 22:36 (#0);
+    coverage Code { bcb: bcb6 } => src/io.rs:25:1: 25:2 (#0);
+    coverage Branch { true_bcb: bcb3, false_bcb: bcb4 } => src/io.rs:21:23: 21:61 (#0);
+
+    bb0: {
+        _25 = const false;               // scope 2 at src/io.rs:13:5: 24:6
+        Coverage::VirtualCounter(bcb0);  // scope 2 at src/io.rs:13:5: 24:6
+        _3 = [const 0_u8; 65536];        // scope 0 at src/io.rs:11:22: 11:32
+        _4 = const 0_u64;                // scope 1 at src/io.rs:12:21: 12:22
+        goto -> bb1;                     // scope 2 at src/io.rs:13:5: 24:6
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 2 at src/io.rs:13:5: 24:6
+        _6 = &mut _1;                    // scope 2 at src/io.rs:14:15: 14:21
+        _8 = &mut _3;                    // scope 2 at src/io.rs:14:27: 14:38
+        _7 = copy _8 as &mut [u8] (PointerCoercion(Unsize, Implicit)); // scope 2 at src/io.rs:14:27: 14:38
+        _5 = <impl io::Read as std::io::Read>::read(move _6, move _7) -> [return: bb2, unwind: bb18]; // scope 2 at src/io.rs:14:15: 14:39
+    }
+
+    bb2: {
+        _25 = const true;                // scope 2 at src/io.rs:14:38: 14:39
+        _9 = discriminant(_5);           // scope 2 at src/io.rs:14:15: 14:39
+        switchInt(move _9) -> [0: bb4, 1: bb7, otherwise: bb3]; // scope 2 at src/io.rs:14:9: 14:39
+    }
+
+    bb3: {
+        unreachable;                     // scope 2 at src/io.rs:14:15: 14:39
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb7);  // scope 2 at src/io.rs:14:9: 14:39
+        switchInt(copy ((_5 as Ok).0: usize)) -> [0: bb6, otherwise: bb5]; // scope 2 at src/io.rs:14:9: 14:39
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb8);  // scope 2 at src/io.rs:16:13: 16:18
+        _11 = copy ((_5 as Ok).0: usize); // scope 2 at src/io.rs:16:16: 16:17
+        _14 = &_3;                       // scope 3 at src/io.rs:17:32: 17:38
+        _15 = RangeTo::<usize> { end: copy _11 }; // scope 3 at src/io.rs:17:39: 17:42
+        _13 = <[u8; 65536] as Index<RangeTo<usize>>>::index(move _14, move _15) -> [return: bb8, unwind: bb22]; // scope 3 at src/io.rs:17:38: 17:43
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb9);  // scope 2 at src/io.rs:15:13: 15:18
+        _10 = copy _4;                   // scope 2 at src/io.rs:15:32: 15:37
+        _0 = Result::<u64, std::io::Error>::Ok(move _10); // scope 2 at src/io.rs:15:29: 15:38
+        goto -> bb16;                    // scope 2 at src/io.rs:15:22: 15:38
+    }
+
+    bb7: {
+        Coverage::VirtualCounter(bcb2);  // scope 2 at src/io.rs:21:13: 21:19
+        _19 = &((_5 as Err).0: std::io::Error); // scope 2 at src/io.rs:21:17: 21:18
+        _22 = std::io::Error::kind(copy _19) -> [return: bb11, unwind: bb22]; // scope 2 at src/io.rs:21:23: 21:31
+    }
+
+    bb8: {
+        _12 = Hasher::update(copy _2, copy _13) -> [return: bb9, unwind: bb22]; // scope 3 at src/io.rs:17:17: 17:44
+    }
+
+    bb9: {
+        _16 = copy _11 as u64 (IntToInt); // scope 3 at src/io.rs:18:26: 18:34
+        _17 = AddWithOverflow(copy _4, copy _16); // scope 3 at src/io.rs:18:17: 18:34
+        assert(!move (_17.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _4, move _16) -> [success: bb10, unwind: bb22]; // scope 3 at src/io.rs:18:17: 18:34
+    }
+
+    bb10: {
+        _4 = move (_17.0: u64);          // scope 3 at src/io.rs:18:17: 18:34
+        _25 = const false;               // scope 2 at src/io.rs:23:9: 23:10
+        goto -> bb1;                     // scope 2 at src/io.rs:13:5: 24:6
+    }
+
+    bb11: {
+        _21 = &_22;                      // scope 2 at src/io.rs:21:23: 21:31
+        _23 = const io::copy_wide::<impl io::Read>::promoted[0]; // scope 2 at src/io.rs:21:35: 21:61
+        _20 = <ErrorKind as PartialEq>::eq(move _21, move _23) -> [return: bb12, unwind: bb22]; // scope 2 at src/io.rs:21:23: 21:61
+    }
+
+    bb12: {
+        switchInt(move _20) -> [0: bb14, otherwise: bb13]; // scope 2 at src/io.rs:21:23: 21:61
+    }
+
+    bb13: {
+        Coverage::VirtualCounter(bcb3);  // scope 2 at src/io.rs:21:72: 21:73
+        _25 = const false;               // scope 2 at src/io.rs:21:17: 21:18
+        _18 = move ((_5 as Err).0: std::io::Error); // scope 2 at src/io.rs:21:17: 21:18
+        drop(_18) -> [return: bb15, unwind: bb22]; // scope 2 at src/io.rs:21:72: 21:73
+    }
+
+    bb14: {
+        Coverage::VirtualCounter(bcb4);  // scope 2 at src/io.rs:21:13: 21:19
+        Coverage::VirtualCounter(bcb5);  // scope 5 at src/io.rs:22:35: 22:36
+        _25 = const false;               // scope 2 at src/io.rs:22:17: 22:18
+        _24 = move ((_5 as Err).0: std::io::Error); // scope 2 at src/io.rs:22:17: 22:18
+        _0 = Result::<u64, std::io::Error>::Err(copy _24); // scope 5 at src/io.rs:22:30: 22:36
+        goto -> bb16;                    // scope 2 at no-location
+    }
+
+    bb15: {
+        _25 = const false;               // scope 2 at src/io.rs:23:9: 23:10
+        goto -> bb1;                     // scope 2 at no-location
+    }
+
+    bb16: {
+        Coverage::VirtualCounter(bcb6);  // scope 2 at src/io.rs:23:9: 23:10
+        _25 = const false;               // scope 2 at src/io.rs:23:9: 23:10
+        drop(_1) -> [return: bb17, unwind continue]; // scope 0 at src/io.rs:25:1: 25:2
+    }
+
+    bb17: {
+        return;                          // scope 0 at src/io.rs:25:2: 25:2
+    }
+
+    bb18 (cleanup): {
+        drop(_1) -> [return: bb19, unwind terminate(cleanup)]; // scope 0 at src/io.rs:25:1: 25:2
+    }
+
+    bb19 (cleanup): {
+        resume;                          // scope 0 at src/io.rs:10:1: 25:2
+    }
+
+    bb20 (cleanup): {
+        switchInt(copy _25) -> [0: bb18, otherwise: bb21]; // scope 2 at src/io.rs:23:9: 23:10
+    }
+
+    bb21 (cleanup): {
+        drop(((_5 as Err).0: std::io::Error)) -> [return: bb18, unwind terminate(cleanup)]; // scope 2 at src/io.rs:23:9: 23:10
+    }
+
+    bb22 (cleanup): {
+        _26 = discriminant(_5);          // scope 2 at src/io.rs:23:9: 23:10
+        switchInt(move _26) -> [1: bb20, otherwise: bb18]; // scope 2 at src/io.rs:23:9: 23:10
+    }
+}
+"#;
+
+    /// hashbrown `src/raw.rs`, `RawIterRange::fold_impl`, same
+    /// compilation settings. bb0 is `_31 = const false; _31 = const
+    /// true; goto -> bb1`: two writes of a drop flag.
+    const FOLD_IMPL_MIR: &str = r#"
+fn raw::<impl at src/raw.rs:3556:1: 3556:24>::fold_impl(_1: RawIterRange<T>, _2: usize, _3: B, _4: F) -> B {
+    debug self => _1;                    // in scope 0 at src/raw.rs:3706:31: 3706:39
+    debug n => _2;                       // in scope 0 at src/raw.rs:3706:41: 3706:46
+    debug acc => _3;                     // in scope 0 at src/raw.rs:3706:55: 3706:62
+    debug f => _4;                       // in scope 0 at src/raw.rs:3706:67: 3706:72
+    let mut _0: B;                       // return place in scope 0 at src/raw.rs:3706:80: 3706:81
+    let mut _5: core::option::Option<usize>; // in scope 0 at src/raw.rs:3711:37: 3711:62
+    let mut _6: &mut control::bitmask::BitMaskIter; // in scope 0 at src/raw.rs:3711:37: 3711:55
+    let mut _7: isize;                   // in scope 0 at src/raw.rs:3711:23: 3711:34
+    let mut _9: bool;                    // in scope 0 at src/raw.rs:3714:31: 3714:37
+    let mut _10: usize;                  // in scope 0 at src/raw.rs:3714:31: 3714:32
+    let mut _11: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+    let mut _13: &raw::Bucket<T>;        // in scope 0 at src/raw.rs:3715:39: 3715:48
+    let mut _14: B;                      // in scope 0 at src/raw.rs:3716:23: 3716:37
+    let mut _15: &mut F;                 // in scope 0 at src/raw.rs:3716:23: 3716:24
+    let mut _16: (B, raw::Bucket<T>);    // in scope 0 at src/raw.rs:3716:23: 3716:37
+    let mut _17: B;                      // in scope 0 at src/raw.rs:3716:25: 3716:28
+    let mut _18: (usize, bool);          // in scope 0 at src/raw.rs:3717:17: 3717:23
+    let mut _19: bool;                   // in scope 0 at src/raw.rs:3720:16: 3720:22
+    let mut _20: usize;                  // in scope 0 at src/raw.rs:3720:16: 3720:17
+    let mut _21: control::bitmask::BitMaskIter; // in scope 0 at src/raw.rs:3753:38: 3755:33
+    let mut _22: control::bitmask::BitMask; // in scope 0 at src/raw.rs:3753:38: 3754:34
+    let mut _23: &control::group::sse2::Group; // in scope 0 at src/raw.rs:3753:38: 3753:80
+    let _24: control::group::sse2::Group; // in scope 0 at src/raw.rs:3753:38: 3753:80
+    let mut _25: *const control::tag::Tag; // in scope 0 at src/raw.rs:3753:58: 3753:79
+    let mut _26: *const u8;              // in scope 0 at src/raw.rs:3753:58: 3753:72
+    let mut _27: raw::Bucket<T>;         // in scope 0 at src/raw.rs:3756:29: 3756:59
+    let mut _28: &raw::Bucket<T>;        // in scope 0 at src/raw.rs:3756:29: 3756:38
+    let mut _29: *const u8;              // in scope 0 at src/raw.rs:3757:34: 3757:66
+    let mut _30: *const u8;              // in scope 0 at src/raw.rs:3757:34: 3757:48
+    let mut _31: bool;                   // in scope 0 at src/raw.rs:3760:5: 3760:6
+    scope 1 {
+        debug index => _8;               // in scope 1 at src/raw.rs:3711:28: 3711:33
+        let _8: usize;                   // in scope 1 at src/raw.rs:3711:28: 3711:33
+        let _12: raw::Bucket<T>;         // in scope 1 at src/raw.rs:3715:21: 3715:27
+        scope 2 {
+            debug bucket => _12;         // in scope 2 at src/raw.rs:3715:21: 3715:27
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/raw.rs:3711:23: 3711:34 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:292:12: 292:42 (#158)
+    coverage branch { true: BlockMarkerId(4), false: BlockMarkerId(5) } => /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38 (#159)
+    coverage branch { true: BlockMarkerId(6), false: BlockMarkerId(7) } => src/raw.rs:3720:16: 3720:22 (#0)
+
+    coverage Code { bcb: bcb0 } => src/raw.rs:3706:5: 3708:37 (#0);
+    coverage Code { bcb: bcb2 } => src/raw.rs:3711:19: 3711:62 (#0);
+    coverage Code { bcb: bcb6 } => src/raw.rs:3714:17: 3714:30 (#0);
+    coverage Code { bcb: bcb7 } => src/raw.rs:3714:31: 3714:37 (#0);
+    coverage Code { bcb: bcb9 } => src/raw.rs:3715:39: 3715:62 (#0);
+    coverage Code { bcb: bcb9 } => src/raw.rs:3716:17: 3716:20 (#0);
+    coverage Code { bcb: bcb9 } => src/raw.rs:3716:23: 3716:24 (#0);
+    coverage Code { bcb: bcb9 } => src/raw.rs:3716:17: 3716:37 (#0);
+    coverage Code { bcb: bcb9 } => src/raw.rs:3717:17: 3717:23 (#0);
+    coverage Code { bcb: bcb3 } => src/raw.rs:3720:16: 3720:22 (#0);
+    coverage Code { bcb: bcb4 } => src/raw.rs:3721:17: 3721:27 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3722:13: 3722:14 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3753:17: 3753:35 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3753:17: 3755:33 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3756:17: 3756:26 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3756:17: 3756:59 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3757:17: 3757:31 (#0);
+    coverage Code { bcb: bcb5 } => src/raw.rs:3757:17: 3757:66 (#0);
+    coverage Code { bcb: bcb4 } => src/raw.rs:3760:5: 3760:6 (#0);
+    coverage Branch { true_bcb: bcb6, false_bcb: bcb3 } => src/raw.rs:3711:23: 3711:34 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb5 } => src/raw.rs:3720:16: 3720:22 (#0);
+
+    bb0: {
+        _31 = const false;               // scope 0 at src/raw.rs:3710:9: 3759:10
+        _31 = const true;                // scope 0 at src/raw.rs:3710:9: 3759:10
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/raw.rs:3710:9: 3759:10
+        goto -> bb1;                     // scope 0 at src/raw.rs:3710:9: 3759:10
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/raw.rs:3710:9: 3759:10
+        goto -> bb2;                     // scope 0 at src/raw.rs:3711:13: 3718:14
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/raw.rs:3711:13: 3718:14
+        _6 = &mut (_1.0: control::bitmask::BitMaskIter); // scope 1 at src/raw.rs:3711:37: 3711:55
+        _5 = <BitMaskIter as Iterator>::next(move _6) -> [return: bb3, unwind: bb20]; // scope 1 at src/raw.rs:3711:37: 3711:62
+    }
+
+    bb3: {
+        _7 = discriminant(_5);           // scope 1 at src/raw.rs:3711:37: 3711:62
+        switchInt(move _7) -> [1: bb5, 0: bb4, otherwise: bb24]; // scope 1 at src/raw.rs:3711:23: 3711:34
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/raw.rs:3720:16: 3720:22
+        _20 = copy _2;                   // scope 0 at src/raw.rs:3720:16: 3720:17
+        _19 = Eq(move _20, const 0_usize); // scope 0 at src/raw.rs:3720:16: 3720:22
+        switchInt(move _19) -> [0: bb12, otherwise: bb11]; // scope 0 at src/raw.rs:3720:16: 3720:22
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb6);  // scope 1 at src/raw.rs:3711:23: 3711:34
+        _8 = copy ((_5 as Some).0: usize); // scope 1 at src/raw.rs:3711:28: 3711:33
+        Coverage::VirtualCounter(bcb7);  // scope 1 at src/raw.rs:3714:31: 3714:37
+        _10 = copy _2;                   // scope 1 at src/raw.rs:3714:31: 3714:32
+        _9 = Ne(move _10, const 0_usize); // scope 1 at src/raw.rs:3714:31: 3714:37
+        switchInt(move _9) -> [0: bb7, otherwise: bb6]; // scope 1 at src/raw.rs:3714:31: 3714:37
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb8);  // scope 1 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:292:9: 294:10
+        Coverage::VirtualCounter(bcb9);  // scope 1 at src/raw.rs:3715:39: 3715:62
+        _13 = &(_1.1: raw::Bucket<T>);   // scope 1 at src/raw.rs:3715:39: 3715:48
+        _12 = Bucket::<T>::next_n(move _13, copy _8) -> [return: bb8, unwind: bb20]; // scope 1 at src/raw.rs:3715:39: 3715:62
+    }
+
+    bb7: {
+        Coverage::VirtualCounter(bcb10); // scope 1 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+        _11 = panic(const "assertion failed: n != 0") -> bb20; // scope 1 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+    }
+
+    bb8: {
+        _15 = &mut _4;                   // scope 2 at src/raw.rs:3716:23: 3716:24
+        _31 = const false;               // scope 2 at src/raw.rs:3716:25: 3716:28
+        _17 = move _3;                   // scope 2 at src/raw.rs:3716:25: 3716:28
+        _16 = (move _17, copy _12);      // scope 2 at src/raw.rs:3716:23: 3716:37
+        _14 = <F as FnMut<(B, Bucket<T>)>>::call_mut(move _15, move _16) -> [return: bb9, unwind: bb20]; // scope 2 at src/raw.rs:3716:23: 3716:37
+    }
+
+    bb9: {
+        _31 = const true;                // scope 2 at src/raw.rs:3716:17: 3716:20
+        _3 = move _14;                   // scope 2 at src/raw.rs:3716:17: 3716:20
+        _18 = SubWithOverflow(copy _2, const 1_usize); // scope 2 at src/raw.rs:3717:17: 3717:23
+        assert(!move (_18.1: bool), "attempt to compute `{} - {}`, which would overflow", copy _2, const 1_usize) -> [success: bb10, unwind: bb20]; // scope 2 at src/raw.rs:3717:17: 3717:23
+    }
+
+    bb10: {
+        _2 = move (_18.0: usize);        // scope 2 at src/raw.rs:3717:17: 3717:23
+        goto -> bb2;                     // scope 0 at src/raw.rs:3711:13: 3718:14
+    }
+
+    bb11: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at src/raw.rs:3760:5: 3760:6
+        _31 = const false;               // scope 0 at src/raw.rs:3721:24: 3721:27
+        _0 = move _3;                    // scope 0 at src/raw.rs:3721:24: 3721:27
+        drop(_4) -> [return: bb19, unwind: bb23]; // scope 0 at src/raw.rs:3760:5: 3760:6
+    }
+
+    bb12: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/raw.rs:3753:58: 3753:79
+        _26 = copy (_1.2: *const u8);    // scope 0 at src/raw.rs:3753:58: 3753:72
+        _25 = core::ptr::const_ptr::<impl *const u8>::cast::<Tag>(move _26) -> [return: bb13, unwind: bb20]; // scope 0 at src/raw.rs:3753:58: 3753:79
+    }
+
+    bb13: {
+        _24 = Group::load_aligned(move _25) -> [return: bb14, unwind: bb20]; // scope 0 at src/raw.rs:3753:38: 3753:80
+    }
+
+    bb14: {
+        _23 = &_24;                      // scope 0 at src/raw.rs:3753:38: 3753:80
+        _22 = Group::match_full(move _23) -> [return: bb15, unwind: bb20]; // scope 0 at src/raw.rs:3753:38: 3754:34
+    }
+
+    bb15: {
+        _21 = <BitMask as IntoIterator>::into_iter(move _22) -> [return: bb16, unwind: bb20]; // scope 0 at src/raw.rs:3753:38: 3755:33
+    }
+
+    bb16: {
+        (_1.0: control::bitmask::BitMaskIter) = move _21; // scope 0 at src/raw.rs:3753:17: 3755:33
+        _28 = &(_1.1: raw::Bucket<T>);   // scope 0 at src/raw.rs:3756:29: 3756:38
+        _27 = Bucket::<T>::next_n(move _28, const control::group::sse2::Group::WIDTH) -> [return: bb17, unwind: bb20]; // scope 0 at src/raw.rs:3756:29: 3756:59
+    }
+
+    bb17: {
+        (_1.1: raw::Bucket<T>) = move _27; // scope 0 at src/raw.rs:3756:17: 3756:59
+        _30 = copy (_1.2: *const u8);    // scope 0 at src/raw.rs:3757:34: 3757:48
+        _29 = core::ptr::const_ptr::<impl *const u8>::add(move _30, const control::group::sse2::Group::WIDTH) -> [return: bb18, unwind: bb20]; // scope 0 at src/raw.rs:3757:34: 3757:66
+    }
+
+    bb18: {
+        (_1.2: *const u8) = move _29;    // scope 0 at src/raw.rs:3757:17: 3757:66
+        goto -> bb1;                     // scope 0 at src/raw.rs:3710:9: 3759:10
+    }
+
+    bb19: {
+        return;                          // scope 0 at src/raw.rs:3760:6: 3760:6
+    }
+
+    bb20 (cleanup): {
+        drop(_4) -> [return: bb23, unwind terminate(cleanup)]; // scope 0 at src/raw.rs:3760:5: 3760:6
+    }
+
+    bb21 (cleanup): {
+        resume;                          // scope 0 at src/raw.rs:3706:5: 3760:6
+    }
+
+    bb22 (cleanup): {
+        drop(_3) -> [return: bb21, unwind terminate(cleanup)]; // scope 0 at src/raw.rs:3760:5: 3760:6
+    }
+
+    bb23 (cleanup): {
+        switchInt(copy _31) -> [0: bb21, otherwise: bb22]; // scope 0 at src/raw.rs:3760:5: 3760:6
+    }
+
+    bb24: {
+        unreachable;                     // scope 0 at src/raw.rs:3706:5: 3760:6
+    }
+}
+"#;
+
+    #[test]
+    fn drop_flag_write_before_a_loop_is_not_the_decision() {
+        // Before the fix both decomposed to `Const false`: the drop
+        // flag write in the entry block was read as the function's
+        // value, giving a candidate with no conditions.
+        for text in [COPY_WIDE_MIR, FOLD_IMPL_MIR] {
+            let mir = crate::mir::parse_text(text).expect("MIR parses");
+            assert_eq!(mir.functions.len(), 1);
+            let f = &mir.functions[0];
+            assert_eq!(
+                try_decompose_function(f),
+                Err(DeclineReason::UnsupportedShape),
+                "{}",
+                f.name
+            );
+        }
+    }
+
+    /// `fn decide(a: bool, b: bool) -> Option<bool> { let r = if a { b } else { false }; Some(r) }`
+    /// lowered with the per-arm value in `_3`, which the join block
+    /// moves into `_0`.
+    const ARM_LOCAL_FLOWS_TO_RETURN_MIR: &str = r#"
+fn decide(_1: bool, _2: bool) -> Option<bool> {
+    debug a => _1;
+    debug b => _2;
+    let mut _0: std::option::Option<bool>;
+    let mut _3: bool;
+    let mut _4: bool;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _3 = copy _2;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _3 = const false;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _4 = move _3;
+        _0 = Option::<bool>::Some(move _4);
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn arm_local_that_reaches_the_return_place_is_the_value() {
+        let mir = crate::mir::parse_text(ARM_LOCAL_FLOWS_TO_RETURN_MIR).expect("MIR parses");
+        assert_eq!(
+            decompose_function(&mir.functions[0]),
+            Some(ite("a", cond("b"), const_(false)))
+        );
+        // The same arm values written to a local the join block
+        // overwrites never reach `_0`.
+        let text = ARM_LOCAL_FLOWS_TO_RETURN_MIR.replace("_4 = move _3;", "_4 = const true;");
+        let mir = crate::mir::parse_text(&text).expect("MIR parses");
+        assert_eq!(decompose_function(&mir.functions[0]), None);
+    }
+
+    /// A body whose entry block sets the return place to a constant
+    /// and only then branches (on something that does not change the
+    /// result): the entry-block decomposer yields `Const false`.
+    const CONST_ENTRY_MIR: &str = r#"
+fn f(_1: bool) -> bool {
+    debug flag => _1;
+    let mut _0: bool;
+
+    bb0: {
+        _0 = const false;
+        goto -> bb1;
+    }
+
+    bb1: {
+        switchInt(copy _1) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn zero_condition_tree_is_not_a_candidate() {
+        let mir = crate::mir::parse_text(CONST_ENTRY_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        assert_eq!(try_decompose_function(f), Ok(const_(false)));
+        assert_eq!(try_decompose_candidate(f), Err(DeclineReason::NoConditions));
+        assert_eq!(
+            serde_json::to_value(DeclineReason::NoConditions).unwrap(),
+            "no_conditions"
+        );
+        // A tree with a condition is still a candidate.
+        let mir = crate::mir::parse_text(ARM_LOCAL_FLOWS_TO_RETURN_MIR).expect("MIR parses");
+        assert!(try_decompose_candidate(&mir.functions[0]).is_ok());
+    }
+
+    /// rust-url `idna/src/uts46.rs`, `cargo floyd test` MIR
+    /// (comment-only lines other than the CTFE marker stripped):
+    /// the runtime body and the `// MIR FOR CTFE` body of
+    ///
+    /// ```text
+    /// pub const fn new(deny_glyphless: bool, deny_list: &str) -> Self {
+    ///     let mut bits = UPPER_CASE_MASK;
+    ///     if deny_glyphless {
+    ///         bits |= GLYPHLESS_MASK;
+    ///     }
+    ///     .. // a loop of assert!s over deny_list
+    /// }
+    /// ```
+    ///
+    /// The CTFE body keeps `_5 = copy _1; switchInt(move _5)` in bb0.
+    const ASCII_DENY_LIST_NEW_MIR: &str = r#"
+fn uts46::<impl at idna/src/uts46.rs:276:1: 276:19>::new(_1: bool, _2: &str) -> uts46::AsciiDenyList {
+    debug deny_glyphless => _1;          // in scope 0 at idna/src/uts46.rs:294:22: 294:36
+    debug deny_list => _2;               // in scope 0 at idna/src/uts46.rs:294:44: 294:53
+    let mut _0: uts46::AsciiDenyList;    // return place in scope 0 at idna/src/uts46.rs:294:64: 294:68
+    let mut _3: u128;                    // in scope 0 at idna/src/uts46.rs:295:13: 295:21
+    let mut _6: bool;                    // in scope 0 at idna/src/uts46.rs:301:15: 301:30
+    let mut _7: usize;                   // in scope 0 at idna/src/uts46.rs:301:15: 301:16
+    let mut _8: usize;                   // in scope 0 at idna/src/uts46.rs:301:19: 301:30
+    let _10: usize;                      // in scope 0 at idna/src/uts46.rs:302:27: 302:28
+    let mut _11: usize;                  // in scope 0 at idna/src/uts46.rs:302:21: 302:29
+    let mut _12: bool;                   // in scope 0 at idna/src/uts46.rs:302:21: 302:29
+    let mut _13: bool;                   // in scope 0 at idna/src/uts46.rs:303:21: 303:29
+    let mut _14: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _15: bool;                   // in scope 0 at idna/src/uts46.rs:305:21: 305:30
+    let mut _16: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _17: bool;                   // in scope 0 at idna/src/uts46.rs:306:21: 306:30
+    let mut _18: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _19: bool;                   // in scope 0 at idna/src/uts46.rs:308:19: 308:30
+    let mut _20: bool;                   // in scope 0 at idna/src/uts46.rs:308:34: 308:45
+    let mut _21: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _22: bool;                   // in scope 0 at idna/src/uts46.rs:312:19: 312:30
+    let mut _23: bool;                   // in scope 0 at idna/src/uts46.rs:312:34: 312:45
+    let mut _24: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _25: bool;                   // in scope 0 at idna/src/uts46.rs:316:19: 316:30
+    let mut _26: bool;                   // in scope 0 at idna/src/uts46.rs:316:34: 316:45
+    let mut _27: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _28: u128;                   // in scope 0 at idna/src/uts46.rs:319:21: 319:31
+    let mut _29: bool;                   // in scope 0 at idna/src/uts46.rs:319:21: 319:31
+    let mut _30: (usize, bool);          // in scope 0 at idna/src/uts46.rs:320:13: 320:19
+    let mut _31: u128;                   // in scope 0 at idna/src/uts46.rs:322:16: 322:20
+    scope 1 {
+        debug bits => _3;                // in scope 1 at idna/src/uts46.rs:295:13: 295:21
+        let mut _4: usize;               // in scope 1 at idna/src/uts46.rs:299:13: 299:18
+        scope 2 {
+            debug i => _4;               // in scope 2 at idna/src/uts46.rs:299:13: 299:18
+            let _5: &[u8];               // in scope 2 at idna/src/uts46.rs:300:13: 300:18
+            scope 3 {
+                debug bytes => _5;       // in scope 3 at idna/src/uts46.rs:300:13: 300:18
+                let _9: u8;              // in scope 3 at idna/src/uts46.rs:302:17: 302:18
+                scope 4 {
+                    debug b => _9;       // in scope 4 at idna/src/uts46.rs:302:17: 302:18
+                }
+            }
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => idna/src/uts46.rs:296:12: 296:26 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => idna/src/uts46.rs:301:15: 301:30 (#0)
+    coverage branch { true: BlockMarkerId(4), false: BlockMarkerId(5) } => idna/src/uts46.rs:303:13: 303:64 (#44)
+    coverage branch { true: BlockMarkerId(6), false: BlockMarkerId(7) } => idna/src/uts46.rs:305:13: 305:76 (#48)
+    coverage branch { true: BlockMarkerId(8), false: BlockMarkerId(9) } => idna/src/uts46.rs:306:13: 306:79 (#52)
+    coverage branch { true: BlockMarkerId(10), false: BlockMarkerId(11) } => idna/src/uts46.rs:308:19: 308:30 (#0)
+    coverage branch { true: BlockMarkerId(12), false: BlockMarkerId(13) } => idna/src/uts46.rs:308:34: 308:45 (#0)
+    coverage branch { true: BlockMarkerId(14), false: BlockMarkerId(15) } => idna/src/uts46.rs:312:19: 312:30 (#0)
+    coverage branch { true: BlockMarkerId(16), false: BlockMarkerId(17) } => idna/src/uts46.rs:312:34: 312:45 (#0)
+    coverage branch { true: BlockMarkerId(18), false: BlockMarkerId(19) } => idna/src/uts46.rs:316:19: 316:30 (#0)
+    coverage branch { true: BlockMarkerId(20), false: BlockMarkerId(21) } => idna/src/uts46.rs:316:34: 316:45 (#0)
+
+    coverage Code { bcb: bcb0 } => idna/src/uts46.rs:294:5: 294:68 (#0);
+    coverage Code { bcb: bcb0 } => idna/src/uts46.rs:295:24: 295:39 (#0);
+    coverage Code { bcb: bcb0 } => idna/src/uts46.rs:296:12: 296:26 (#0);
+    coverage Code { bcb: bcb1 } => idna/src/uts46.rs:297:13: 297:35 (#0);
+    coverage Code { bcb: bcb27 } => idna/src/uts46.rs:298:9: 298:10 (#0);
+    coverage Code { bcb: bcb2 } => idna/src/uts46.rs:299:21: 299:22 (#0);
+    coverage Code { bcb: bcb2 } => idna/src/uts46.rs:300:21: 300:41 (#0);
+    coverage Code { bcb: bcb3 } => idna/src/uts46.rs:301:15: 301:30 (#0);
+    coverage Code { bcb: bcb4 } => idna/src/uts46.rs:302:21: 302:29 (#0);
+    coverage Code { bcb: bcb4 } => idna/src/uts46.rs:303:13: 303:20 (#0);
+    coverage Code { bcb: bcb4 } => idna/src/uts46.rs:303:21: 303:29 (#0);
+    coverage Code { bcb: bcb5 } => idna/src/uts46.rs:305:13: 305:20 (#0);
+    coverage Code { bcb: bcb5 } => idna/src/uts46.rs:305:21: 305:30 (#0);
+    coverage Code { bcb: bcb6 } => idna/src/uts46.rs:306:13: 306:20 (#0);
+    coverage Code { bcb: bcb6 } => idna/src/uts46.rs:306:21: 306:30 (#0);
+    coverage Code { bcb: bcb7 } => idna/src/uts46.rs:307:13: 307:20 (#0);
+    coverage Code { bcb: bcb7 } => idna/src/uts46.rs:308:19: 308:30 (#0);
+    coverage Code { bcb: bcb8 } => idna/src/uts46.rs:308:34: 308:45 (#0);
+    coverage Code { bcb: bcb11 } => idna/src/uts46.rs:311:13: 311:20 (#0);
+    coverage Code { bcb: bcb11 } => idna/src/uts46.rs:312:19: 312:30 (#0);
+    coverage Code { bcb: bcb12 } => idna/src/uts46.rs:312:34: 312:45 (#0);
+    coverage Code { bcb: bcb15 } => idna/src/uts46.rs:315:13: 315:20 (#0);
+    coverage Code { bcb: bcb15 } => idna/src/uts46.rs:316:19: 316:30 (#0);
+    coverage Code { bcb: bcb16 } => idna/src/uts46.rs:316:34: 316:45 (#0);
+    coverage Code { bcb: bcb19 } => idna/src/uts46.rs:319:13: 319:17 (#0);
+    coverage Code { bcb: bcb19 } => idna/src/uts46.rs:319:13: 319:31 (#0);
+    coverage Code { bcb: bcb19 } => idna/src/uts46.rs:320:13: 320:19 (#0);
+    coverage Code { bcb: bcb26 } => idna/src/uts46.rs:322:9: 322:22 (#0);
+    coverage Code { bcb: bcb26 } => idna/src/uts46.rs:323:5: 323:6 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb27 } => idna/src/uts46.rs:296:12: 296:26 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb26 } => idna/src/uts46.rs:301:15: 301:30 (#0);
+    coverage Branch { true_bcb: bcb8, false_bcb: bcb22 } => idna/src/uts46.rs:308:19: 308:30 (#0);
+    coverage Branch { true_bcb: bcb9, false_bcb: bcb10 } => idna/src/uts46.rs:308:34: 308:45 (#0);
+    coverage Branch { true_bcb: bcb12, false_bcb: bcb21 } => idna/src/uts46.rs:312:19: 312:30 (#0);
+    coverage Branch { true_bcb: bcb13, false_bcb: bcb14 } => idna/src/uts46.rs:312:34: 312:45 (#0);
+    coverage Branch { true_bcb: bcb16, false_bcb: bcb20 } => idna/src/uts46.rs:316:19: 316:30 (#0);
+    coverage Branch { true_bcb: bcb17, false_bcb: bcb18 } => idna/src/uts46.rs:316:34: 316:45 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 1 at idna/src/uts46.rs:296:12: 296:26
+        _3 = const uts46::UPPER_CASE_MASK; // scope 0 at idna/src/uts46.rs:295:24: 295:39
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 1 at idna/src/uts46.rs:296:12: 296:26
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 1 at idna/src/uts46.rs:296:9: 298:10
+        _3 = BitOr(copy _3, const uts46::GLYPHLESS_MASK); // scope 1 at idna/src/uts46.rs:297:13: 297:35
+        goto -> bb3;                     // scope 1 at idna/src/uts46.rs:296:9: 298:10
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb27); // scope 1 at idna/src/uts46.rs:296:9: 298:10
+        goto -> bb3;                     // scope 1 at idna/src/uts46.rs:296:9: 298:10
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 2 at idna/src/uts46.rs:300:21: 300:41
+        _4 = const 0_usize;              // scope 1 at idna/src/uts46.rs:299:21: 299:22
+        _5 = core::str::<impl str>::as_bytes(copy _2) -> [return: bb4, unwind continue]; // scope 2 at idna/src/uts46.rs:300:21: 300:41
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb3);  // scope 3 at idna/src/uts46.rs:301:9: 321:10
+        _7 = copy _4;                    // scope 3 at idna/src/uts46.rs:301:15: 301:16
+        _8 = PtrMetadata(copy _5);       // scope 3 at idna/src/uts46.rs:301:19: 301:30
+        _6 = Lt(move _7, move _8);       // scope 3 at idna/src/uts46.rs:301:15: 301:30
+        switchInt(move _6) -> [0: bb6, otherwise: bb5]; // scope 3 at idna/src/uts46.rs:301:15: 301:30
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb4);  // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        _10 = copy _4;                   // scope 3 at idna/src/uts46.rs:302:27: 302:28
+        _11 = PtrMetadata(copy _5);      // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        _12 = Lt(copy _10, copy _11);    // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        assert(move _12, "index out of bounds: the length is {} but the index is {}", move _11, copy _10) -> [success: bb7, unwind continue]; // scope 3 at idna/src/uts46.rs:302:21: 302:29
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb26); // scope 0 at idna/src/uts46.rs:323:6: 323:6
+        _31 = copy _3;                   // scope 3 at idna/src/uts46.rs:322:16: 322:20
+        _0 = uts46::AsciiDenyList { bits: move _31 }; // scope 3 at idna/src/uts46.rs:322:9: 322:22
+        return;                          // scope 0 at idna/src/uts46.rs:323:6: 323:6
+    }
+
+    bb7: {
+        _9 = copy (*_5)[_10];            // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        _13 = Lt(copy _9, const 128_u8); // scope 4 at idna/src/uts46.rs:303:21: 303:29
+        switchInt(move _13) -> [0: bb9, otherwise: bb8]; // scope 4 at idna/src/uts46.rs:303:21: 303:29
+    }
+
+    bb8: {
+        Coverage::VirtualCounter(bcb5);  // scope 4 at idna/src/uts46.rs:305:21: 305:30
+        _15 = Ne(copy _9, const 46_u8);  // scope 4 at idna/src/uts46.rs:305:21: 305:30
+        switchInt(move _15) -> [0: bb11, otherwise: bb10]; // scope 4 at idna/src/uts46.rs:305:21: 305:30
+    }
+
+    bb9: {
+        Coverage::VirtualCounter(bcb25); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _14 = panic(const "ASCII deny list must be ASCII.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb10: {
+        Coverage::VirtualCounter(bcb6);  // scope 4 at idna/src/uts46.rs:306:21: 306:30
+        _17 = Ne(copy _9, const 45_u8);  // scope 4 at idna/src/uts46.rs:306:21: 306:30
+        switchInt(move _17) -> [0: bb13, otherwise: bb12]; // scope 4 at idna/src/uts46.rs:306:21: 306:30
+    }
+
+    bb11: {
+        Coverage::VirtualCounter(bcb24); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _16 = panic(const "ASCII deny list must not contain the dot.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb12: {
+        Coverage::VirtualCounter(bcb7);  // scope 4 at idna/src/uts46.rs:308:19: 308:30
+        _19 = Ge(copy _9, const 48_u8);  // scope 4 at idna/src/uts46.rs:308:19: 308:30
+        switchInt(move _19) -> [0: bb15, otherwise: bb14]; // scope 4 at idna/src/uts46.rs:308:19: 308:30
+    }
+
+    bb13: {
+        Coverage::VirtualCounter(bcb23); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _18 = panic(const "ASCII deny list must not contain the hyphen.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb14: {
+        Coverage::VirtualCounter(bcb8);  // scope 4 at idna/src/uts46.rs:308:34: 308:45
+        _20 = Le(copy _9, const 57_u8);  // scope 4 at idna/src/uts46.rs:308:34: 308:45
+        switchInt(move _20) -> [0: bb17, otherwise: bb16]; // scope 4 at idna/src/uts46.rs:308:34: 308:45
+    }
+
+    bb15: {
+        Coverage::VirtualCounter(bcb22); // scope 4 at no-location
+        goto -> bb18;                    // scope 4 at no-location
+    }
+
+    bb16: {
+        Coverage::VirtualCounter(bcb9);  // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _21 = panic(const "ASCII deny list must not contain digits.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb17: {
+        Coverage::VirtualCounter(bcb10); // scope 4 at no-location
+        goto -> bb18;                    // scope 4 at no-location
+    }
+
+    bb18: {
+        Coverage::VirtualCounter(bcb11); // scope 4 at idna/src/uts46.rs:312:19: 312:30
+        _22 = Ge(copy _9, const 97_u8);  // scope 4 at idna/src/uts46.rs:312:19: 312:30
+        switchInt(move _22) -> [0: bb20, otherwise: bb19]; // scope 4 at idna/src/uts46.rs:312:19: 312:30
+    }
+
+    bb19: {
+        Coverage::VirtualCounter(bcb12); // scope 4 at idna/src/uts46.rs:312:34: 312:45
+        _23 = Le(copy _9, const 122_u8); // scope 4 at idna/src/uts46.rs:312:34: 312:45
+        switchInt(move _23) -> [0: bb22, otherwise: bb21]; // scope 4 at idna/src/uts46.rs:312:34: 312:45
+    }
+
+    bb20: {
+        Coverage::VirtualCounter(bcb21); // scope 4 at no-location
+        goto -> bb23;                    // scope 4 at no-location
+    }
+
+    bb21: {
+        Coverage::VirtualCounter(bcb13); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _24 = panic(const "ASCII deny list must not contain letters.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb22: {
+        Coverage::VirtualCounter(bcb14); // scope 4 at no-location
+        goto -> bb23;                    // scope 4 at no-location
+    }
+
+    bb23: {
+        Coverage::VirtualCounter(bcb15); // scope 4 at idna/src/uts46.rs:316:19: 316:30
+        _25 = Ge(copy _9, const 65_u8);  // scope 4 at idna/src/uts46.rs:316:19: 316:30
+        switchInt(move _25) -> [0: bb25, otherwise: bb24]; // scope 4 at idna/src/uts46.rs:316:19: 316:30
+    }
+
+    bb24: {
+        Coverage::VirtualCounter(bcb16); // scope 4 at idna/src/uts46.rs:316:34: 316:45
+        _26 = Le(copy _9, const 90_u8);  // scope 4 at idna/src/uts46.rs:316:34: 316:45
+        switchInt(move _26) -> [0: bb27, otherwise: bb26]; // scope 4 at idna/src/uts46.rs:316:34: 316:45
+    }
+
+    bb25: {
+        Coverage::VirtualCounter(bcb20); // scope 4 at no-location
+        goto -> bb28;                    // scope 4 at no-location
+    }
+
+    bb26: {
+        Coverage::VirtualCounter(bcb17); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _27 = panic(const "ASCII deny list must not contain letters.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb27: {
+        Coverage::VirtualCounter(bcb18); // scope 4 at no-location
+        goto -> bb28;                    // scope 4 at no-location
+    }
+
+    bb28: {
+        Coverage::VirtualCounter(bcb19); // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        _29 = Lt(copy _9, const 128_u8); // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        assert(move _29, "attempt to shift left by `{}`, which would overflow", copy _9) -> [success: bb29, unwind continue]; // scope 4 at idna/src/uts46.rs:319:21: 319:31
+    }
+
+    bb29: {
+        _28 = Shl(const 1_u128, copy _9); // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        _3 = BitOr(copy _3, move _28);   // scope 4 at idna/src/uts46.rs:319:13: 319:31
+        _30 = AddWithOverflow(copy _4, const 1_usize); // scope 4 at idna/src/uts46.rs:320:13: 320:19
+        assert(!move (_30.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _4, const 1_usize) -> [success: bb30, unwind continue]; // scope 4 at idna/src/uts46.rs:320:13: 320:19
+    }
+
+    bb30: {
+        _4 = move (_30.0: usize);        // scope 4 at idna/src/uts46.rs:320:13: 320:19
+        goto -> bb4;                     // scope 3 at idna/src/uts46.rs:301:9: 321:10
+    }
+}
+
+// MIR FOR CTFE
+fn uts46::<impl at idna/src/uts46.rs:276:1: 276:19>::new(_1: bool, _2: &str) -> uts46::AsciiDenyList {
+    debug deny_glyphless => _1;          // in scope 0 at idna/src/uts46.rs:294:22: 294:36
+    debug deny_list => _2;               // in scope 0 at idna/src/uts46.rs:294:44: 294:53
+    let mut _0: uts46::AsciiDenyList;    // return place in scope 0 at idna/src/uts46.rs:294:64: 294:68
+    let mut _3: u128;                    // in scope 0 at idna/src/uts46.rs:295:13: 295:21
+    let _4: ();                          // in scope 0 at idna/src/uts46.rs:296:9: 298:10
+    let mut _5: bool;                    // in scope 0 at idna/src/uts46.rs:296:12: 296:26
+    let mut _8: &str;                    // in scope 0 at idna/src/uts46.rs:300:21: 300:30
+    let _9: ();                          // in scope 0 at idna/src/uts46.rs:301:9: 321:10
+    let mut _10: ();                     // in scope 0 at idna/src/uts46.rs:294:5: 323:6
+    let mut _11: bool;                   // in scope 0 at idna/src/uts46.rs:301:15: 301:30
+    let mut _12: usize;                  // in scope 0 at idna/src/uts46.rs:301:15: 301:16
+    let mut _13: usize;                  // in scope 0 at idna/src/uts46.rs:301:19: 301:30
+    let mut _14: &[u8];                  // in scope 0 at idna/src/uts46.rs:301:19: 301:24
+    let _16: usize;                      // in scope 0 at idna/src/uts46.rs:302:27: 302:28
+    let mut _17: usize;                  // in scope 0 at idna/src/uts46.rs:302:21: 302:29
+    let mut _18: bool;                   // in scope 0 at idna/src/uts46.rs:302:21: 302:29
+    let _19: ();                         // in scope 0 at idna/src/uts46.rs:303:13: 303:64
+    let mut _20: bool;                   // in scope 0 at idna/src/uts46.rs:303:21: 303:29
+    let mut _21: u8;                     // in scope 0 at idna/src/uts46.rs:303:21: 303:22
+    let mut _22: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let _23: ();                         // in scope 0 at idna/src/uts46.rs:305:13: 305:76
+    let mut _24: bool;                   // in scope 0 at idna/src/uts46.rs:305:21: 305:30
+    let mut _25: u8;                     // in scope 0 at idna/src/uts46.rs:305:21: 305:22
+    let mut _26: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let _27: ();                         // in scope 0 at idna/src/uts46.rs:306:13: 306:79
+    let mut _28: bool;                   // in scope 0 at idna/src/uts46.rs:306:21: 306:30
+    let mut _29: u8;                     // in scope 0 at idna/src/uts46.rs:306:21: 306:22
+    let mut _30: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let _31: ();                         // in scope 0 at idna/src/uts46.rs:307:13: 310:14
+    let mut _32: bool;                   // in scope 0 at idna/src/uts46.rs:308:19: 308:30
+    let mut _33: u8;                     // in scope 0 at idna/src/uts46.rs:308:20: 308:21
+    let mut _34: bool;                   // in scope 0 at idna/src/uts46.rs:308:34: 308:45
+    let mut _35: u8;                     // in scope 0 at idna/src/uts46.rs:308:35: 308:36
+    let mut _36: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let _37: ();                         // in scope 0 at idna/src/uts46.rs:311:13: 314:14
+    let mut _38: bool;                   // in scope 0 at idna/src/uts46.rs:312:19: 312:30
+    let mut _39: u8;                     // in scope 0 at idna/src/uts46.rs:312:20: 312:21
+    let mut _40: bool;                   // in scope 0 at idna/src/uts46.rs:312:34: 312:45
+    let mut _41: u8;                     // in scope 0 at idna/src/uts46.rs:312:35: 312:36
+    let mut _42: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let _43: ();                         // in scope 0 at idna/src/uts46.rs:315:13: 318:14
+    let mut _44: bool;                   // in scope 0 at idna/src/uts46.rs:316:19: 316:30
+    let mut _45: u8;                     // in scope 0 at idna/src/uts46.rs:316:20: 316:21
+    let mut _46: bool;                   // in scope 0 at idna/src/uts46.rs:316:34: 316:45
+    let mut _47: u8;                     // in scope 0 at idna/src/uts46.rs:316:35: 316:36
+    let mut _48: !;                      // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    let mut _49: u128;                   // in scope 0 at idna/src/uts46.rs:319:21: 319:31
+    let mut _50: u8;                     // in scope 0 at idna/src/uts46.rs:319:30: 319:31
+    let mut _51: bool;                   // in scope 0 at idna/src/uts46.rs:319:21: 319:31
+    let mut _52: (usize, bool);          // in scope 0 at idna/src/uts46.rs:320:13: 320:19
+    let mut _53: !;                      // in scope 0 at idna/src/uts46.rs:301:9: 321:10
+    let _54: ();                         // in scope 0 at idna/src/uts46.rs:301:9: 321:10
+    let mut _55: !;                      // in scope 0 at idna/src/uts46.rs:301:9: 321:10
+    let mut _56: u128;                   // in scope 0 at idna/src/uts46.rs:322:16: 322:20
+    scope 1 {
+        debug bits => _3;                // in scope 1 at idna/src/uts46.rs:295:13: 295:21
+        let mut _6: usize;               // in scope 1 at idna/src/uts46.rs:299:13: 299:18
+        scope 2 {
+            debug i => _6;               // in scope 2 at idna/src/uts46.rs:299:13: 299:18
+            let _7: &[u8];               // in scope 2 at idna/src/uts46.rs:300:13: 300:18
+            scope 3 {
+                debug bytes => _7;       // in scope 3 at idna/src/uts46.rs:300:13: 300:18
+                let _15: u8;             // in scope 3 at idna/src/uts46.rs:302:17: 302:18
+                scope 4 {
+                    debug b => _15;      // in scope 4 at idna/src/uts46.rs:302:17: 302:18
+                }
+            }
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => idna/src/uts46.rs:296:12: 296:26 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => idna/src/uts46.rs:301:15: 301:30 (#0)
+    coverage branch { true: BlockMarkerId(4), false: BlockMarkerId(5) } => idna/src/uts46.rs:303:13: 303:64 (#44)
+    coverage branch { true: BlockMarkerId(6), false: BlockMarkerId(7) } => idna/src/uts46.rs:305:13: 305:76 (#48)
+    coverage branch { true: BlockMarkerId(8), false: BlockMarkerId(9) } => idna/src/uts46.rs:306:13: 306:79 (#52)
+    coverage branch { true: BlockMarkerId(10), false: BlockMarkerId(11) } => idna/src/uts46.rs:308:19: 308:30 (#0)
+    coverage branch { true: BlockMarkerId(12), false: BlockMarkerId(13) } => idna/src/uts46.rs:308:34: 308:45 (#0)
+    coverage branch { true: BlockMarkerId(14), false: BlockMarkerId(15) } => idna/src/uts46.rs:312:19: 312:30 (#0)
+    coverage branch { true: BlockMarkerId(16), false: BlockMarkerId(17) } => idna/src/uts46.rs:312:34: 312:45 (#0)
+    coverage branch { true: BlockMarkerId(18), false: BlockMarkerId(19) } => idna/src/uts46.rs:316:19: 316:30 (#0)
+    coverage branch { true: BlockMarkerId(20), false: BlockMarkerId(21) } => idna/src/uts46.rs:316:34: 316:45 (#0)
+
+    coverage Code { bcb: bcb0 } => idna/src/uts46.rs:294:5: 294:68 (#0);
+    coverage Code { bcb: bcb0 } => idna/src/uts46.rs:295:24: 295:39 (#0);
+    coverage Code { bcb: bcb0 } => idna/src/uts46.rs:296:12: 296:26 (#0);
+    coverage Code { bcb: bcb1 } => idna/src/uts46.rs:297:13: 297:35 (#0);
+    coverage Code { bcb: bcb27 } => idna/src/uts46.rs:298:9: 298:10 (#0);
+    coverage Code { bcb: bcb2 } => idna/src/uts46.rs:299:21: 299:22 (#0);
+    coverage Code { bcb: bcb2 } => idna/src/uts46.rs:300:21: 300:41 (#0);
+    coverage Code { bcb: bcb3 } => idna/src/uts46.rs:301:15: 301:30 (#0);
+    coverage Code { bcb: bcb4 } => idna/src/uts46.rs:302:21: 302:29 (#0);
+    coverage Code { bcb: bcb4 } => idna/src/uts46.rs:303:13: 303:20 (#0);
+    coverage Code { bcb: bcb4 } => idna/src/uts46.rs:303:21: 303:29 (#0);
+    coverage Code { bcb: bcb5 } => idna/src/uts46.rs:305:13: 305:20 (#0);
+    coverage Code { bcb: bcb5 } => idna/src/uts46.rs:305:21: 305:30 (#0);
+    coverage Code { bcb: bcb6 } => idna/src/uts46.rs:306:13: 306:20 (#0);
+    coverage Code { bcb: bcb6 } => idna/src/uts46.rs:306:21: 306:30 (#0);
+    coverage Code { bcb: bcb7 } => idna/src/uts46.rs:307:13: 307:20 (#0);
+    coverage Code { bcb: bcb7 } => idna/src/uts46.rs:308:19: 308:30 (#0);
+    coverage Code { bcb: bcb8 } => idna/src/uts46.rs:308:34: 308:45 (#0);
+    coverage Code { bcb: bcb11 } => idna/src/uts46.rs:311:13: 311:20 (#0);
+    coverage Code { bcb: bcb11 } => idna/src/uts46.rs:312:19: 312:30 (#0);
+    coverage Code { bcb: bcb12 } => idna/src/uts46.rs:312:34: 312:45 (#0);
+    coverage Code { bcb: bcb15 } => idna/src/uts46.rs:315:13: 315:20 (#0);
+    coverage Code { bcb: bcb15 } => idna/src/uts46.rs:316:19: 316:30 (#0);
+    coverage Code { bcb: bcb16 } => idna/src/uts46.rs:316:34: 316:45 (#0);
+    coverage Code { bcb: bcb19 } => idna/src/uts46.rs:319:13: 319:17 (#0);
+    coverage Code { bcb: bcb19 } => idna/src/uts46.rs:319:13: 319:31 (#0);
+    coverage Code { bcb: bcb19 } => idna/src/uts46.rs:320:13: 320:19 (#0);
+    coverage Code { bcb: bcb26 } => idna/src/uts46.rs:322:9: 322:22 (#0);
+    coverage Code { bcb: bcb26 } => idna/src/uts46.rs:323:5: 323:6 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb27 } => idna/src/uts46.rs:296:12: 296:26 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb26 } => idna/src/uts46.rs:301:15: 301:30 (#0);
+    coverage Branch { true_bcb: bcb8, false_bcb: bcb22 } => idna/src/uts46.rs:308:19: 308:30 (#0);
+    coverage Branch { true_bcb: bcb9, false_bcb: bcb10 } => idna/src/uts46.rs:308:34: 308:45 (#0);
+    coverage Branch { true_bcb: bcb12, false_bcb: bcb21 } => idna/src/uts46.rs:312:19: 312:30 (#0);
+    coverage Branch { true_bcb: bcb13, false_bcb: bcb14 } => idna/src/uts46.rs:312:34: 312:45 (#0);
+    coverage Branch { true_bcb: bcb16, false_bcb: bcb20 } => idna/src/uts46.rs:316:19: 316:30 (#0);
+    coverage Branch { true_bcb: bcb17, false_bcb: bcb18 } => idna/src/uts46.rs:316:34: 316:45 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 1 at idna/src/uts46.rs:296:12: 296:26
+        StorageLive(_3);                 // scope 0 at idna/src/uts46.rs:295:13: 295:21
+        _3 = const uts46::UPPER_CASE_MASK; // scope 0 at idna/src/uts46.rs:295:24: 295:39
+        StorageLive(_4);                 // scope 1 at idna/src/uts46.rs:296:9: 298:10
+        StorageLive(_5);                 // scope 1 at idna/src/uts46.rs:296:12: 296:26
+        _5 = copy _1;                    // scope 1 at idna/src/uts46.rs:296:12: 296:26
+        switchInt(move _5) -> [0: bb2, otherwise: bb1]; // scope 1 at idna/src/uts46.rs:296:12: 296:26
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 1 at idna/src/uts46.rs:296:9: 298:10
+        _3 = BitOr(copy _3, const uts46::GLYPHLESS_MASK); // scope 1 at idna/src/uts46.rs:297:13: 297:35
+        _4 = const ();                   // scope 1 at idna/src/uts46.rs:296:27: 298:10
+        goto -> bb3;                     // scope 1 at idna/src/uts46.rs:296:9: 298:10
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb27); // scope 1 at idna/src/uts46.rs:296:9: 298:10
+        _4 = const ();                   // scope 1 at idna/src/uts46.rs:298:10: 298:10
+        goto -> bb3;                     // scope 1 at idna/src/uts46.rs:296:9: 298:10
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 2 at idna/src/uts46.rs:300:21: 300:41
+        StorageDead(_5);                 // scope 1 at idna/src/uts46.rs:298:9: 298:10
+        StorageDead(_4);                 // scope 1 at idna/src/uts46.rs:298:9: 298:10
+        StorageLive(_6);                 // scope 1 at idna/src/uts46.rs:299:13: 299:18
+        _6 = const 0_usize;              // scope 1 at idna/src/uts46.rs:299:21: 299:22
+        StorageLive(_7);                 // scope 2 at idna/src/uts46.rs:300:13: 300:18
+        StorageLive(_8);                 // scope 2 at idna/src/uts46.rs:300:21: 300:30
+        _8 = &(*_2);                     // scope 2 at idna/src/uts46.rs:300:21: 300:30
+        ConstEvalCounter;                // scope 2 at idna/src/uts46.rs:300:21: 300:41
+        _7 = core::str::<impl str>::as_bytes(move _8) -> [return: bb4, unwind continue]; // scope 2 at idna/src/uts46.rs:300:21: 300:41
+    }
+
+    bb4: {
+        StorageDead(_8);                 // scope 2 at idna/src/uts46.rs:300:40: 300:41
+        StorageLive(_9);                 // scope 3 at idna/src/uts46.rs:301:9: 321:10
+        goto -> bb5;                     // scope 3 at idna/src/uts46.rs:301:9: 321:10
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb3);  // scope 3 at idna/src/uts46.rs:301:9: 321:10
+        StorageLive(_11);                // scope 3 at idna/src/uts46.rs:301:15: 301:30
+        StorageLive(_12);                // scope 3 at idna/src/uts46.rs:301:15: 301:16
+        _12 = copy _6;                   // scope 3 at idna/src/uts46.rs:301:15: 301:16
+        StorageLive(_13);                // scope 3 at idna/src/uts46.rs:301:19: 301:30
+        StorageLive(_14);                // scope 3 at idna/src/uts46.rs:301:19: 301:24
+        _14 = &(*_7);                    // scope 3 at idna/src/uts46.rs:301:19: 301:24
+        ConstEvalCounter;                // scope 3 at idna/src/uts46.rs:301:19: 301:30
+        _13 = core::slice::<impl [u8]>::len(move _14) -> [return: bb6, unwind continue]; // scope 3 at idna/src/uts46.rs:301:19: 301:30
+    }
+
+    bb6: {
+        StorageDead(_14);                // scope 3 at idna/src/uts46.rs:301:29: 301:30
+        _11 = Lt(move _12, move _13);    // scope 3 at idna/src/uts46.rs:301:15: 301:30
+        switchInt(move _11) -> [0: bb8, otherwise: bb7]; // scope 3 at idna/src/uts46.rs:301:15: 301:30
+    }
+
+    bb7: {
+        Coverage::VirtualCounter(bcb4);  // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        StorageDead(_13);                // scope 3 at idna/src/uts46.rs:301:29: 301:30
+        StorageDead(_12);                // scope 3 at idna/src/uts46.rs:301:29: 301:30
+        StorageLive(_15);                // scope 3 at idna/src/uts46.rs:302:17: 302:18
+        StorageLive(_16);                // scope 3 at idna/src/uts46.rs:302:27: 302:28
+        _16 = copy _6;                   // scope 3 at idna/src/uts46.rs:302:27: 302:28
+        _17 = PtrMetadata(copy _7);      // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        _18 = Lt(copy _16, copy _17);    // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        assert(move _18, "index out of bounds: the length is {} but the index is {}", move _17, copy _16) -> [success: bb9, unwind continue]; // scope 3 at idna/src/uts46.rs:302:21: 302:29
+    }
+
+    bb8: {
+        Coverage::VirtualCounter(bcb26); // scope 0 at idna/src/uts46.rs:323:6: 323:6
+        StorageDead(_13);                // scope 3 at idna/src/uts46.rs:301:29: 301:30
+        StorageDead(_12);                // scope 3 at idna/src/uts46.rs:301:29: 301:30
+        StorageLive(_54);                // scope 3 at idna/src/uts46.rs:301:9: 321:10
+        _9 = const ();                   // scope 3 at idna/src/uts46.rs:301:9: 321:10
+        StorageDead(_54);                // scope 3 at idna/src/uts46.rs:321:9: 321:10
+        StorageDead(_11);                // scope 3 at idna/src/uts46.rs:321:9: 321:10
+        StorageDead(_9);                 // scope 3 at idna/src/uts46.rs:321:9: 321:10
+        StorageLive(_56);                // scope 3 at idna/src/uts46.rs:322:16: 322:20
+        _56 = copy _3;                   // scope 3 at idna/src/uts46.rs:322:16: 322:20
+        _0 = uts46::AsciiDenyList { bits: move _56 }; // scope 3 at idna/src/uts46.rs:322:9: 322:22
+        StorageDead(_56);                // scope 3 at idna/src/uts46.rs:322:21: 322:22
+        StorageDead(_7);                 // scope 2 at idna/src/uts46.rs:323:5: 323:6
+        StorageDead(_6);                 // scope 1 at idna/src/uts46.rs:323:5: 323:6
+        StorageDead(_3);                 // scope 0 at idna/src/uts46.rs:323:5: 323:6
+        return;                          // scope 0 at idna/src/uts46.rs:323:6: 323:6
+    }
+
+    bb9: {
+        _15 = copy (*_7)[_16];           // scope 3 at idna/src/uts46.rs:302:21: 302:29
+        StorageDead(_16);                // scope 3 at idna/src/uts46.rs:302:29: 302:30
+        StorageLive(_19);                // scope 4 at idna/src/uts46.rs:303:13: 303:64
+        StorageLive(_20);                // scope 4 at idna/src/uts46.rs:303:21: 303:29
+        StorageLive(_21);                // scope 4 at idna/src/uts46.rs:303:21: 303:22
+        _21 = copy _15;                  // scope 4 at idna/src/uts46.rs:303:21: 303:22
+        _20 = Lt(move _21, const 128_u8); // scope 4 at idna/src/uts46.rs:303:21: 303:29
+        switchInt(move _20) -> [0: bb11, otherwise: bb10]; // scope 4 at idna/src/uts46.rs:303:21: 303:29
+    }
+
+    bb10: {
+        Coverage::VirtualCounter(bcb5);  // scope 4 at idna/src/uts46.rs:305:21: 305:30
+        StorageDead(_21);                // scope 4 at idna/src/uts46.rs:303:28: 303:29
+        _19 = const ();                  // scope 4 at idna/src/uts46.rs:303:64: 303:64
+        StorageDead(_20);                // scope 4 at idna/src/uts46.rs:303:63: 303:64
+        StorageDead(_19);                // scope 4 at idna/src/uts46.rs:303:63: 303:64
+        StorageLive(_23);                // scope 4 at idna/src/uts46.rs:305:13: 305:76
+        StorageLive(_24);                // scope 4 at idna/src/uts46.rs:305:21: 305:30
+        StorageLive(_25);                // scope 4 at idna/src/uts46.rs:305:21: 305:22
+        _25 = copy _15;                  // scope 4 at idna/src/uts46.rs:305:21: 305:22
+        _24 = Ne(move _25, const 46_u8); // scope 4 at idna/src/uts46.rs:305:21: 305:30
+        switchInt(move _24) -> [0: bb13, otherwise: bb12]; // scope 4 at idna/src/uts46.rs:305:21: 305:30
+    }
+
+    bb11: {
+        Coverage::VirtualCounter(bcb25); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        StorageDead(_21);                // scope 4 at idna/src/uts46.rs:303:28: 303:29
+        StorageLive(_22);                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        ConstEvalCounter;                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _22 = panic(const "ASCII deny list must be ASCII.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb12: {
+        Coverage::VirtualCounter(bcb6);  // scope 4 at idna/src/uts46.rs:306:21: 306:30
+        StorageDead(_25);                // scope 4 at idna/src/uts46.rs:305:29: 305:30
+        _23 = const ();                  // scope 4 at idna/src/uts46.rs:305:76: 305:76
+        StorageDead(_24);                // scope 4 at idna/src/uts46.rs:305:75: 305:76
+        StorageDead(_23);                // scope 4 at idna/src/uts46.rs:305:75: 305:76
+        StorageLive(_27);                // scope 4 at idna/src/uts46.rs:306:13: 306:79
+        StorageLive(_28);                // scope 4 at idna/src/uts46.rs:306:21: 306:30
+        StorageLive(_29);                // scope 4 at idna/src/uts46.rs:306:21: 306:22
+        _29 = copy _15;                  // scope 4 at idna/src/uts46.rs:306:21: 306:22
+        _28 = Ne(move _29, const 45_u8); // scope 4 at idna/src/uts46.rs:306:21: 306:30
+        switchInt(move _28) -> [0: bb15, otherwise: bb14]; // scope 4 at idna/src/uts46.rs:306:21: 306:30
+    }
+
+    bb13: {
+        Coverage::VirtualCounter(bcb24); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        StorageDead(_25);                // scope 4 at idna/src/uts46.rs:305:29: 305:30
+        StorageLive(_26);                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        ConstEvalCounter;                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _26 = panic(const "ASCII deny list must not contain the dot.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb14: {
+        Coverage::VirtualCounter(bcb7);  // scope 4 at idna/src/uts46.rs:308:19: 308:30
+        StorageDead(_29);                // scope 4 at idna/src/uts46.rs:306:29: 306:30
+        _27 = const ();                  // scope 4 at idna/src/uts46.rs:306:79: 306:79
+        StorageDead(_28);                // scope 4 at idna/src/uts46.rs:306:78: 306:79
+        StorageDead(_27);                // scope 4 at idna/src/uts46.rs:306:78: 306:79
+        StorageLive(_31);                // scope 4 at idna/src/uts46.rs:307:13: 310:14
+        StorageLive(_32);                // scope 4 at idna/src/uts46.rs:308:19: 308:30
+        StorageLive(_33);                // scope 4 at idna/src/uts46.rs:308:20: 308:21
+        _33 = copy _15;                  // scope 4 at idna/src/uts46.rs:308:20: 308:21
+        _32 = Ge(move _33, const 48_u8); // scope 4 at idna/src/uts46.rs:308:19: 308:30
+        switchInt(move _32) -> [0: bb17, otherwise: bb16]; // scope 4 at idna/src/uts46.rs:308:19: 308:30
+    }
+
+    bb15: {
+        Coverage::VirtualCounter(bcb23); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        StorageDead(_29);                // scope 4 at idna/src/uts46.rs:306:29: 306:30
+        StorageLive(_30);                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        ConstEvalCounter;                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _30 = panic(const "ASCII deny list must not contain the hyphen.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb16: {
+        Coverage::VirtualCounter(bcb8);  // scope 4 at idna/src/uts46.rs:308:34: 308:45
+        StorageDead(_33);                // scope 4 at idna/src/uts46.rs:308:29: 308:30
+        StorageLive(_34);                // scope 4 at idna/src/uts46.rs:308:34: 308:45
+        StorageLive(_35);                // scope 4 at idna/src/uts46.rs:308:35: 308:36
+        _35 = copy _15;                  // scope 4 at idna/src/uts46.rs:308:35: 308:36
+        _34 = Le(move _35, const 57_u8); // scope 4 at idna/src/uts46.rs:308:34: 308:45
+        switchInt(move _34) -> [0: bb19, otherwise: bb18]; // scope 4 at idna/src/uts46.rs:308:34: 308:45
+    }
+
+    bb17: {
+        Coverage::VirtualCounter(bcb22); // scope 4 at no-location
+        StorageDead(_33);                // scope 4 at idna/src/uts46.rs:308:29: 308:30
+        goto -> bb20;                    // scope 4 at no-location
+    }
+
+    bb18: {
+        Coverage::VirtualCounter(bcb9);  // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        StorageDead(_35);                // scope 4 at idna/src/uts46.rs:308:44: 308:45
+        StorageLive(_36);                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        ConstEvalCounter;                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _36 = panic(const "ASCII deny list must not contain digits.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb19: {
+        Coverage::VirtualCounter(bcb10); // scope 4 at no-location
+        StorageDead(_35);                // scope 4 at idna/src/uts46.rs:308:44: 308:45
+        goto -> bb20;                    // scope 4 at no-location
+    }
+
+    bb20: {
+        Coverage::VirtualCounter(bcb11); // scope 4 at idna/src/uts46.rs:312:19: 312:30
+        _31 = const ();                  // scope 4 at idna/src/uts46.rs:310:14: 310:14
+        StorageDead(_34);                // scope 4 at idna/src/uts46.rs:310:13: 310:14
+        StorageDead(_32);                // scope 4 at idna/src/uts46.rs:310:13: 310:14
+        StorageDead(_31);                // scope 4 at idna/src/uts46.rs:310:13: 310:14
+        StorageLive(_37);                // scope 4 at idna/src/uts46.rs:311:13: 314:14
+        StorageLive(_38);                // scope 4 at idna/src/uts46.rs:312:19: 312:30
+        StorageLive(_39);                // scope 4 at idna/src/uts46.rs:312:20: 312:21
+        _39 = copy _15;                  // scope 4 at idna/src/uts46.rs:312:20: 312:21
+        _38 = Ge(move _39, const 97_u8); // scope 4 at idna/src/uts46.rs:312:19: 312:30
+        switchInt(move _38) -> [0: bb22, otherwise: bb21]; // scope 4 at idna/src/uts46.rs:312:19: 312:30
+    }
+
+    bb21: {
+        Coverage::VirtualCounter(bcb12); // scope 4 at idna/src/uts46.rs:312:34: 312:45
+        StorageDead(_39);                // scope 4 at idna/src/uts46.rs:312:29: 312:30
+        StorageLive(_40);                // scope 4 at idna/src/uts46.rs:312:34: 312:45
+        StorageLive(_41);                // scope 4 at idna/src/uts46.rs:312:35: 312:36
+        _41 = copy _15;                  // scope 4 at idna/src/uts46.rs:312:35: 312:36
+        _40 = Le(move _41, const 122_u8); // scope 4 at idna/src/uts46.rs:312:34: 312:45
+        switchInt(move _40) -> [0: bb24, otherwise: bb23]; // scope 4 at idna/src/uts46.rs:312:34: 312:45
+    }
+
+    bb22: {
+        Coverage::VirtualCounter(bcb21); // scope 4 at no-location
+        StorageDead(_39);                // scope 4 at idna/src/uts46.rs:312:29: 312:30
+        goto -> bb25;                    // scope 4 at no-location
+    }
+
+    bb23: {
+        Coverage::VirtualCounter(bcb13); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        StorageDead(_41);                // scope 4 at idna/src/uts46.rs:312:44: 312:45
+        StorageLive(_42);                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        ConstEvalCounter;                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _42 = panic(const "ASCII deny list must not contain letters.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb24: {
+        Coverage::VirtualCounter(bcb14); // scope 4 at no-location
+        StorageDead(_41);                // scope 4 at idna/src/uts46.rs:312:44: 312:45
+        goto -> bb25;                    // scope 4 at no-location
+    }
+
+    bb25: {
+        Coverage::VirtualCounter(bcb15); // scope 4 at idna/src/uts46.rs:316:19: 316:30
+        _37 = const ();                  // scope 4 at idna/src/uts46.rs:314:14: 314:14
+        StorageDead(_40);                // scope 4 at idna/src/uts46.rs:314:13: 314:14
+        StorageDead(_38);                // scope 4 at idna/src/uts46.rs:314:13: 314:14
+        StorageDead(_37);                // scope 4 at idna/src/uts46.rs:314:13: 314:14
+        StorageLive(_43);                // scope 4 at idna/src/uts46.rs:315:13: 318:14
+        StorageLive(_44);                // scope 4 at idna/src/uts46.rs:316:19: 316:30
+        StorageLive(_45);                // scope 4 at idna/src/uts46.rs:316:20: 316:21
+        _45 = copy _15;                  // scope 4 at idna/src/uts46.rs:316:20: 316:21
+        _44 = Ge(move _45, const 65_u8); // scope 4 at idna/src/uts46.rs:316:19: 316:30
+        switchInt(move _44) -> [0: bb27, otherwise: bb26]; // scope 4 at idna/src/uts46.rs:316:19: 316:30
+    }
+
+    bb26: {
+        Coverage::VirtualCounter(bcb16); // scope 4 at idna/src/uts46.rs:316:34: 316:45
+        StorageDead(_45);                // scope 4 at idna/src/uts46.rs:316:29: 316:30
+        StorageLive(_46);                // scope 4 at idna/src/uts46.rs:316:34: 316:45
+        StorageLive(_47);                // scope 4 at idna/src/uts46.rs:316:35: 316:36
+        _47 = copy _15;                  // scope 4 at idna/src/uts46.rs:316:35: 316:36
+        _46 = Le(move _47, const 90_u8); // scope 4 at idna/src/uts46.rs:316:34: 316:45
+        switchInt(move _46) -> [0: bb29, otherwise: bb28]; // scope 4 at idna/src/uts46.rs:316:34: 316:45
+    }
+
+    bb27: {
+        Coverage::VirtualCounter(bcb20); // scope 4 at no-location
+        StorageDead(_45);                // scope 4 at idna/src/uts46.rs:316:29: 316:30
+        goto -> bb30;                    // scope 4 at no-location
+    }
+
+    bb28: {
+        Coverage::VirtualCounter(bcb17); // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        StorageDead(_47);                // scope 4 at idna/src/uts46.rs:316:44: 316:45
+        StorageLive(_48);                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        ConstEvalCounter;                // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+        _48 = panic(const "ASCII deny list must not contain letters.") -> unwind continue; // scope 4 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/panic.rs:28:9: 28:39
+    }
+
+    bb29: {
+        Coverage::VirtualCounter(bcb18); // scope 4 at no-location
+        StorageDead(_47);                // scope 4 at idna/src/uts46.rs:316:44: 316:45
+        goto -> bb30;                    // scope 4 at no-location
+    }
+
+    bb30: {
+        Coverage::VirtualCounter(bcb19); // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        _43 = const ();                  // scope 4 at idna/src/uts46.rs:318:14: 318:14
+        StorageDead(_46);                // scope 4 at idna/src/uts46.rs:318:13: 318:14
+        StorageDead(_44);                // scope 4 at idna/src/uts46.rs:318:13: 318:14
+        StorageDead(_43);                // scope 4 at idna/src/uts46.rs:318:13: 318:14
+        StorageLive(_49);                // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        StorageLive(_50);                // scope 4 at idna/src/uts46.rs:319:30: 319:31
+        _50 = copy _15;                  // scope 4 at idna/src/uts46.rs:319:30: 319:31
+        _51 = Lt(copy _50, const 128_u8); // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        assert(move _51, "attempt to shift left by `{}`, which would overflow", copy _50) -> [success: bb31, unwind continue]; // scope 4 at idna/src/uts46.rs:319:21: 319:31
+    }
+
+    bb31: {
+        _49 = Shl(const 1_u128, move _50); // scope 4 at idna/src/uts46.rs:319:21: 319:31
+        StorageDead(_50);                // scope 4 at idna/src/uts46.rs:319:30: 319:31
+        _3 = BitOr(copy _3, move _49);   // scope 4 at idna/src/uts46.rs:319:13: 319:31
+        StorageDead(_49);                // scope 4 at idna/src/uts46.rs:319:30: 319:31
+        _52 = AddWithOverflow(copy _6, const 1_usize); // scope 4 at idna/src/uts46.rs:320:13: 320:19
+        assert(!move (_52.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _6, const 1_usize) -> [success: bb32, unwind continue]; // scope 4 at idna/src/uts46.rs:320:13: 320:19
+    }
+
+    bb32: {
+        _6 = move (_52.0: usize);        // scope 4 at idna/src/uts46.rs:320:13: 320:19
+        _10 = const ();                  // scope 3 at idna/src/uts46.rs:301:31: 321:10
+        StorageDead(_15);                // scope 3 at idna/src/uts46.rs:321:9: 321:10
+        StorageDead(_11);                // scope 3 at idna/src/uts46.rs:321:9: 321:10
+        ConstEvalCounter;                // scope 3 at idna/src/uts46.rs:301:9: 321:10
+        goto -> bb5;                     // scope 3 at idna/src/uts46.rs:301:9: 321:10
+    }
+}
+"#;
+
+    #[test]
+    fn ctfe_body_is_never_a_candidate() {
+        let mir = crate::mir::parse_text(ASCII_DENY_LIST_NEW_MIR).expect("MIR parses");
+        assert_eq!(mir.functions.len(), 2, "runtime and CTFE bodies");
+        let (runtime, ctfe) = (&mir.functions[0], &mir.functions[1]);
+        assert_eq!(runtime.name, ctfe.name);
+        assert!(!runtime.is_ctfe);
+        assert!(ctfe.is_ctfe);
+        // The CTFE body has a decision shape of its own; it is
+        // declined before decomposition.
+        assert_eq!(try_decompose_function(ctfe), Ok(cond("deny_glyphless")));
+        assert_eq!(try_decompose_candidate(ctfe), Err(DeclineReason::CtfeBody));
+        assert_eq!(
+            serde_json::to_value(DeclineReason::CtfeBody).unwrap(),
+            "ctfe_body"
+        );
+        assert!(try_decompose_candidate(runtime).is_err());
+        assert_ne!(
+            try_decompose_candidate(runtime),
+            Err(DeclineReason::CtfeBody)
+        );
+    }
+
+    /// `cargo floyd test` MIR (rustc nightly 1.101, coverage flags,
+    /// comment lines stripped) for uuid 1.x `format_simple` in
+    /// `src/fmt.rs`, runtime body then `MIR FOR CTFE` body:
+    ///
+    /// ```text
+    /// const fn format_simple(src: &[u8; 16], upper: bool) -> [u8; 32] {
+    ///     let alpha_offset = if upper { 0x07 } else { 0x27 };
+    ///     let mut dst = [0; 32];
+    ///     let mut i = 0;
+    ///     while i < 16 { .. i += 1; }
+    ///     dst
+    /// }
+    /// ```
+    const FORMAT_SIMPLE_MIR: &str = r#"
+fn format_simple(_1: &[u8; 16], _2: bool) -> [u8; 32] {
+    debug src => _1;                     // in scope 0 at src/fmt.rs:190:24: 190:27
+    debug upper => _2;                   // in scope 0 at src/fmt.rs:190:40: 190:45
+    let mut _0: [u8; 32];                // return place in scope 0 at src/fmt.rs:190:56: 190:64
+    let _3: u8;                          // in scope 0 at src/fmt.rs:191:9: 191:21
+    let mut _6: bool;                    // in scope 0 at src/fmt.rs:194:11: 194:17
+    let mut _7: usize;                   // in scope 0 at src/fmt.rs:194:11: 194:12
+    let _9: usize;                       // in scope 0 at src/fmt.rs:195:21: 195:22
+    let mut _10: bool;                   // in scope 0 at src/fmt.rs:195:17: 195:23
+    let mut _11: u8;                     // in scope 0 at src/fmt.rs:196:22: 196:57
+    let mut _12: u8;                     // in scope 0 at src/fmt.rs:196:36: 196:42
+    let mut _13: u32;                    // in scope 0 at src/fmt.rs:196:36: 196:42
+    let mut _14: bool;                   // in scope 0 at src/fmt.rs:196:36: 196:42
+    let mut _15: u8;                     // in scope 0 at src/fmt.rs:196:44: 196:56
+    let _16: usize;                      // in scope 0 at src/fmt.rs:196:13: 196:18
+    let mut _17: usize;                  // in scope 0 at src/fmt.rs:196:13: 196:14
+    let mut _18: (usize, bool);          // in scope 0 at src/fmt.rs:196:13: 196:18
+    let mut _19: bool;                   // in scope 0 at src/fmt.rs:196:9: 196:19
+    let mut _20: u8;                     // in scope 0 at src/fmt.rs:197:26: 197:63
+    let mut _21: u8;                     // in scope 0 at src/fmt.rs:197:40: 197:48
+    let mut _22: u8;                     // in scope 0 at src/fmt.rs:197:50: 197:62
+    let _23: usize;                      // in scope 0 at src/fmt.rs:197:13: 197:22
+    let mut _24: usize;                  // in scope 0 at src/fmt.rs:197:13: 197:18
+    let mut _25: usize;                  // in scope 0 at src/fmt.rs:197:13: 197:14
+    let mut _26: (usize, bool);          // in scope 0 at src/fmt.rs:197:13: 197:18
+    let mut _27: (usize, bool);          // in scope 0 at src/fmt.rs:197:13: 197:22
+    let mut _28: bool;                   // in scope 0 at src/fmt.rs:197:9: 197:23
+    let mut _29: (usize, bool);          // in scope 0 at src/fmt.rs:198:9: 198:15
+    scope 1 {
+        debug alpha_offset => _3;        // in scope 1 at src/fmt.rs:191:9: 191:21
+        let mut _4: [u8; 32];            // in scope 1 at src/fmt.rs:192:9: 192:16
+        scope 2 {
+            debug dst => _4;             // in scope 2 at src/fmt.rs:192:9: 192:16
+            let mut _5: usize;           // in scope 2 at src/fmt.rs:193:9: 193:14
+            scope 3 {
+                debug i => _5;           // in scope 3 at src/fmt.rs:193:9: 193:14
+                let _8: u8;              // in scope 3 at src/fmt.rs:195:13: 195:14
+                scope 4 {
+                    debug x => _8;       // in scope 4 at src/fmt.rs:195:13: 195:14
+                }
+            }
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/fmt.rs:191:27: 191:32 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/fmt.rs:194:11: 194:17 (#0)
+
+    coverage Code { bcb: bcb0 } => src/fmt.rs:190:1: 190:64 (#0);
+    coverage Code { bcb: bcb0 } => src/fmt.rs:191:27: 191:32 (#0);
+    coverage Code { bcb: bcb1 } => src/fmt.rs:191:35: 191:39 (#0);
+    coverage Code { bcb: bcb6 } => src/fmt.rs:191:49: 191:53 (#0);
+    coverage Code { bcb: bcb2 } => src/fmt.rs:192:19: 192:26 (#0);
+    coverage Code { bcb: bcb2 } => src/fmt.rs:193:17: 193:18 (#0);
+    coverage Code { bcb: bcb3 } => src/fmt.rs:194:11: 194:17 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:195:17: 195:23 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:9: 196:12 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:9: 196:19 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:22: 196:35 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:9: 196:57 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:9: 197:12 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:9: 197:23 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:26: 197:39 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:9: 197:63 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:198:9: 198:15 (#0);
+    coverage Code { bcb: bcb5 } => src/fmt.rs:200:5: 200:8 (#0);
+    coverage Code { bcb: bcb5 } => src/fmt.rs:201:1: 201:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb6 } => src/fmt.rs:191:27: 191:32 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb5 } => src/fmt.rs:194:11: 194:17 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/fmt.rs:191:27: 191:32
+        switchInt(copy _2) -> [0: bb2, otherwise: bb1]; // scope 0 at src/fmt.rs:191:27: 191:32
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/fmt.rs:191:24: 191:55
+        _3 = const 7_u8;                 // scope 0 at src/fmt.rs:191:35: 191:39
+        goto -> bb3;                     // scope 0 at src/fmt.rs:191:24: 191:55
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at src/fmt.rs:191:24: 191:55
+        _3 = const 39_u8;                // scope 0 at src/fmt.rs:191:49: 191:53
+        goto -> bb3;                     // scope 0 at src/fmt.rs:191:24: 191:55
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 3 at src/fmt.rs:194:5: 199:6
+        _4 = [const 0_u8; 32];           // scope 1 at src/fmt.rs:192:19: 192:26
+        _5 = const 0_usize;              // scope 2 at src/fmt.rs:193:17: 193:18
+        goto -> bb4;                     // scope 3 at src/fmt.rs:194:5: 199:6
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb3);  // scope 3 at src/fmt.rs:194:5: 199:6
+        _7 = copy _5;                    // scope 3 at src/fmt.rs:194:11: 194:12
+        _6 = Lt(move _7, const 16_usize); // scope 3 at src/fmt.rs:194:11: 194:17
+        switchInt(move _6) -> [0: bb6, otherwise: bb5]; // scope 3 at src/fmt.rs:194:11: 194:17
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb4);  // scope 3 at src/fmt.rs:195:17: 195:23
+        _9 = copy _5;                    // scope 3 at src/fmt.rs:195:21: 195:22
+        _10 = Lt(copy _9, const 16_usize); // scope 3 at src/fmt.rs:195:17: 195:23
+        assert(move _10, "index out of bounds: the length is {} but the index is {}", const 16_usize, copy _9) -> [success: bb7, unwind continue]; // scope 3 at src/fmt.rs:195:17: 195:23
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/fmt.rs:201:2: 201:2
+        _0 = copy _4;                    // scope 3 at src/fmt.rs:200:5: 200:8
+        return;                          // scope 0 at src/fmt.rs:201:2: 201:2
+    }
+
+    bb7: {
+        _8 = copy (*_1)[_9];             // scope 3 at src/fmt.rs:195:17: 195:23
+        _13 = const 4_i32 as u32 (IntToInt); // scope 4 at src/fmt.rs:196:36: 196:42
+        _14 = Lt(move _13, const 8_u32); // scope 4 at src/fmt.rs:196:36: 196:42
+        assert(move _14, "attempt to shift right by `{}`, which would overflow", const 4_i32) -> [success: bb8, unwind continue]; // scope 4 at src/fmt.rs:196:36: 196:42
+    }
+
+    bb8: {
+        _12 = Shr(copy _8, const 4_i32); // scope 4 at src/fmt.rs:196:36: 196:42
+        _15 = copy _3;                   // scope 4 at src/fmt.rs:196:44: 196:56
+        _11 = nibble_to_hex(move _12, move _15) -> [return: bb9, unwind continue]; // scope 4 at src/fmt.rs:196:22: 196:57
+    }
+
+    bb9: {
+        _17 = copy _5;                   // scope 4 at src/fmt.rs:196:13: 196:14
+        _18 = MulWithOverflow(copy _17, const 2_usize); // scope 4 at src/fmt.rs:196:13: 196:18
+        assert(!move (_18.1: bool), "attempt to compute `{} * {}`, which would overflow", move _17, const 2_usize) -> [success: bb10, unwind continue]; // scope 4 at src/fmt.rs:196:13: 196:18
+    }
+
+    bb10: {
+        _16 = move (_18.0: usize);       // scope 4 at src/fmt.rs:196:13: 196:18
+        _19 = Lt(copy _16, const 32_usize); // scope 4 at src/fmt.rs:196:9: 196:19
+        assert(move _19, "index out of bounds: the length is {} but the index is {}", const 32_usize, copy _16) -> [success: bb11, unwind continue]; // scope 4 at src/fmt.rs:196:9: 196:19
+    }
+
+    bb11: {
+        _4[_16] = move _11;              // scope 4 at src/fmt.rs:196:9: 196:57
+        _21 = BitAnd(copy _8, const 15_u8); // scope 4 at src/fmt.rs:197:40: 197:48
+        _22 = copy _3;                   // scope 4 at src/fmt.rs:197:50: 197:62
+        _20 = nibble_to_hex(move _21, move _22) -> [return: bb12, unwind continue]; // scope 4 at src/fmt.rs:197:26: 197:63
+    }
+
+    bb12: {
+        _25 = copy _5;                   // scope 4 at src/fmt.rs:197:13: 197:14
+        _26 = MulWithOverflow(copy _25, const 2_usize); // scope 4 at src/fmt.rs:197:13: 197:18
+        assert(!move (_26.1: bool), "attempt to compute `{} * {}`, which would overflow", move _25, const 2_usize) -> [success: bb13, unwind continue]; // scope 4 at src/fmt.rs:197:13: 197:18
+    }
+
+    bb13: {
+        _24 = move (_26.0: usize);       // scope 4 at src/fmt.rs:197:13: 197:18
+        _27 = AddWithOverflow(copy _24, const 1_usize); // scope 4 at src/fmt.rs:197:13: 197:22
+        assert(!move (_27.1: bool), "attempt to compute `{} + {}`, which would overflow", move _24, const 1_usize) -> [success: bb14, unwind continue]; // scope 4 at src/fmt.rs:197:13: 197:22
+    }
+
+    bb14: {
+        _23 = move (_27.0: usize);       // scope 4 at src/fmt.rs:197:13: 197:22
+        _28 = Lt(copy _23, const 32_usize); // scope 4 at src/fmt.rs:197:9: 197:23
+        assert(move _28, "index out of bounds: the length is {} but the index is {}", const 32_usize, copy _23) -> [success: bb15, unwind continue]; // scope 4 at src/fmt.rs:197:9: 197:23
+    }
+
+    bb15: {
+        _4[_23] = move _20;              // scope 4 at src/fmt.rs:197:9: 197:63
+        _29 = AddWithOverflow(copy _5, const 1_usize); // scope 4 at src/fmt.rs:198:9: 198:15
+        assert(!move (_29.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _5, const 1_usize) -> [success: bb16, unwind continue]; // scope 4 at src/fmt.rs:198:9: 198:15
+    }
+
+    bb16: {
+        _5 = move (_29.0: usize);        // scope 4 at src/fmt.rs:198:9: 198:15
+        goto -> bb4;                     // scope 3 at src/fmt.rs:194:5: 199:6
+    }
+}
+
+// MIR FOR CTFE
+fn format_simple(_1: &[u8; 16], _2: bool) -> [u8; 32] {
+    debug src => _1;                     // in scope 0 at src/fmt.rs:190:24: 190:27
+    debug upper => _2;                   // in scope 0 at src/fmt.rs:190:40: 190:45
+    let mut _0: [u8; 32];                // return place in scope 0 at src/fmt.rs:190:56: 190:64
+    let _3: u8;                          // in scope 0 at src/fmt.rs:191:9: 191:21
+    let mut _4: bool;                    // in scope 0 at src/fmt.rs:191:27: 191:32
+    let _7: ();                          // in scope 0 at src/fmt.rs:194:5: 199:6
+    let mut _8: ();                      // in scope 0 at src/fmt.rs:190:1: 201:2
+    let mut _9: bool;                    // in scope 0 at src/fmt.rs:194:11: 194:17
+    let mut _10: usize;                  // in scope 0 at src/fmt.rs:194:11: 194:12
+    let _12: usize;                      // in scope 0 at src/fmt.rs:195:21: 195:22
+    let mut _13: bool;                   // in scope 0 at src/fmt.rs:195:17: 195:23
+    let mut _14: u8;                     // in scope 0 at src/fmt.rs:196:22: 196:57
+    let mut _15: u8;                     // in scope 0 at src/fmt.rs:196:36: 196:42
+    let mut _16: u8;                     // in scope 0 at src/fmt.rs:196:36: 196:37
+    let mut _17: u32;                    // in scope 0 at src/fmt.rs:196:36: 196:42
+    let mut _18: bool;                   // in scope 0 at src/fmt.rs:196:36: 196:42
+    let mut _19: u8;                     // in scope 0 at src/fmt.rs:196:44: 196:56
+    let _20: usize;                      // in scope 0 at src/fmt.rs:196:13: 196:18
+    let mut _21: usize;                  // in scope 0 at src/fmt.rs:196:13: 196:14
+    let mut _22: (usize, bool);          // in scope 0 at src/fmt.rs:196:13: 196:18
+    let mut _23: bool;                   // in scope 0 at src/fmt.rs:196:9: 196:19
+    let mut _24: u8;                     // in scope 0 at src/fmt.rs:197:26: 197:63
+    let mut _25: u8;                     // in scope 0 at src/fmt.rs:197:40: 197:48
+    let mut _26: u8;                     // in scope 0 at src/fmt.rs:197:40: 197:41
+    let mut _27: u8;                     // in scope 0 at src/fmt.rs:197:50: 197:62
+    let _28: usize;                      // in scope 0 at src/fmt.rs:197:13: 197:22
+    let mut _29: usize;                  // in scope 0 at src/fmt.rs:197:13: 197:18
+    let mut _30: usize;                  // in scope 0 at src/fmt.rs:197:13: 197:14
+    let mut _31: (usize, bool);          // in scope 0 at src/fmt.rs:197:13: 197:18
+    let mut _32: (usize, bool);          // in scope 0 at src/fmt.rs:197:13: 197:22
+    let mut _33: bool;                   // in scope 0 at src/fmt.rs:197:9: 197:23
+    let mut _34: (usize, bool);          // in scope 0 at src/fmt.rs:198:9: 198:15
+    let mut _35: !;                      // in scope 0 at src/fmt.rs:194:5: 199:6
+    let _36: ();                         // in scope 0 at src/fmt.rs:194:5: 199:6
+    let mut _37: !;                      // in scope 0 at src/fmt.rs:194:5: 199:6
+    scope 1 {
+        debug alpha_offset => _3;        // in scope 1 at src/fmt.rs:191:9: 191:21
+        let mut _5: [u8; 32];            // in scope 1 at src/fmt.rs:192:9: 192:16
+        scope 2 {
+            debug dst => _5;             // in scope 2 at src/fmt.rs:192:9: 192:16
+            let mut _6: usize;           // in scope 2 at src/fmt.rs:193:9: 193:14
+            scope 3 {
+                debug i => _6;           // in scope 3 at src/fmt.rs:193:9: 193:14
+                let _11: u8;             // in scope 3 at src/fmt.rs:195:13: 195:14
+                scope 4 {
+                    debug x => _11;      // in scope 4 at src/fmt.rs:195:13: 195:14
+                }
+            }
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/fmt.rs:191:27: 191:32 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/fmt.rs:194:11: 194:17 (#0)
+
+    coverage Code { bcb: bcb0 } => src/fmt.rs:190:1: 190:64 (#0);
+    coverage Code { bcb: bcb0 } => src/fmt.rs:191:27: 191:32 (#0);
+    coverage Code { bcb: bcb1 } => src/fmt.rs:191:35: 191:39 (#0);
+    coverage Code { bcb: bcb6 } => src/fmt.rs:191:49: 191:53 (#0);
+    coverage Code { bcb: bcb2 } => src/fmt.rs:192:19: 192:26 (#0);
+    coverage Code { bcb: bcb2 } => src/fmt.rs:193:17: 193:18 (#0);
+    coverage Code { bcb: bcb3 } => src/fmt.rs:194:11: 194:17 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:195:17: 195:23 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:9: 196:12 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:9: 196:19 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:22: 196:35 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:9: 196:57 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:9: 197:12 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:9: 197:23 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:26: 197:39 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:9: 197:63 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:198:9: 198:15 (#0);
+    coverage Code { bcb: bcb5 } => src/fmt.rs:200:5: 200:8 (#0);
+    coverage Code { bcb: bcb5 } => src/fmt.rs:201:1: 201:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb6 } => src/fmt.rs:191:27: 191:32 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb5 } => src/fmt.rs:194:11: 194:17 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/fmt.rs:191:27: 191:32
+        StorageLive(_3);                 // scope 0 at src/fmt.rs:191:9: 191:21
+        StorageLive(_4);                 // scope 0 at src/fmt.rs:191:27: 191:32
+        _4 = copy _2;                    // scope 0 at src/fmt.rs:191:27: 191:32
+        switchInt(move _4) -> [0: bb2, otherwise: bb1]; // scope 0 at src/fmt.rs:191:27: 191:32
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/fmt.rs:191:24: 191:55
+        _3 = const 7_u8;                 // scope 0 at src/fmt.rs:191:35: 191:39
+        goto -> bb3;                     // scope 0 at src/fmt.rs:191:24: 191:55
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at src/fmt.rs:191:24: 191:55
+        _3 = const 39_u8;                // scope 0 at src/fmt.rs:191:49: 191:53
+        goto -> bb3;                     // scope 0 at src/fmt.rs:191:24: 191:55
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 3 at src/fmt.rs:194:5: 199:6
+        StorageDead(_4);                 // scope 0 at src/fmt.rs:191:54: 191:55
+        StorageLive(_5);                 // scope 1 at src/fmt.rs:192:9: 192:16
+        _5 = [const 0_u8; 32];           // scope 1 at src/fmt.rs:192:19: 192:26
+        StorageLive(_6);                 // scope 2 at src/fmt.rs:193:9: 193:14
+        _6 = const 0_usize;              // scope 2 at src/fmt.rs:193:17: 193:18
+        StorageLive(_7);                 // scope 3 at src/fmt.rs:194:5: 199:6
+        goto -> bb4;                     // scope 3 at src/fmt.rs:194:5: 199:6
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb3);  // scope 3 at src/fmt.rs:194:5: 199:6
+        StorageLive(_9);                 // scope 3 at src/fmt.rs:194:11: 194:17
+        StorageLive(_10);                // scope 3 at src/fmt.rs:194:11: 194:12
+        _10 = copy _6;                   // scope 3 at src/fmt.rs:194:11: 194:12
+        _9 = Lt(move _10, const 16_usize); // scope 3 at src/fmt.rs:194:11: 194:17
+        switchInt(move _9) -> [0: bb6, otherwise: bb5]; // scope 3 at src/fmt.rs:194:11: 194:17
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb4);  // scope 3 at src/fmt.rs:195:17: 195:23
+        StorageDead(_10);                // scope 3 at src/fmt.rs:194:16: 194:17
+        StorageLive(_11);                // scope 3 at src/fmt.rs:195:13: 195:14
+        StorageLive(_12);                // scope 3 at src/fmt.rs:195:21: 195:22
+        _12 = copy _6;                   // scope 3 at src/fmt.rs:195:21: 195:22
+        _13 = Lt(copy _12, const 16_usize); // scope 3 at src/fmt.rs:195:17: 195:23
+        assert(move _13, "index out of bounds: the length is {} but the index is {}", const 16_usize, copy _12) -> [success: bb7, unwind continue]; // scope 3 at src/fmt.rs:195:17: 195:23
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/fmt.rs:201:2: 201:2
+        StorageDead(_10);                // scope 3 at src/fmt.rs:194:16: 194:17
+        StorageLive(_36);                // scope 3 at src/fmt.rs:194:5: 199:6
+        _7 = const ();                   // scope 3 at src/fmt.rs:194:5: 199:6
+        StorageDead(_36);                // scope 3 at src/fmt.rs:199:5: 199:6
+        StorageDead(_9);                 // scope 3 at src/fmt.rs:199:5: 199:6
+        StorageDead(_7);                 // scope 3 at src/fmt.rs:199:5: 199:6
+        _0 = copy _5;                    // scope 3 at src/fmt.rs:200:5: 200:8
+        StorageDead(_6);                 // scope 2 at src/fmt.rs:201:1: 201:2
+        StorageDead(_5);                 // scope 1 at src/fmt.rs:201:1: 201:2
+        StorageDead(_3);                 // scope 0 at src/fmt.rs:201:1: 201:2
+        return;                          // scope 0 at src/fmt.rs:201:2: 201:2
+    }
+
+    bb7: {
+        _11 = copy (*_1)[_12];           // scope 3 at src/fmt.rs:195:17: 195:23
+        StorageDead(_12);                // scope 3 at src/fmt.rs:195:23: 195:24
+        StorageLive(_14);                // scope 4 at src/fmt.rs:196:22: 196:57
+        StorageLive(_15);                // scope 4 at src/fmt.rs:196:36: 196:42
+        StorageLive(_16);                // scope 4 at src/fmt.rs:196:36: 196:37
+        _16 = copy _11;                  // scope 4 at src/fmt.rs:196:36: 196:37
+        _17 = const 4_i32 as u32 (IntToInt); // scope 4 at src/fmt.rs:196:36: 196:42
+        _18 = Lt(move _17, const 8_u32); // scope 4 at src/fmt.rs:196:36: 196:42
+        assert(move _18, "attempt to shift right by `{}`, which would overflow", const 4_i32) -> [success: bb8, unwind continue]; // scope 4 at src/fmt.rs:196:36: 196:42
+    }
+
+    bb8: {
+        _15 = Shr(move _16, const 4_i32); // scope 4 at src/fmt.rs:196:36: 196:42
+        StorageDead(_16);                // scope 4 at src/fmt.rs:196:41: 196:42
+        StorageLive(_19);                // scope 4 at src/fmt.rs:196:44: 196:56
+        _19 = copy _3;                   // scope 4 at src/fmt.rs:196:44: 196:56
+        ConstEvalCounter;                // scope 4 at src/fmt.rs:196:22: 196:57
+        _14 = nibble_to_hex(move _15, move _19) -> [return: bb9, unwind continue]; // scope 4 at src/fmt.rs:196:22: 196:57
+    }
+
+    bb9: {
+        StorageDead(_19);                // scope 4 at src/fmt.rs:196:56: 196:57
+        StorageDead(_15);                // scope 4 at src/fmt.rs:196:56: 196:57
+        StorageLive(_20);                // scope 4 at src/fmt.rs:196:13: 196:18
+        StorageLive(_21);                // scope 4 at src/fmt.rs:196:13: 196:14
+        _21 = copy _6;                   // scope 4 at src/fmt.rs:196:13: 196:14
+        _22 = MulWithOverflow(copy _21, const 2_usize); // scope 4 at src/fmt.rs:196:13: 196:18
+        assert(!move (_22.1: bool), "attempt to compute `{} * {}`, which would overflow", move _21, const 2_usize) -> [success: bb10, unwind continue]; // scope 4 at src/fmt.rs:196:13: 196:18
+    }
+
+    bb10: {
+        _20 = move (_22.0: usize);       // scope 4 at src/fmt.rs:196:13: 196:18
+        StorageDead(_21);                // scope 4 at src/fmt.rs:196:17: 196:18
+        _23 = Lt(copy _20, const 32_usize); // scope 4 at src/fmt.rs:196:9: 196:19
+        assert(move _23, "index out of bounds: the length is {} but the index is {}", const 32_usize, copy _20) -> [success: bb11, unwind continue]; // scope 4 at src/fmt.rs:196:9: 196:19
+    }
+
+    bb11: {
+        _5[_20] = move _14;              // scope 4 at src/fmt.rs:196:9: 196:57
+        StorageDead(_14);                // scope 4 at src/fmt.rs:196:56: 196:57
+        StorageDead(_20);                // scope 4 at src/fmt.rs:196:57: 196:58
+        StorageLive(_24);                // scope 4 at src/fmt.rs:197:26: 197:63
+        StorageLive(_25);                // scope 4 at src/fmt.rs:197:40: 197:48
+        StorageLive(_26);                // scope 4 at src/fmt.rs:197:40: 197:41
+        _26 = copy _11;                  // scope 4 at src/fmt.rs:197:40: 197:41
+        _25 = BitAnd(move _26, const 15_u8); // scope 4 at src/fmt.rs:197:40: 197:48
+        StorageDead(_26);                // scope 4 at src/fmt.rs:197:47: 197:48
+        StorageLive(_27);                // scope 4 at src/fmt.rs:197:50: 197:62
+        _27 = copy _3;                   // scope 4 at src/fmt.rs:197:50: 197:62
+        ConstEvalCounter;                // scope 4 at src/fmt.rs:197:26: 197:63
+        _24 = nibble_to_hex(move _25, move _27) -> [return: bb12, unwind continue]; // scope 4 at src/fmt.rs:197:26: 197:63
+    }
+
+    bb12: {
+        StorageDead(_27);                // scope 4 at src/fmt.rs:197:62: 197:63
+        StorageDead(_25);                // scope 4 at src/fmt.rs:197:62: 197:63
+        StorageLive(_28);                // scope 4 at src/fmt.rs:197:13: 197:22
+        StorageLive(_29);                // scope 4 at src/fmt.rs:197:13: 197:18
+        StorageLive(_30);                // scope 4 at src/fmt.rs:197:13: 197:14
+        _30 = copy _6;                   // scope 4 at src/fmt.rs:197:13: 197:14
+        _31 = MulWithOverflow(copy _30, const 2_usize); // scope 4 at src/fmt.rs:197:13: 197:18
+        assert(!move (_31.1: bool), "attempt to compute `{} * {}`, which would overflow", move _30, const 2_usize) -> [success: bb13, unwind continue]; // scope 4 at src/fmt.rs:197:13: 197:18
+    }
+
+    bb13: {
+        _29 = move (_31.0: usize);       // scope 4 at src/fmt.rs:197:13: 197:18
+        StorageDead(_30);                // scope 4 at src/fmt.rs:197:17: 197:18
+        _32 = AddWithOverflow(copy _29, const 1_usize); // scope 4 at src/fmt.rs:197:13: 197:22
+        assert(!move (_32.1: bool), "attempt to compute `{} + {}`, which would overflow", move _29, const 1_usize) -> [success: bb14, unwind continue]; // scope 4 at src/fmt.rs:197:13: 197:22
+    }
+
+    bb14: {
+        _28 = move (_32.0: usize);       // scope 4 at src/fmt.rs:197:13: 197:22
+        StorageDead(_29);                // scope 4 at src/fmt.rs:197:21: 197:22
+        _33 = Lt(copy _28, const 32_usize); // scope 4 at src/fmt.rs:197:9: 197:23
+        assert(move _33, "index out of bounds: the length is {} but the index is {}", const 32_usize, copy _28) -> [success: bb15, unwind continue]; // scope 4 at src/fmt.rs:197:9: 197:23
+    }
+
+    bb15: {
+        _5[_28] = move _24;              // scope 4 at src/fmt.rs:197:9: 197:63
+        StorageDead(_24);                // scope 4 at src/fmt.rs:197:62: 197:63
+        StorageDead(_28);                // scope 4 at src/fmt.rs:197:63: 197:64
+        _34 = AddWithOverflow(copy _6, const 1_usize); // scope 4 at src/fmt.rs:198:9: 198:15
+        assert(!move (_34.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _6, const 1_usize) -> [success: bb16, unwind continue]; // scope 4 at src/fmt.rs:198:9: 198:15
+    }
+
+    bb16: {
+        _6 = move (_34.0: usize);        // scope 4 at src/fmt.rs:198:9: 198:15
+        _8 = const ();                   // scope 3 at src/fmt.rs:194:18: 199:6
+        StorageDead(_11);                // scope 3 at src/fmt.rs:199:5: 199:6
+        StorageDead(_9);                 // scope 3 at src/fmt.rs:199:5: 199:6
+        ConstEvalCounter;                // scope 3 at src/fmt.rs:194:5: 199:6
+        goto -> bb4;                     // scope 3 at src/fmt.rs:194:5: 199:6
+    }
+}
+
+format_simple::{constant#0}: usize = {
+    let mut _0: usize;                   // return place in scope 0 at src/fmt.rs:190:35: 190:37
+
+    bb0: {
+        _0 = const 16_usize;             // scope 0 at src/fmt.rs:190:35: 190:37
+        return;                          // scope 0 at src/fmt.rs:190:35: 190:37
+    }
+}
+
+format_simple::{constant#1}: usize = {
+    let mut _0: usize;                   // return place in scope 0 at src/fmt.rs:190:61: 190:63
+
+    bb0: {
+        _0 = const 32_usize;             // scope 0 at src/fmt.rs:190:61: 190:63
+        return;                          // scope 0 at src/fmt.rs:190:61: 190:63
+    }
+}
+
+format_simple::{constant#2}: usize = {
+    let mut _0: usize;                   // return place in scope 0 at src/fmt.rs:192:23: 192:25
+
+    bb0: {
+        _0 = const 32_usize;             // scope 0 at src/fmt.rs:192:23: 192:25
+        return;                          // scope 0 at src/fmt.rs:192:23: 192:25
+    }
+}
+"#;
+
+    /// `rustc +nightly --emit=mir -Cinstrument-coverage
+    /// -Zcoverage-options=branch,condition -Zmir-include-spans`
+    /// (comment lines stripped) for:
+    ///
+    /// ```text
+    /// pub fn nested(a: bool, b: bool) -> u8 {
+    ///     if a { if b { 1 } else { 2 } } else { 3 }
+    /// }
+    /// pub fn spin(c: bool, n: u32) -> u32 {
+    ///     let x = if c { 3 } else { let mut k = n; while k > 9 { k -= 1; } k };
+    ///     x
+    /// }
+    /// pub fn split(c: bool) -> u32 {
+    ///     let mut a = 0u32;
+    ///     let mut b = 0u32;
+    ///     if c { a = 5; } else { b = 7; }
+    ///     a + b
+    /// }
+    /// ```
+    const VALUE_ARM_DECLINES_MIR: &str = r#"
+fn nested(_1: bool, _2: bool) -> u8 {
+    debug a => _1;                       // in scope 0 at lift.rs:1:15: 1:16
+    debug b => _2;                       // in scope 0 at lift.rs:1:24: 1:25
+    let mut _0: u8;                      // return place in scope 0 at lift.rs:1:36: 1:38
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => lift.rs:2:8: 2:9 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => lift.rs:3:12: 3:13 (#0)
+
+    coverage Code { bcb: bcb0 } => lift.rs:1:1: 1:38 (#0);
+    coverage Code { bcb: bcb0 } => lift.rs:2:8: 2:9 (#0);
+    coverage Code { bcb: bcb1 } => lift.rs:3:12: 3:13 (#0);
+    coverage Code { bcb: bcb2 } => lift.rs:3:16: 3:17 (#0);
+    coverage Code { bcb: bcb5 } => lift.rs:3:27: 3:28 (#0);
+    coverage Code { bcb: bcb6 } => lift.rs:5:9: 5:10 (#0);
+    coverage Code { bcb: bcb4 } => lift.rs:7:1: 7:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb6 } => lift.rs:2:8: 2:9 (#0);
+    coverage Branch { true_bcb: bcb2, false_bcb: bcb5 } => lift.rs:3:12: 3:13 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at lift.rs:2:8: 2:9
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 0 at lift.rs:2:8: 2:9
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at lift.rs:3:12: 3:13
+        switchInt(copy _2) -> [0: bb4, otherwise: bb3]; // scope 0 at lift.rs:3:12: 3:13
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at lift.rs:2:5: 6:6
+        _0 = const 3_u8;                 // scope 0 at lift.rs:5:9: 5:10
+        goto -> bb6;                     // scope 0 at lift.rs:2:5: 6:6
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at lift.rs:3:9: 3:30
+        _0 = const 1_u8;                 // scope 0 at lift.rs:3:16: 3:17
+        goto -> bb5;                     // scope 0 at lift.rs:3:9: 3:30
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at lift.rs:3:9: 3:30
+        _0 = const 2_u8;                 // scope 0 at lift.rs:3:27: 3:28
+        goto -> bb5;                     // scope 0 at lift.rs:3:9: 3:30
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at lift.rs:2:5: 6:6
+        goto -> bb6;                     // scope 0 at lift.rs:2:5: 6:6
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at lift.rs:7:2: 7:2
+        return;                          // scope 0 at lift.rs:7:2: 7:2
+    }
+}
+
+fn spin(_1: bool, _2: u32) -> u32 {
+    debug c => _1;                       // in scope 0 at lift.rs:9:13: 9:14
+    debug n => _2;                       // in scope 0 at lift.rs:9:22: 9:23
+    let mut _0: u32;                     // return place in scope 0 at lift.rs:9:33: 9:36
+    let _3: u32;                         // in scope 0 at lift.rs:10:9: 10:10
+    let mut _4: u32;                     // in scope 0 at lift.rs:13:13: 13:18
+    let mut _5: bool;                    // in scope 0 at lift.rs:14:15: 14:20
+    let mut _6: u32;                     // in scope 0 at lift.rs:14:15: 14:16
+    let mut _7: (u32, bool);             // in scope 0 at lift.rs:15:13: 15:19
+    scope 1 {
+        debug x => _3;                   // in scope 1 at lift.rs:10:9: 10:10
+    }
+    scope 2 {
+        debug k => _4;                   // in scope 2 at lift.rs:13:13: 13:18
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => lift.rs:10:16: 10:17 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => lift.rs:14:15: 14:20 (#0)
+
+    coverage Code { bcb: bcb0 } => lift.rs:9:1: 9:36 (#0);
+    coverage Code { bcb: bcb0 } => lift.rs:10:16: 10:17 (#0);
+    coverage Code { bcb: bcb1 } => lift.rs:11:9: 11:10 (#0);
+    coverage Code { bcb: bcb3 } => lift.rs:13:21: 13:22 (#0);
+    coverage Code { bcb: bcb4 } => lift.rs:14:15: 14:20 (#0);
+    coverage Code { bcb: bcb5 } => lift.rs:15:13: 15:19 (#0);
+    coverage Code { bcb: bcb6 } => lift.rs:17:9: 17:10 (#0);
+    coverage Code { bcb: bcb2 } => lift.rs:19:5: 19:6 (#0);
+    coverage Code { bcb: bcb2 } => lift.rs:20:1: 20:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => lift.rs:10:16: 10:17 (#0);
+    coverage Branch { true_bcb: bcb5, false_bcb: bcb6 } => lift.rs:14:15: 14:20 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at lift.rs:10:16: 10:17
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 0 at lift.rs:10:16: 10:17
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at lift.rs:10:13: 18:6
+        _3 = const 3_u32;                // scope 0 at lift.rs:11:9: 11:10
+        goto -> bb7;                     // scope 0 at lift.rs:10:13: 18:6
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 2 at lift.rs:14:9: 16:10
+        _4 = copy _2;                    // scope 0 at lift.rs:13:21: 13:22
+        goto -> bb3;                     // scope 2 at lift.rs:14:9: 16:10
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb4);  // scope 2 at lift.rs:14:9: 16:10
+        _6 = copy _4;                    // scope 2 at lift.rs:14:15: 14:16
+        _5 = Gt(move _6, const 9_u32);   // scope 2 at lift.rs:14:15: 14:20
+        switchInt(move _5) -> [0: bb5, otherwise: bb4]; // scope 2 at lift.rs:14:15: 14:20
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb5);  // scope 2 at lift.rs:15:13: 15:19
+        _7 = SubWithOverflow(copy _4, const 1_u32); // scope 2 at lift.rs:15:13: 15:19
+        assert(!move (_7.1: bool), "attempt to compute `{} - {}`, which would overflow", copy _4, const 1_u32) -> [success: bb6, unwind continue]; // scope 2 at lift.rs:15:13: 15:19
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at lift.rs:10:13: 18:6
+        _3 = copy _4;                    // scope 2 at lift.rs:17:9: 17:10
+        goto -> bb7;                     // scope 0 at lift.rs:10:13: 18:6
+    }
+
+    bb6: {
+        _4 = move (_7.0: u32);           // scope 2 at lift.rs:15:13: 15:19
+        goto -> bb3;                     // scope 2 at lift.rs:14:9: 16:10
+    }
+
+    bb7: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at lift.rs:20:2: 20:2
+        _0 = copy _3;                    // scope 1 at lift.rs:19:5: 19:6
+        return;                          // scope 0 at lift.rs:20:2: 20:2
+    }
+}
+
+fn split(_1: bool) -> u32 {
+    debug c => _1;                       // in scope 0 at lift.rs:22:14: 22:15
+    let mut _0: u32;                     // return place in scope 0 at lift.rs:22:26: 22:29
+    let mut _2: u32;                     // in scope 0 at lift.rs:23:9: 23:14
+    let mut _4: u32;                     // in scope 0 at lift.rs:30:5: 30:6
+    let mut _5: u32;                     // in scope 0 at lift.rs:30:9: 30:10
+    let mut _6: (u32, bool);             // in scope 0 at lift.rs:30:5: 30:10
+    scope 1 {
+        debug a => _2;                   // in scope 1 at lift.rs:23:9: 23:14
+        let mut _3: u32;                 // in scope 1 at lift.rs:24:9: 24:14
+        scope 2 {
+            debug b => _3;               // in scope 2 at lift.rs:24:9: 24:14
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => lift.rs:25:8: 25:9 (#0)
+
+    coverage Code { bcb: bcb0 } => lift.rs:22:1: 22:29 (#0);
+    coverage Code { bcb: bcb0 } => lift.rs:23:17: 23:21 (#0);
+    coverage Code { bcb: bcb0 } => lift.rs:24:17: 24:21 (#0);
+    coverage Code { bcb: bcb0 } => lift.rs:25:8: 25:9 (#0);
+    coverage Code { bcb: bcb1 } => lift.rs:26:9: 26:14 (#0);
+    coverage Code { bcb: bcb3 } => lift.rs:28:9: 28:14 (#0);
+    coverage Code { bcb: bcb2 } => lift.rs:30:5: 30:10 (#0);
+    coverage Code { bcb: bcb2 } => lift.rs:31:1: 31:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => lift.rs:25:8: 25:9 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 2 at lift.rs:25:8: 25:9
+        _2 = const 0_u32;                // scope 0 at lift.rs:23:17: 23:21
+        _3 = const 0_u32;                // scope 1 at lift.rs:24:17: 24:21
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 2 at lift.rs:25:8: 25:9
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 2 at lift.rs:25:5: 29:6
+        _2 = const 5_u32;                // scope 2 at lift.rs:26:9: 26:14
+        goto -> bb3;                     // scope 2 at lift.rs:25:5: 29:6
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 2 at lift.rs:25:5: 29:6
+        _3 = const 7_u32;                // scope 2 at lift.rs:28:9: 28:14
+        goto -> bb3;                     // scope 2 at lift.rs:25:5: 29:6
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 2 at lift.rs:30:5: 30:10
+        _4 = copy _2;                    // scope 2 at lift.rs:30:5: 30:6
+        _5 = copy _3;                    // scope 2 at lift.rs:30:9: 30:10
+        _6 = AddWithOverflow(copy _4, copy _5); // scope 2 at lift.rs:30:5: 30:10
+        assert(!move (_6.1: bool), "attempt to compute `{} + {}`, which would overflow", move _4, move _5) -> [success: bb4, unwind continue]; // scope 2 at lift.rs:30:5: 30:10
+    }
+
+    bb4: {
+        _0 = move (_6.0: u32);           // scope 2 at lift.rs:30:5: 30:10
+        return;                          // scope 0 at lift.rs:31:2: 31:2
+    }
+}
+"#;
+
+    #[test]
+    fn value_arms_lift_format_simple_to_one_condition() {
+        let mir = mir::parse_text(FORMAT_SIMPLE_MIR).expect("MIR parses");
+        assert_eq!(mir.functions.len(), 2, "runtime and CTFE bodies");
+        let runtime = &mir.functions[0];
+        assert!(!runtime.is_ctfe);
+        // Arms `_3 = const 7_u8` / `_3 = const 39_u8` join at bb3.
+        assert_eq!(local_type(runtime, 3), Some("u8"));
+        assert_eq!(build_decision_from_block(0, runtime), None);
+        assert_eq!(
+            try_decompose_candidate_lifted(runtime),
+            Ok((
+                ite("upper", const_(true), const_(false)),
+                Some(Lift::ValueArms)
+            ))
+        );
+        assert_eq!(serde_json::to_value(Lift::ValueArms).unwrap(), "value_arms");
+    }
+
+    #[test]
+    fn value_arms_lift_leaves_the_ctfe_twin_declined() {
+        let mir = mir::parse_text(FORMAT_SIMPLE_MIR).expect("MIR parses");
+        let ctfe = &mir.functions[1];
+        assert!(ctfe.is_ctfe);
+        assert_eq!(ctfe.name, mir.functions[0].name);
+        assert_eq!(try_decompose_candidate(ctfe), Err(DeclineReason::CtfeBody));
+    }
+
+    #[test]
+    fn value_arms_lift_declines_a_nested_if() {
+        // Three arms (`1`, `2`, `3`): the inner `if b` is a decision
+        // of its own, so neither it nor `a` is lifted.
+        let mir = mir::parse_text(VALUE_ARM_DECLINES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "nested");
+        assert_eq!(lift_value_arms(0, f), None);
+        assert_eq!(
+            try_decompose_candidate(f),
+            Err(DeclineReason::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn value_arms_lift_declines_an_arm_that_loops() {
+        // The `else` arm runs into the `while k > 9` header, not a
+        // join with the `then` arm.
+        let mir = mir::parse_text(VALUE_ARM_DECLINES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "spin");
+        assert_eq!(lift_value_arms(0, f), None);
+        assert_eq!(
+            try_decompose_candidate(f),
+            Err(DeclineReason::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn value_arms_lift_declines_arms_writing_different_locals() {
+        // `a = 5` / `b = 7`: no common value reaches the join.
+        let mir = mir::parse_text(VALUE_ARM_DECLINES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "split");
+        assert_eq!(lift_value_arms(0, f), None);
+        assert_eq!(
+            try_decompose_candidate(f),
+            Err(DeclineReason::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn call_arms_lift_is_recorded() {
+        let mir = mir::parse_text(PICK_ASSERT_ARMS_MIR).expect("MIR parses");
+        let (_, lift) = try_decompose_candidate_lifted(&mir.functions[0]).expect("a candidate");
+        assert_eq!(lift, Some(Lift::CallArms));
+        assert_eq!(serde_json::to_value(Lift::CallArms).unwrap(), "call_arms");
+        // A Boolean-leaf decision carries no lift.
+        let mir = mir::parse_text(DECIDE_AND_MIR).expect("MIR parses");
+        let (_, lift) = try_decompose_candidate_lifted(&mir.functions[0]).expect("a candidate");
+        assert_eq!(lift, None);
+    }
+
+    /// `cargo floyd test` MIR (rustc nightly 1.101, coverage flags,
+    /// comment lines stripped) for chrono 0.4 `FixedOffset::west_opt`
+    /// (runtime body):
+    ///
+    /// ```text
+    /// pub const fn west_opt(secs: i32) -> Option<FixedOffset> {
+    ///     if -86_400 < secs && secs < 86_400 {
+    ///         Some(FixedOffset { local_minus_utc: -secs })
+    ///     } else {
+    ///         None
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// The `then` arm checks the negation for overflow (an `assert`)
+    /// before it writes `_0`.
+    const WEST_OPT_MIR: &str = r#"
+fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::west_opt(_1: i32) -> Option<offset::fixed::FixedOffset> {
+    debug secs => _1;                    // in scope 0 at src/offset/fixed.rs:97:27: 97:31
+    let mut _0: std::option::Option<offset::fixed::FixedOffset>; // return place in scope 0 at src/offset/fixed.rs:97:41: 97:60
+    let mut _2: bool;                    // in scope 0 at src/offset/fixed.rs:98:12: 98:26
+    let mut _3: bool;                    // in scope 0 at src/offset/fixed.rs:98:30: 98:43
+    let mut _4: offset::fixed::FixedOffset; // in scope 0 at src/offset/fixed.rs:99:18: 99:56
+    let mut _5: i32;                     // in scope 0 at src/offset/fixed.rs:99:49: 99:54
+    let mut _6: bool;                    // in scope 0 at src/offset/fixed.rs:99:49: 99:54
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/offset/fixed.rs:98:12: 98:26 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/offset/fixed.rs:98:30: 98:43 (#0)
+
+    coverage Code { bcb: bcb0 } => src/offset/fixed.rs:97:5: 97:60 (#0);
+    coverage Code { bcb: bcb0 } => src/offset/fixed.rs:98:12: 98:26 (#0);
+    coverage Code { bcb: bcb1 } => src/offset/fixed.rs:98:30: 98:43 (#0);
+    coverage Code { bcb: bcb2 } => src/offset/fixed.rs:99:13: 99:57 (#0);
+    coverage Code { bcb: bcb5 } => src/offset/fixed.rs:101:13: 101:17 (#0);
+    coverage Code { bcb: bcb3 } => src/offset/fixed.rs:103:5: 103:6 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb6 } => src/offset/fixed.rs:98:12: 98:26 (#0);
+    coverage Branch { true_bcb: bcb2, false_bcb: bcb4 } => src/offset/fixed.rs:98:30: 98:43 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/offset/fixed.rs:98:12: 98:26
+        _2 = Lt(const -86400_i32, copy _1); // scope 0 at src/offset/fixed.rs:98:12: 98:26
+        switchInt(move _2) -> [0: bb2, otherwise: bb1]; // scope 0 at src/offset/fixed.rs:98:12: 98:26
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/offset/fixed.rs:98:30: 98:43
+        _3 = Lt(copy _1, const 86400_i32); // scope 0 at src/offset/fixed.rs:98:30: 98:43
+        switchInt(move _3) -> [0: bb4, otherwise: bb3]; // scope 0 at src/offset/fixed.rs:98:30: 98:43
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at no-location
+        goto -> bb6;                     // scope 0 at no-location
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/offset/fixed.rs:99:49: 99:54
+        _6 = Eq(copy _1, const i32::MIN); // scope 0 at src/offset/fixed.rs:99:49: 99:54
+        assert(!move _6, "attempt to negate `{}`, which would overflow", copy _1) -> [success: bb5, unwind continue]; // scope 0 at src/offset/fixed.rs:99:49: 99:54
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at no-location
+        goto -> bb6;                     // scope 0 at no-location
+    }
+
+    bb5: {
+        _5 = Neg(copy _1);               // scope 0 at src/offset/fixed.rs:99:49: 99:54
+        _4 = offset::fixed::FixedOffset { local_minus_utc: move _5 }; // scope 0 at src/offset/fixed.rs:99:18: 99:56
+        _0 = Option::<offset::fixed::FixedOffset>::Some(move _4); // scope 0 at src/offset/fixed.rs:99:13: 99:57
+        goto -> bb7;                     // scope 0 at src/offset/fixed.rs:98:9: 102:10
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/offset/fixed.rs:98:9: 102:10
+        _0 = Option::<offset::fixed::FixedOffset>::None; // scope 0 at src/offset/fixed.rs:101:13: 101:17
+        goto -> bb7;                     // scope 0 at src/offset/fixed.rs:98:9: 102:10
+    }
+
+    bb7: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/offset/fixed.rs:103:6: 103:6
+        return;                          // scope 0 at src/offset/fixed.rs:103:6: 103:6
+    }
+}
+"#;
+
+    #[test]
+    fn value_arms_run_through_checked_arithmetic() {
+        let mir = mir::parse_text(WEST_OPT_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        assert!(matches!(
+            f.blocks[3].terminator,
+            MirTerminator::Assert { success: 5, .. }
+        ));
+        assert_eq!(
+            try_decompose_candidate_lifted(f),
+            Ok((
+                ite(
+                    "-86400 < secs",
+                    ite("secs < 86400", const_(true), const_(false)),
+                    const_(false)
+                ),
+                Some(Lift::ValueArms)
+            ))
+        );
     }
 }

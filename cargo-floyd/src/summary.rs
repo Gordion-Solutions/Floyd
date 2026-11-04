@@ -151,12 +151,13 @@ pub fn not_measurable_line<'a>(
 }
 
 /// The JSON spelling of a [`NotMeasurableReason`].
-fn reason_label(reason: &NotMeasurableReason) -> &'static str {
+pub fn reason_label(reason: &NotMeasurableReason) -> &'static str {
     match reason {
         NotMeasurableReason::Uninstrumented => "uninstrumented",
         NotMeasurableReason::ExternalMacro => "external_macro",
         NotMeasurableReason::NoCoverageRecord => "no_coverage_record",
         NotMeasurableReason::AmbiguousSpans => "ambiguous_spans",
+        NotMeasurableReason::NoBranchRegion => "no_branch_region",
     }
 }
 
@@ -352,6 +353,7 @@ mod tests {
             NotMeasurableReason::ExternalMacro,
             NotMeasurableReason::NoCoverageRecord,
             NotMeasurableReason::AmbiguousSpans,
+            NotMeasurableReason::NoBranchRegion,
         ] {
             assert_eq!(serde_json::to_value(r).unwrap(), reason_label(&r));
         }
