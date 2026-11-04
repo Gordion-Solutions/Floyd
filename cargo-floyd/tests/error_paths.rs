@@ -10,7 +10,10 @@
 //! - MIR files skipped by `--max-mir-size` are named on stderr and in
 //!   the JSON, and the `no_candidates` message says they are why;
 //! - a proc-macro crate's test binary (which links `libstd`
-//!   dynamically) is listed and run.
+//!   dynamically) is listed and run;
+//! - the instrumented build goes into `<target>/floyd`, so plain
+//!   `cargo +nightly test` binaries in the target directory are not
+//!   mistaken for it, and a second run reuses it.
 //!
 //! Tagged `#[ignore]`: needs the nightly toolchain with
 //! `llvm-tools-preview`. Run with
@@ -235,4 +238,162 @@ fn proc_macro_test_binary_is_listed_and_run() {
     assert_eq!(j["tests_discovered"].as_array().unwrap().len(), 3);
     assert_eq!(j["summary"]["percentage"], 100.0);
     assert_eq!(run.code, 0);
+}
+
+/// Files under `dir` with extension `ext`, with their modification
+/// times.
+fn files_with_mtimes(dir: &Path, ext: &str) -> Vec<(PathBuf, std::time::SystemTime)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == ext) {
+                let mtime = e.metadata().and_then(|m| m.modified()).expect("mtime");
+                out.push((p, mtime));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A fresh, empty target directory under `CARGO_TARGET_TMPDIR`.
+fn fresh_target(name: &str) -> PathBuf {
+    let t = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&t);
+    t
+}
+
+#[test]
+#[ignore = "requires nightly Rust + llvm-tools-preview component"]
+fn a_plain_nightly_test_build_does_not_hide_the_instrumented_one() {
+    // `cargo +nightly test` first leaves uninstrumented test binaries
+    // (no `.mir`, no coverage map) in the target directory. Cargo
+    // does not fingerprint what the rustc shim adds, so building in
+    // the same directory reused them and Floyd found no test
+    // artifacts. It builds in `<target>/floyd` instead.
+    let target = fresh_target("nightly-first-target");
+    let manifest = fixture("failure-paths").join("Cargo.toml");
+    let plain = Command::new("cargo")
+        .args([
+            "+nightly",
+            "test",
+            "--features",
+            "builds",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .env("CARGO_TARGET_DIR", &target)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .output()
+        .expect("run cargo +nightly test");
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(files_with_mtimes(&target, "mir").is_empty());
+
+    let run = floyd_in_target(
+        "failure-paths",
+        &["--format=json", "--features=builds"],
+        &target,
+    );
+    let j = run.json();
+    assert_eq!(j["verdict"], "analysed", "{}", run.stderr);
+    assert_eq!(j["summary"]["percentage"], 100.0);
+    assert_eq!(run.code, 0);
+    let mirs = files_with_mtimes(&target.join("floyd"), "mir");
+    assert!(!mirs.is_empty(), "no MIR under {}/floyd", target.display());
+    assert_eq!(
+        files_with_mtimes(&target, "mir"),
+        mirs,
+        "MIR outside <target>/floyd"
+    );
+}
+
+#[test]
+#[ignore = "requires nightly Rust + llvm-tools-preview component"]
+fn a_second_run_reuses_the_instrumented_build() {
+    let target = fresh_target("second-run-target");
+    let args = ["--format=json", "--features=builds"];
+    let first = floyd_in_target("failure-paths", &args, &target);
+    assert_eq!(first.json()["verdict"], "analysed", "{}", first.stderr);
+    let built = files_with_mtimes(&target.join("floyd"), "mir");
+    assert!(!built.is_empty());
+
+    let second = floyd_in_target("failure-paths", &args, &target);
+    assert_eq!(second.json()["verdict"], "analysed", "{}", second.stderr);
+    assert_eq!(second.json()["summary"], first.json()["summary"]);
+    assert_eq!(
+        files_with_mtimes(&target.join("floyd"), "mir"),
+        built,
+        "the second run recompiled the fixture"
+    );
+}
+
+#[test]
+#[ignore = "requires nightly Rust + llvm-tools-preview component"]
+fn target_dir_option_overrides_cargo_target_dir() {
+    let target = fresh_target("target-dir-option-target");
+    let env_target = fresh_target("target-dir-option-env-target");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cargo-floyd"));
+    cmd.args([
+        "floyd",
+        "test",
+        "--format=json",
+        "--features=builds",
+        "--target-dir",
+    ])
+    .arg(&target)
+    .arg(fixture("failure-paths"))
+    .env("CARGO_TARGET_DIR", &env_target);
+    let out = cmd.output().expect("run cargo-floyd");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let j: Value = serde_json::from_str(&stdout).expect("JSON");
+    assert_eq!(
+        j["verdict"],
+        "analysed",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!files_with_mtimes(&target.join("floyd"), "mir").is_empty());
+    assert!(!env_target.exists());
+}
+
+/// `cargo floyd test <args..> fixtures/<name>` with the project
+/// target directory `target` (`CARGO_TARGET_DIR`), run in the
+/// directory `<target>.cwd`, which must be left without coverage
+/// profiles.
+fn floyd_in_target(name: &str, args: &[&str], target: &Path) -> Run {
+    let cwd = target.with_extension("cwd");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    let out = Command::new(env!("CARGO_BIN_EXE_cargo-floyd"))
+        .current_dir(&cwd)
+        .args(["floyd", "test"])
+        .args(args)
+        .arg(fixture(name))
+        .env("CARGO_TARGET_DIR", target)
+        .env_remove("FLOYD_FIXTURE_FAIL_LIST")
+        .env_remove("FLOYD_FIXTURE_NO_PROFILE")
+        .output()
+        .expect("run cargo-floyd");
+    assert_eq!(
+        files_with_mtimes(&cwd, "profraw"),
+        vec![],
+        "coverage profiles left in the working directory"
+    );
+    Run {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        code: out.status.code().expect("exit code"),
+    }
 }

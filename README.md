@@ -343,6 +343,24 @@ upload floyd-mcdc.xml`).
 | `--max-mir-size=<MB>` | Skip test-target MIR files larger than `<MB>` megabytes (default 50). Skipped files are listed on stderr with their sizes and in the JSON `skipped_oversize_mirs`; when they are why no decision was found, the `no_candidates` message says so. Raise it for crates with heavy monomorphisation (for example `fixed` needs `--max-mir-size=200`). |
 | `--features=<list>`, `-F <list>` | Enable cargo features for the instrumented `cargo build --tests` (repeatable; comma- or space-separated, as for cargo). |
 | `--all-features`, `--no-default-features` | Passed to the instrumented build, as for `cargo test`. Crates whose test suite expects `cargo test --all-features` (such as `time`) need it. |
+| `--target-dir=<dir>` | The project's target directory, as for cargo (default: `CARGO_TARGET_DIR`, `build.target-dir`, else `target/`). The instrumented build goes into `<dir>/floyd`. |
+
+### Build directory
+
+Floyd builds the instrumented tests in its own directory,
+`<target>/floyd` (for example `target/floyd/`), never in the
+directory `cargo test` uses. Cargo does not see the instrumentation
+Floyd adds per crate as a change, so in a shared directory it would
+reuse plain test binaries left by `cargo +nightly test`; a separate
+directory also keeps Floyd's build and yours from invalidating each
+other. A second `cargo floyd test` reuses the instrumented build.
+`target/floyd` sits inside `target/`, so an ignore rule for `target/`
+already covers it; to speed up CI, cache it with the rest of
+`target/` (or add `target/floyd` if you cache only part of it).
+`-Zcoverage-options` and `-Zmir-include-spans` go through cargo's
+rustflags (appended to `RUSTFLAGS` or `CARGO_ENCODED_RUSTFLAGS` when
+you set one, otherwise to `build.rustflags`), so cargo rebuilds when
+they change.
 
 ### Errors
 

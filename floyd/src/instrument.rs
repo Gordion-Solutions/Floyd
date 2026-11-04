@@ -110,9 +110,42 @@ pub struct TestArtifact {
 pub struct CargoBuildResult {
     /// Workspace root from `cargo metadata`.
     pub workspace_root: PathBuf,
+    /// The target directory the instrumented build used,
+    /// `<target>/floyd` (see [`floyd_target_dir`]).
+    pub target_dir: PathBuf,
     /// One [`TestArtifact`] per cargo test target that produced both
     /// a binary and a MIR file.
     pub test_artifacts: Vec<TestArtifact>,
+}
+
+/// Name of the subdirectory of the project's target directory that
+/// Floyd's instrumented builds use: `<target>/floyd`.
+pub const FLOYD_TARGET_SUBDIR: &str = "floyd";
+
+/// Instrumentation flags passed to every crate through cargo's
+/// rustflags, so cargo fingerprints them: a build with different
+/// values is never reused. Both are inert on crates that are not
+/// coverage-instrumented or do not emit MIR, so they need no
+/// per-crate filtering. The flags that do (`-Cinstrument-coverage`,
+/// `--emit=mir,link`) are added by the `floyd-rustc-shim`
+/// `RUSTC_WRAPPER` for the primary package only, and the shim also
+/// adds these two when cargo's rustflags did not carry them (see
+/// [`compile_cargo_project_in`]).
+pub const FINGERPRINTED_RUSTFLAGS: &[&str] =
+    &["-Zcoverage-options=branch,condition", "-Zmir-include-spans"];
+
+/// The target directory Floyd builds a project's instrumented tests
+/// in: `<target>/floyd`, where `<target>` is the project's target
+/// directory.
+///
+/// Cargo's fingerprint does not cover what the `RUSTC_WRAPPER` shim
+/// adds, so building into the project's own target directory would
+/// reuse plain, uninstrumented test binaries left there by `cargo
+/// +nightly test` (no `.mir`, no coverage map). A directory only
+/// Floyd builds in never holds such binaries, and keeps Floyd's
+/// build from invalidating the user's.
+pub fn floyd_target_dir(project_target_dir: &Path) -> PathBuf {
+    project_target_dir.join(FLOYD_TARGET_SUBDIR)
 }
 
 /// Build a cargo project's test targets with MIR emission and coverage
@@ -120,9 +153,11 @@ pub struct CargoBuildResult {
 ///
 /// Internally:
 /// 1. Probes `cargo metadata` to discover the workspace root.
-/// 2. Runs `cargo +nightly build --tests --message-format=json` with
-///    `RUSTFLAGS=-Cinstrument-coverage -Zcoverage-options=branch,condition
-///                -Zmir-include-spans --emit=mir,link`.
+/// 2. Runs `cargo +nightly build --tests --message-format=json
+///    --target-dir <target>/floyd` ([`floyd_target_dir`]) with
+///    [`FINGERPRINTED_RUSTFLAGS`] added to cargo's rustflags. The
+///    caller sets `RUSTC_WRAPPER` to the `floyd-rustc-shim`, which adds
+///    `-Cinstrument-coverage --emit=mir,link` for the primary package.
 /// 3. Parses the JSON message stream for `compiler-artifact`
 ///    entries flagged as test targets and pairs each binary with its
 ///    sibling `.mir` file.
@@ -144,6 +179,28 @@ pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, I
 pub fn compile_cargo_project_with_args(
     manifest_path: &Path,
     cargo_args: &[String],
+) -> Result<CargoBuildResult, InstrumentError> {
+    compile_cargo_project_in(manifest_path, cargo_args, None)
+}
+
+/// [`compile_cargo_project_with_args`] with an explicit project target
+/// directory (`cargo floyd test --target-dir <dir>`). The build goes
+/// into [`floyd_target_dir`] of it; with `None`, of `cargo
+/// metadata`'s `target_directory`, which honours `CARGO_TARGET_DIR`
+/// and `build.target-dir`.
+///
+/// [`FINGERPRINTED_RUSTFLAGS`] are appended to the rustflags cargo
+/// would use: to `CARGO_ENCODED_RUSTFLAGS` or `RUSTFLAGS` when set
+/// (those replace configured rustflags), otherwise through `--config
+/// build.rustflags=[..]`, which cargo joins with the configured
+/// `build.rustflags`. If the project configures
+/// `target.<triple>.rustflags` instead, cargo ignores
+/// `build.rustflags`; the shim then adds the flags itself and only
+/// the fingerprinting is lost, not the instrumentation.
+pub fn compile_cargo_project_in(
+    manifest_path: &Path,
+    cargo_args: &[String],
+    target_dir: Option<&Path>,
 ) -> Result<CargoBuildResult, InstrumentError> {
     let manifest = if manifest_path.is_dir() {
         manifest_path.join("Cargo.toml")
@@ -214,7 +271,27 @@ pub fn compile_cargo_project_with_args(
     // on real embedded crates like `heapless` where the generic
     // dep tree would otherwise produce hundreds of gigabytes of
     // MIR text.
-    let build_out = Command::new("cargo")
+    //
+    // The build goes into `<target>/floyd` (see `floyd_target_dir`),
+    // and the flags that need no per-crate filtering go through
+    // cargo's rustflags so cargo fingerprints them.
+    let project_target = match target_dir {
+        Some(t) => t.to_path_buf(),
+        None => metadata
+            .as_ref()
+            .and_then(|v| v.get("target_directory"))
+            .and_then(|t| t.as_str())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                InstrumentError::new(
+                    "cargo metadata",
+                    "could not parse target_directory".to_string(),
+                )
+            })?,
+    };
+    let floyd_target = floyd_target_dir(&project_target);
+    let mut build = Command::new("cargo");
+    build
         .args([
             "+nightly",
             "build",
@@ -223,11 +300,22 @@ pub fn compile_cargo_project_with_args(
             "--manifest-path",
         ])
         .arg(&manifest)
-        .args(cargo_args)
-        .output()
-        .map_err(|e| {
-            InstrumentError::new("cargo build --tests", format!("could not exec cargo: {e}"))
-        })?;
+        .arg("--target-dir")
+        .arg(&floyd_target);
+    match rustflags_route(
+        std::env::var_os("CARGO_ENCODED_RUSTFLAGS"),
+        std::env::var_os("RUSTFLAGS"),
+    ) {
+        RustflagsRoute::Env(key, value) => {
+            build.env(key, value);
+        }
+        RustflagsRoute::Config(arg) => {
+            build.arg("--config").arg(arg);
+        }
+    }
+    let build_out = build.args(cargo_args).output().map_err(|e| {
+        InstrumentError::new("cargo build --tests", format!("could not exec cargo: {e}"))
+    })?;
     if !build_out.status.success() {
         return Err(InstrumentError {
             stage: "cargo build --tests",
@@ -312,8 +400,50 @@ pub fn compile_cargo_project_with_args(
 
     Ok(CargoBuildResult {
         workspace_root,
+        target_dir: floyd_target,
         test_artifacts,
     })
+}
+
+/// How [`FINGERPRINTED_RUSTFLAGS`] reach cargo.
+#[derive(Debug, PartialEq, Eq)]
+enum RustflagsRoute {
+    /// Set this environment variable to this value (the caller's
+    /// value with the flags appended).
+    Env(&'static str, std::ffi::OsString),
+    /// Pass `--config <this>`.
+    Config(String),
+}
+
+/// Pick the route for [`FINGERPRINTED_RUSTFLAGS`] given the caller's
+/// `CARGO_ENCODED_RUSTFLAGS` and `RUSTFLAGS`, following cargo's
+/// precedence: the first of the two that is set wins over configured
+/// rustflags, so append to it; with neither, add to the configured
+/// `build.rustflags`.
+fn rustflags_route(
+    encoded: Option<std::ffi::OsString>,
+    plain: Option<std::ffi::OsString>,
+) -> RustflagsRoute {
+    let append = |mut value: std::ffi::OsString, sep: &str| {
+        for flag in FINGERPRINTED_RUSTFLAGS {
+            if !value.is_empty() {
+                value.push(sep);
+            }
+            value.push(flag);
+        }
+        value
+    };
+    if let Some(v) = encoded {
+        return RustflagsRoute::Env("CARGO_ENCODED_RUSTFLAGS", append(v, "\x1f"));
+    }
+    if let Some(v) = plain {
+        return RustflagsRoute::Env("RUSTFLAGS", append(v, " "));
+    }
+    let list: Vec<String> = FINGERPRINTED_RUSTFLAGS
+        .iter()
+        .map(|f| format!("{f:?}"))
+        .collect();
+    RustflagsRoute::Config(format!("build.rustflags=[{}]", list.join(", ")))
 }
 
 /// Compile a single `.rs` source file as a *test* crate with both
@@ -449,6 +579,46 @@ fn rustc_nightly(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floyd_target_dir_is_a_subdirectory_of_the_project_target() {
+        assert_eq!(
+            floyd_target_dir(Path::new("/p/target")),
+            PathBuf::from("/p/target/floyd")
+        );
+    }
+
+    #[test]
+    fn rustflags_go_through_config_unless_the_caller_set_them_in_the_environment() {
+        assert_eq!(
+            rustflags_route(None, None),
+            RustflagsRoute::Config(
+                r#"build.rustflags=["-Zcoverage-options=branch,condition", "-Zmir-include-spans"]"#
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            rustflags_route(None, Some("--cfg x".into())),
+            RustflagsRoute::Env(
+                "RUSTFLAGS",
+                "--cfg x -Zcoverage-options=branch,condition -Zmir-include-spans".into()
+            )
+        );
+        assert_eq!(
+            rustflags_route(Some("--cfg\x1fx".into()), Some("ignored".into())),
+            RustflagsRoute::Env(
+                "CARGO_ENCODED_RUSTFLAGS",
+                "--cfg\x1fx\x1f-Zcoverage-options=branch,condition\x1f-Zmir-include-spans".into()
+            )
+        );
+        assert_eq!(
+            rustflags_route(None, Some("".into())),
+            RustflagsRoute::Env(
+                "RUSTFLAGS",
+                "-Zcoverage-options=branch,condition -Zmir-include-spans".into()
+            )
+        );
+    }
 
     #[test]
     fn error_display_includes_stage_and_stderr() {

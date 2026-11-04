@@ -458,8 +458,30 @@ fn main() -> ExitCode {
     // Cargo feature selection, passed through to the instrumented
     // `cargo build --tests`.
     let mut cargo_args: Vec<String> = Vec::new();
+    // `--target-dir <dir>`: the project's target directory, as for
+    // cargo; the instrumented build goes into `<dir>/floyd`.
+    let mut target_dir: Option<std::path::PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
+        if let Some(val) = args[i].strip_prefix("--target-dir=") {
+            target_dir = Some(std::path::PathBuf::from(val));
+            args.remove(i);
+            continue;
+        }
+        if args[i] == "--target-dir" {
+            args.remove(i);
+            match args.get(i).copied() {
+                Some(v) if !v.starts_with('-') => {
+                    target_dir = Some(std::path::PathBuf::from(v));
+                    args.remove(i);
+                }
+                _ => {
+                    eprintln!("cargo-floyd: --target-dir requires a directory");
+                    return ExitCode::from(2);
+                }
+            }
+            continue;
+        }
         if args[i] == "--all-features" || args[i] == "--no-default-features" {
             cargo_args.push(args[i].to_string());
             args.remove(i);
@@ -603,6 +625,15 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    if target_dir.is_some() && !matches!(source, Source::Cargo(_)) {
+        eprintln!("cargo-floyd: --target-dir applies to cargo projects only");
+        return ExitCode::from(2);
+    }
+    // Relative to the directory cargo-floyd runs in, as for cargo.
+    let target_dir = target_dir.map(|t| match std::env::current_dir() {
+        Ok(cwd) => cwd.join(t),
+        Err(_) => t,
+    });
 
     match (is_test_mode, source) {
         (true, Source::Cargo(p)) => run_test_mode_cargo(
@@ -612,6 +643,7 @@ fn main() -> ExitCode {
             &only_patterns,
             max_mir_mb,
             &cargo_args,
+            target_dir.as_deref(),
         ),
         (true, Source::SingleFile(p)) => run_test_mode_single(&p, &workdir, format),
         (false, Source::Cargo(_)) => {
@@ -720,6 +752,7 @@ fn run_test_mode_cargo(
     only_patterns: &[String],
     max_mir_mb: Option<u64>,
     cargo_args: &[String],
+    target_dir: Option<&Path>,
 ) -> ExitCode {
     // Scope Floyd's `--emit=mir,link -Cinstrument-coverage
     // -Zcoverage-options=branch,condition -Zmir-include-spans` to
@@ -753,7 +786,7 @@ fn run_test_mode_cargo(
 
     // Build all test artifacts in the cargo project.
     let build_started = std::time::SystemTime::now();
-    let build = match instrument::compile_cargo_project_with_args(manifest, cargo_args) {
+    let build = match instrument::compile_cargo_project_in(manifest, cargo_args, target_dir) {
         Ok(b) => b,
         Err(e) => {
             let error = build_error(manifest, &e, build_started);
@@ -1782,7 +1815,8 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("    cargo floyd test [--format=text|json|junit] [--only=<pat>]...");
     eprintln!("                     [--max-mir-size=<MB>] [--features=<list>]");
-    eprintln!("                     [--all-features] [--no-default-features] [<path>]");
+    eprintln!("                     [--all-features] [--no-default-features]");
+    eprintln!("                     [--target-dir=<dir>] [<path>]");
     eprintln!("        Runtime MC/DC analysis: builds the project as a test");
     eprintln!("        crate with coverage instrumentation, runs each #[test]");
     eprintln!("        function individually, and reports which conditions the");
@@ -1807,6 +1841,10 @@ fn print_usage() {
     eprintln!("        --features=<list> (or -F <list>), --all-features and");
     eprintln!("        --no-default-features are passed to the instrumented");
     eprintln!("        `cargo build --tests`, as for `cargo test`.");
+    eprintln!();
+    eprintln!("        The instrumented build goes into <target>/floyd, where");
+    eprintln!("        <target> is --target-dir=<dir>, else the project's target");
+    eprintln!("        directory (CARGO_TARGET_DIR, build.target-dir, ./target).");
     eprintln!();
     eprintln!("        On an error (build failure, test discovery or a test run");
     eprintln!("        failing) the exit code is 1 and --format=json/junit still");

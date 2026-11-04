@@ -1,9 +1,11 @@
 //! `RUSTC_WRAPPER` shim that scopes Floyd's instrumentation flags
 //! to the primary package only.
 //!
-//! Without this shim, `--emit=mir,link` and `-Cinstrument-coverage
-//! -Zcoverage-options=branch,condition` applied via `RUSTFLAGS`
-//! would also apply to EVERY dependency rustc builds. On crates
+//! Without this shim, `--emit=mir,link` and `-Cinstrument-coverage`
+//! applied via `RUSTFLAGS` would also apply to EVERY dependency
+//! rustc builds. (The flags that are inert on dependencies,
+//! `floyd::instrument::FINGERPRINTED_RUSTFLAGS`, do go through
+//! cargo's rustflags, so that cargo fingerprints them.) On crates
 //! with deep generic dep trees (`heapless`, embedded Rust in
 //! general), that explodes the MIR text and crashes rustc under
 //! 30GB RAM + 48GB swap on real builds.
@@ -45,8 +47,17 @@ fn main() {
         // critical-section, hash32, …) do not also dump MIR and
         // get coverage-instrumented.
         rustc_args.push(OsString::from("-Cinstrument-coverage"));
-        rustc_args.push(OsString::from("-Zcoverage-options=branch,condition"));
-        rustc_args.push(OsString::from("-Zmir-include-spans"));
+        // `-Zcoverage-options` and `-Zmir-include-spans` normally
+        // arrive through cargo's rustflags, which cargo fingerprints
+        // (`floyd::instrument::FINGERPRINTED_RUSTFLAGS`). Add them
+        // here only when they did not, e.g. a project whose
+        // `target.<triple>.rustflags` makes cargo ignore the
+        // `build.rustflags` Floyd passes.
+        for flag in floyd::instrument::FINGERPRINTED_RUSTFLAGS {
+            if !rustc_args.iter().any(|a| a == *flag) {
+                rustc_args.push(OsString::from(*flag));
+            }
+        }
         rustc_args.push(OsString::from("--emit=mir,link"));
         // Memory-pressure guards for crates with heavy
         // monomorphisation (e.g. `heapless` with its const-generic
