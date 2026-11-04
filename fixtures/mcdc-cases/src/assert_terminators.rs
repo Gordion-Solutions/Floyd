@@ -2,7 +2,9 @@
 //!
 //! rustc's checked-arithmetic and bounds checks are `assert`
 //! terminators in MIR. They must parse as `Assert` (not `Other`), so a
-//! decision before or after one still decomposes.
+//! decision followed by one still decomposes. Arms that run through
+//! one are covered in `value_arms` (`lift_checked_arms`,
+//! `lift_checked_and`).
 
 /// `a && b` followed by a checked add (`Assert` terminator) before
 /// the result is returned.

@@ -3,9 +3,11 @@
 //! Shapes the decomposer once turned into fake decisions: operand
 //! set-up copies, drop flags written before a loop's `goto`, arms
 //! that copy a non-`bool` value, the `// MIR FOR CTFE` body of a
-//! `const fn`, and trees that test no condition. None may be a
-//! candidate; each must be listed in `out_of_scope` with its
-//! `reason`.
+//! `const fn`, and trees that test no condition. None of these may
+//! become a condition. A function whose decision cannot be recovered
+//! without them is listed in `out_of_scope` with its `reason`; one
+//! whose non-`bool` arms are lifted or ignored is a candidate whose
+//! only condition is the comparison.
 
 /// A non-`Copy` pair, for the struct-arm case.
 #[derive(Debug)]
