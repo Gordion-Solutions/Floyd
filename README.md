@@ -95,8 +95,9 @@ shapes are lifted, reported per candidate as `lift` in the JSON:
 
 - `call_arms`: both arms of a single condition end in calls that are
   not panics (`if c { f(x) } else { g(x) }`).
-- `value_arms`: both arms are straight-line code (no call,
-  `assert`, branch, loop or return) that writes one common
+- `value_arms`: both arms are straight-line code (no call, branch,
+  loop or return; overflow and bounds checks are fine) that writes
+  one common
   non-`bool` value, `_0` or a `let`, before the arms join
   (`if upper { 7 } else { 39 }`,
   `if -86_400 < secs && secs < 86_400 { Some(..) } else { None }`).

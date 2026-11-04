@@ -48,8 +48,9 @@
 //!   The root's `bool` `switchInt`, and every `bool` `switchInt` it
 //!   reaches through coverage-only `goto` blocks, form a
 //!   short-circuit condition chain; the chain must end in exactly two
-//!   arm blocks that run through `goto`s only (no call, `assert`,
-//!   branch or return) into one join block outside the chain, and
+//!   arm blocks that run through `goto`s and checked-arithmetic
+//!   `assert`s only (no call, branch or return) into one join block
+//!   outside the chain, and
 //!   both arms must write one common non-`bool` local before the
 //!   join (`if upper { 7 } else { 39 }`, `if -86400 < secs && secs <
 //!   86400 { Some(..) } else { None }`). A third arm (an `if` nested
@@ -454,10 +455,11 @@ const MAX_VALUE_ARM_BLOCKS: usize = 32;
 ///    arm, as `if a { if b { .. } else { .. } } else { .. }` has,
 ///    means an arm holds a decision of its own: the function is
 ///    declined, not lifted.
-/// 3. Each arm runs straight-line through `goto`s only (no call, no
-///    `assert`, no `switchInt`, no return) into a join block that
-///    both arms reach, and neither arm, nor the join, is a block of
-///    the condition chain (a loop back edge).
+/// 3. Each arm runs straight-line through `goto`s and checked-
+///    operation `assert`s only (no call, no `switchInt`, no return)
+///    into a join block that both arms reach, and neither arm, nor
+///    the join, is a block of the condition chain (a loop back
+///    edge).
 /// 4. Both arms write one common local before the join (the return
 ///    place, or the `let` the `if` initialises), and that local is
 ///    not `bool`. A `bool` value is the ordinary handlers' job; a
@@ -582,24 +584,35 @@ fn skip_inert_gotos(f: &MirFunction, start: BlockId) -> BlockId {
     current
 }
 
-/// The blocks control runs through from `start` along `goto`s: each
-/// `goto`-terminated block and then the first block that is not one
-/// (or the first block seen twice).
+/// The blocks control runs through from `start` along `goto`s and
+/// the `success` edges of rustc's checked-operation `assert`s
+/// (overflow, bounds, division by zero): each such block and then
+/// the first block that is neither (or the first block seen twice).
+///
+/// A checked-operation `assert` is part of computing the arm's value
+/// (`Some(FixedOffset { local_minus_utc: -secs })` checks the
+/// negation); rustc never lowers a user `assert!` to one, that is a
+/// `switchInt` and a panic call.
 fn value_arm_chain(f: &MirFunction, start: BlockId) -> Vec<BlockId> {
     let mut chain = Vec::new();
     let mut current = start;
     while chain.len() < MAX_VALUE_ARM_BLOCKS && !chain.contains(&current) {
         chain.push(current);
-        match goto_target(f, current) {
-            Some(target) => current = target,
-            None => break,
+        let Some(block) = f.blocks.iter().find(|b| b.id == current) else {
+            break;
+        };
+        match &block.terminator {
+            MirTerminator::Goto { target, .. } => current = *target,
+            MirTerminator::Assert { success, .. } => current = *success,
+            _ => break,
         }
     }
     chain
 }
 
 /// Rules 3 and 4 of [`lift_value_arms`]: the two arms run through
-/// `goto`s into a common join block outside the condition chain and
+/// `goto`s and checked-operation `assert`s ([`value_arm_chain`])
+/// into a common join block outside the condition chain and
 /// both write a common non-`bool` local on the way.
 fn arms_join_with_value(
     f: &MirFunction,
@@ -6818,5 +6831,112 @@ fn split(_1: bool) -> u32 {
         let mir = mir::parse_text(DECIDE_AND_MIR).expect("MIR parses");
         let (_, lift) = try_decompose_candidate_lifted(&mir.functions[0]).expect("a candidate");
         assert_eq!(lift, None);
+    }
+
+    /// `cargo floyd test` MIR (rustc nightly 1.101, coverage flags,
+    /// comment lines stripped) for chrono 0.4 `FixedOffset::west_opt`
+    /// (runtime body):
+    ///
+    /// ```text
+    /// pub const fn west_opt(secs: i32) -> Option<FixedOffset> {
+    ///     if -86_400 < secs && secs < 86_400 {
+    ///         Some(FixedOffset { local_minus_utc: -secs })
+    ///     } else {
+    ///         None
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// The `then` arm checks the negation for overflow (an `assert`)
+    /// before it writes `_0`.
+    const WEST_OPT_MIR: &str = r#"
+fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::west_opt(_1: i32) -> Option<offset::fixed::FixedOffset> {
+    debug secs => _1;                    // in scope 0 at src/offset/fixed.rs:97:27: 97:31
+    let mut _0: std::option::Option<offset::fixed::FixedOffset>; // return place in scope 0 at src/offset/fixed.rs:97:41: 97:60
+    let mut _2: bool;                    // in scope 0 at src/offset/fixed.rs:98:12: 98:26
+    let mut _3: bool;                    // in scope 0 at src/offset/fixed.rs:98:30: 98:43
+    let mut _4: offset::fixed::FixedOffset; // in scope 0 at src/offset/fixed.rs:99:18: 99:56
+    let mut _5: i32;                     // in scope 0 at src/offset/fixed.rs:99:49: 99:54
+    let mut _6: bool;                    // in scope 0 at src/offset/fixed.rs:99:49: 99:54
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/offset/fixed.rs:98:12: 98:26 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/offset/fixed.rs:98:30: 98:43 (#0)
+
+    coverage Code { bcb: bcb0 } => src/offset/fixed.rs:97:5: 97:60 (#0);
+    coverage Code { bcb: bcb0 } => src/offset/fixed.rs:98:12: 98:26 (#0);
+    coverage Code { bcb: bcb1 } => src/offset/fixed.rs:98:30: 98:43 (#0);
+    coverage Code { bcb: bcb2 } => src/offset/fixed.rs:99:13: 99:57 (#0);
+    coverage Code { bcb: bcb5 } => src/offset/fixed.rs:101:13: 101:17 (#0);
+    coverage Code { bcb: bcb3 } => src/offset/fixed.rs:103:5: 103:6 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb6 } => src/offset/fixed.rs:98:12: 98:26 (#0);
+    coverage Branch { true_bcb: bcb2, false_bcb: bcb4 } => src/offset/fixed.rs:98:30: 98:43 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/offset/fixed.rs:98:12: 98:26
+        _2 = Lt(const -86400_i32, copy _1); // scope 0 at src/offset/fixed.rs:98:12: 98:26
+        switchInt(move _2) -> [0: bb2, otherwise: bb1]; // scope 0 at src/offset/fixed.rs:98:12: 98:26
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/offset/fixed.rs:98:30: 98:43
+        _3 = Lt(copy _1, const 86400_i32); // scope 0 at src/offset/fixed.rs:98:30: 98:43
+        switchInt(move _3) -> [0: bb4, otherwise: bb3]; // scope 0 at src/offset/fixed.rs:98:30: 98:43
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at no-location
+        goto -> bb6;                     // scope 0 at no-location
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/offset/fixed.rs:99:49: 99:54
+        _6 = Eq(copy _1, const i32::MIN); // scope 0 at src/offset/fixed.rs:99:49: 99:54
+        assert(!move _6, "attempt to negate `{}`, which would overflow", copy _1) -> [success: bb5, unwind continue]; // scope 0 at src/offset/fixed.rs:99:49: 99:54
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at no-location
+        goto -> bb6;                     // scope 0 at no-location
+    }
+
+    bb5: {
+        _5 = Neg(copy _1);               // scope 0 at src/offset/fixed.rs:99:49: 99:54
+        _4 = offset::fixed::FixedOffset { local_minus_utc: move _5 }; // scope 0 at src/offset/fixed.rs:99:18: 99:56
+        _0 = Option::<offset::fixed::FixedOffset>::Some(move _4); // scope 0 at src/offset/fixed.rs:99:13: 99:57
+        goto -> bb7;                     // scope 0 at src/offset/fixed.rs:98:9: 102:10
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/offset/fixed.rs:98:9: 102:10
+        _0 = Option::<offset::fixed::FixedOffset>::None; // scope 0 at src/offset/fixed.rs:101:13: 101:17
+        goto -> bb7;                     // scope 0 at src/offset/fixed.rs:98:9: 102:10
+    }
+
+    bb7: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/offset/fixed.rs:103:6: 103:6
+        return;                          // scope 0 at src/offset/fixed.rs:103:6: 103:6
+    }
+}
+"#;
+
+    #[test]
+    fn value_arms_run_through_checked_arithmetic() {
+        let mir = mir::parse_text(WEST_OPT_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        assert!(matches!(
+            f.blocks[3].terminator,
+            MirTerminator::Assert { success: 5, .. }
+        ));
+        assert_eq!(
+            try_decompose_candidate_lifted(f),
+            Ok((
+                ite(
+                    "-86400 < secs",
+                    ite("secs < 86400", const_(true), const_(false)),
+                    const_(false)
+                ),
+                Some(Lift::ValueArms)
+            ))
+        );
     }
 }
