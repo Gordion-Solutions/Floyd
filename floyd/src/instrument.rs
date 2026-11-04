@@ -391,6 +391,8 @@ pub fn compile_cargo_project_in(
         }
     }
 
+    sort_test_artifacts(&mut test_artifacts);
+
     if test_artifacts.is_empty() {
         return Err(InstrumentError::new(
             "cargo build --tests",
@@ -403,6 +405,29 @@ pub fn compile_cargo_project_in(
         target_dir: floyd_target,
         test_artifacts,
     })
+}
+
+/// Put test artifacts in a stable order: by package, then target
+/// kind, then target name, then binary path. Cargo emits
+/// `compiler-artifact` messages in job-scheduling order, which varies
+/// from run to run even when every unit is fresh; without this the
+/// report's per-test observations (and everything else listed per
+/// artifact) would come out in a different order on identical runs.
+fn sort_test_artifacts(artifacts: &mut [TestArtifact]) {
+    artifacts.sort_by(|a, b| {
+        (
+            &a.package_name,
+            &a.target_kinds,
+            &a.target_name,
+            &a.binary_path,
+        )
+            .cmp(&(
+                &b.package_name,
+                &b.target_kinds,
+                &b.target_name,
+                &b.binary_path,
+            ))
+    });
 }
 
 /// How [`FINGERPRINTED_RUSTFLAGS`] reach cargo.
@@ -626,5 +651,31 @@ mod tests {
         let s = format!("{e}");
         assert!(s.contains("rustc --emit=mir"));
         assert!(s.contains("boom"));
+    }
+
+    #[test]
+    fn test_artifacts_are_sorted_independently_of_cargo_message_order() {
+        let art = |pkg: &str, kind: &str, name: &str| TestArtifact {
+            binary_path: PathBuf::from(format!("/t/{name}")),
+            mir_path: PathBuf::from(format!("/t/{name}.mir")),
+            package_name: pkg.to_string(),
+            target_name: name.to_string(),
+            target_kinds: vec![kind.to_string()],
+            src_path: PathBuf::new(),
+            manifest_path: None,
+        };
+        let order = |v: &[TestArtifact]| -> Vec<String> {
+            v.iter().map(|a| a.target_name.clone()).collect()
+        };
+        let mut a = vec![
+            art("p 0.1.0", "test", "weak"),
+            art("p 0.1.0", "lib", "p"),
+            art("p 0.1.0", "test", "mcdc"),
+        ];
+        let mut b = vec![a[2].clone(), a[0].clone(), a[1].clone()];
+        sort_test_artifacts(&mut a);
+        sort_test_artifacts(&mut b);
+        assert_eq!(order(&a), ["p", "mcdc", "weak"]);
+        assert_eq!(order(&a), order(&b));
     }
 }
