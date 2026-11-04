@@ -29,6 +29,7 @@ use floyd::masking::{
 use floyd::mir;
 use floyd::runner;
 
+mod failure;
 mod harness;
 mod selector;
 mod summary;
@@ -49,6 +50,30 @@ enum RuntimeVerdict {
     /// Decomposable decisions were found but no test produced a
     /// usable observation for any of them.
     AllUnobserved,
+    /// The instrumented `cargo build --tests` failed (`error` carries
+    /// rustc's diagnostics, or the internal compiler error).
+    BuildFailed,
+    /// A required tool (`llvm-profdata`, `llvm-cov`) was not found.
+    SetupFailed,
+    /// A test binary's `--list` failed, so its tests are unknown.
+    TestDiscoveryFailed,
+    /// Running a test, or exporting its coverage, failed.
+    TestRunFailed,
+}
+
+impl RuntimeVerdict {
+    /// The verdict as it appears in the JSON (`build_failed`, ...).
+    fn as_str(self) -> &'static str {
+        match self {
+            RuntimeVerdict::Analysed => "analysed",
+            RuntimeVerdict::NoCandidates => "no_candidates",
+            RuntimeVerdict::AllUnobserved => "all_unobserved",
+            RuntimeVerdict::BuildFailed => "build_failed",
+            RuntimeVerdict::SetupFailed => "setup_failed",
+            RuntimeVerdict::TestDiscoveryFailed => "test_discovery_failed",
+            RuntimeVerdict::TestRunFailed => "test_run_failed",
+        }
+    }
 }
 
 /// A function with a `switchInt`-shaped decision that the engine's
@@ -339,14 +364,19 @@ struct NoHarnessTarget {
 }
 
 /// JSON document for `cargo floyd test --format=json` on a cargo
-/// project. Emitted on every exit path, including the two decline
-/// paths, so `out_of_scope` and `candidates` are always obtainable.
+/// project. Emitted on every exit path: the analysed verdict, the two
+/// decline paths, and the error paths (`build_failed`,
+/// `setup_failed`, `test_discovery_failed`, `test_run_failed`), which
+/// carry `error` and whatever was collected before the failure.
 #[derive(serde::Serialize)]
 struct CargoRuntimeReport<'a> {
     manifest: String,
-    workspace_root: String,
+    /// `null` when the build failed before cargo reported it.
+    workspace_root: Option<String>,
     test_targets: usize,
     verdict: RuntimeVerdict,
+    /// Why the run stopped; `null` unless `verdict` is an error.
+    error: Option<&'a failure::RunError>,
     tests_discovered: &'a [String],
     observations: &'a [ConditionObservation],
     /// `None` unless `verdict` is `analysed`.
@@ -363,6 +393,8 @@ struct CargoRuntimeReport<'a> {
     out_of_scope: &'a [DeclinedFunction],
     /// MIR files above the size guard that were not analysed.
     skipped_oversize_mirs: &'a [SkippedMir],
+    /// The size guard in effect (`--max-mir-size`, default 50).
+    max_mir_size_mb: u64,
     /// Test targets with `harness = false` that were not listed or
     /// run, and so contribute no tests or candidates.
     skipped_no_harness: &'a [NoHarnessTarget],
@@ -423,8 +455,38 @@ fn main() -> ExitCode {
     // Users analysing const-generic libs like fixed (106 MB) can
     // raise it when they are willing to spend the parse time.
     let mut max_mir_mb: Option<u64> = None;
+    // Cargo feature selection, passed through to the instrumented
+    // `cargo build --tests`.
+    let mut cargo_args: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
+        if args[i] == "--all-features" || args[i] == "--no-default-features" {
+            cargo_args.push(args[i].to_string());
+            args.remove(i);
+            continue;
+        }
+        if let Some(val) = args[i]
+            .strip_prefix("--features=")
+            .or_else(|| args[i].strip_prefix("-F="))
+        {
+            cargo_args.push(format!("--features={val}"));
+            args.remove(i);
+            continue;
+        }
+        if args[i] == "--features" || args[i] == "-F" {
+            let flag = args.remove(i);
+            match args.get(i).copied() {
+                Some(v) if !v.starts_with('-') => {
+                    cargo_args.push(format!("--features={v}"));
+                    args.remove(i);
+                }
+                _ => {
+                    eprintln!("cargo-floyd: {flag} requires a value (e.g. {flag} serde,std)");
+                    return ExitCode::from(2);
+                }
+            }
+            continue;
+        }
         if let Some(pat) = args[i].strip_prefix("--only=") {
             only_patterns.push(pat.to_string());
             args.remove(i);
@@ -534,10 +596,23 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    if !cargo_args.is_empty() && !matches!(source, Source::Cargo(_)) {
+        eprintln!(
+            "cargo-floyd: --features, --all-features and --no-default-features \
+             apply to cargo projects only"
+        );
+        return ExitCode::from(2);
+    }
+
     match (is_test_mode, source) {
-        (true, Source::Cargo(p)) => {
-            run_test_mode_cargo(&p, &workdir, format, &only_patterns, max_mir_mb)
-        }
+        (true, Source::Cargo(p)) => run_test_mode_cargo(
+            &p,
+            &workdir,
+            format,
+            &only_patterns,
+            max_mir_mb,
+            &cargo_args,
+        ),
         (true, Source::SingleFile(p)) => run_test_mode_single(&p, &workdir, format),
         (false, Source::Cargo(_)) => {
             eprintln!("cargo-floyd: static analysis on a cargo project is not supported yet;");
@@ -644,6 +719,7 @@ fn run_test_mode_cargo(
     format: Format,
     only_patterns: &[String],
     max_mir_mb: Option<u64>,
+    cargo_args: &[String],
 ) -> ExitCode {
     // Scope Floyd's `--emit=mir,link -Cinstrument-coverage
     // -Zcoverage-options=branch,condition -Zmir-include-spans` to
@@ -663,27 +739,44 @@ fn run_test_mode_cargo(
         }
     }
 
+    let max_mir_mb = max_mir_mb.unwrap_or(DEFAULT_MAX_MIR_MB);
+    let partial = |workspace_root| Partial {
+        manifest,
+        workspace_root,
+        test_targets: 0,
+        tests_discovered: &[],
+        out_of_scope: &[],
+        skipped_oversize_mirs: &[],
+        skipped_no_harness: &[],
+        max_mir_mb,
+    };
+
     // Build all test artifacts in the cargo project.
-    let build = match instrument::compile_cargo_project(manifest) {
+    let build_started = std::time::SystemTime::now();
+    let build = match instrument::compile_cargo_project_with_args(manifest, cargo_args) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("cargo-floyd: {e}");
-            return ExitCode::from(1);
+            let error = build_error(manifest, &e, build_started);
+            return emit_run_error(format, &partial(None), RuntimeVerdict::BuildFailed, &error);
         }
     };
 
-    let profdata_tool = match runner::llvm_tool("llvm-profdata") {
-        Ok(p) => p,
+    let tools = runner::llvm_tool("llvm-profdata")
+        .and_then(|p| runner::llvm_tool("llvm-cov").map(|c| (p, c)));
+    let (profdata_tool, cov_tool) = match tools {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let cov_tool = match runner::llvm_tool("llvm-cov") {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("cargo-floyd: {e}");
-            return ExitCode::from(1);
+            let error = runner_error(&e);
+            return emit_run_error(
+                format,
+                &Partial {
+                    test_targets: build.test_artifacts.len(),
+                    ..partial(Some(&build.workspace_root))
+                },
+                RuntimeVerdict::SetupFailed,
+                &error,
+            );
         }
     };
 
@@ -725,7 +818,7 @@ fn run_test_mode_cargo(
     // threshold and surface the skip in the honest-scope report,
     // so the user sees exactly which artifacts were elided and
     // why.
-    let max_mir_bytes: u64 = max_mir_mb.unwrap_or(50) * 1024 * 1024;
+    let max_mir_bytes: u64 = max_mir_mb * 1024 * 1024;
     let mut skipped_oversize_mirs: Vec<(std::path::PathBuf, u64)> = Vec::new();
     let mut skipped_no_harness: Vec<NoHarnessTarget> = Vec::new();
 
@@ -776,7 +869,20 @@ fn run_test_mode_cargo(
             Ok(t) => t,
             Err(e) => {
                 eprintln!("cargo-floyd: {e}");
-                return ExitCode::from(1);
+                return emit_run_error(
+                    format,
+                    &Partial {
+                        workspace_root: Some(&build.workspace_root),
+                        test_targets: build.test_artifacts.len(),
+                        tests_discovered: &all_tests,
+                        out_of_scope: &declined,
+                        skipped_oversize_mirs: &skipped_oversize_mirs,
+                        skipped_no_harness: &skipped_no_harness,
+                        ..partial(None)
+                    },
+                    RuntimeVerdict::TestDiscoveryFailed,
+                    &runner_error(&e),
+                );
             }
         };
         for t in &tests {
@@ -873,6 +979,9 @@ fn run_test_mode_cargo(
         });
     }
 
+    if !skipped_oversize_mirs.is_empty() {
+        print_oversize_notice(&mut std::io::stderr(), &skipped_oversize_mirs, max_mir_mb);
+    }
     if std::env::var("FLOYD_DIAG").is_ok() {
         eprintln!("[progress] Pass 1 complete: {} candidates, {} declined, {} artifacts, {} skipped-oversize",
         raw_candidates.len(), declined.len(), artifacts.len(), skipped_oversize_mirs.len());
@@ -951,33 +1060,34 @@ fn run_test_mode_cargo(
     let progress_total = jobs.len();
 
     use rayon::prelude::*;
-    let results: Result<Vec<(String, CoverageIndex)>, String> = jobs
+    let results: Result<Vec<(String, CoverageIndex)>, runner::RunnerError> = jobs
         .par_iter()
-        .map(|job| -> Result<(String, CoverageIndex), String> {
-            let prof = workdir.join(format!(
-                "cov-{:03}-{:03}.profraw",
-                job.art_idx, job.test_idx
-            ));
-            runner::run_test_isolated(&job.binary_path, &job.test_name, &prof)
-                .map_err(|e| e.to_string())?;
-            let coverage = runner::profraw_to_coverage(
-                &prof,
-                &profdata_tool,
-                &cov_tool,
-                &job.binary_path,
-                workdir,
-            )
-            .map_err(|e| e.to_string())?;
-            let n = progress_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if (n.is_multiple_of(10) || n == progress_total) && std::env::var("FLOYD_DIAG").is_ok()
-            {
-                eprintln!("[progress]   {n}/{progress_total}");
-            }
-            Ok((
-                job.test_name.clone(),
-                CoverageIndex::build_for(&coverage, &paths, &wanted),
-            ))
-        })
+        .map(
+            |job| -> Result<(String, CoverageIndex), runner::RunnerError> {
+                let prof = workdir.join(format!(
+                    "cov-{:03}-{:03}.profraw",
+                    job.art_idx, job.test_idx
+                ));
+                runner::run_test_isolated(&job.binary_path, &job.test_name, &prof)?;
+                let coverage = runner::profraw_to_coverage(
+                    &prof,
+                    &profdata_tool,
+                    &cov_tool,
+                    &job.binary_path,
+                    workdir,
+                )?;
+                let n = progress_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if (n.is_multiple_of(10) || n == progress_total)
+                    && std::env::var("FLOYD_DIAG").is_ok()
+                {
+                    eprintln!("[progress]   {n}/{progress_total}");
+                }
+                Ok((
+                    job.test_name.clone(),
+                    CoverageIndex::build_for(&coverage, &paths, &wanted),
+                ))
+            },
+        )
         .collect();
     if std::env::var("FLOYD_DIAG").is_ok() {
         eprintln!("[progress] Pass 2 complete");
@@ -987,7 +1097,20 @@ fn run_test_mode_cargo(
         Ok(v) => v,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
-            return ExitCode::from(1);
+            return emit_run_error(
+                format,
+                &Partial {
+                    workspace_root: Some(&build.workspace_root),
+                    test_targets: build.test_artifacts.len(),
+                    tests_discovered: &all_tests,
+                    out_of_scope: &declined,
+                    skipped_oversize_mirs: &skipped_oversize_mirs,
+                    skipped_no_harness: &skipped_no_harness,
+                    ..partial(None)
+                },
+                RuntimeVerdict::TestRunFailed,
+                &runner_error(&e),
+            );
         }
     };
 
@@ -1108,21 +1231,16 @@ fn run_test_mode_cargo(
         .filter_map(|c| c.not_measurable.as_ref())
         .collect();
     let not_measurable_count = not_measurable.len();
-    let skipped_mirs: Vec<SkippedMir> = skipped_oversize_mirs
-        .iter()
-        .map(|(path, bytes)| SkippedMir {
-            path: path.display().to_string(),
-            bytes: *bytes,
-        })
-        .collect();
+    let skipped_mirs = skipped_mir_entries(&skipped_oversize_mirs);
     let manifest_str = manifest.display().to_string();
     let workspace_root_str = build.workspace_root.display().to_string();
     let test_targets = build.test_artifacts.len();
     let report = |verdict, observations, analysis| CargoRuntimeReport {
         manifest: manifest_str.clone(),
-        workspace_root: workspace_root_str.clone(),
+        workspace_root: Some(workspace_root_str.clone()),
         test_targets,
         verdict,
+        error: None,
         tests_discovered: &all_tests,
         observations,
         analysis,
@@ -1130,6 +1248,7 @@ fn run_test_mode_cargo(
         candidates: &candidate_summaries,
         out_of_scope: &declined,
         skipped_oversize_mirs: &skipped_mirs,
+        max_mir_size_mb: max_mir_mb,
         skipped_no_harness: &skipped_no_harness,
     };
     // Decline paths: the human-readable explanation goes to stderr
@@ -1140,6 +1259,7 @@ fn run_test_mode_cargo(
                 &mut std::io::stdout(),
                 &declined,
                 &skipped_oversize_mirs,
+                max_mir_mb,
                 &skipped_no_harness,
             ),
             Format::Json => {
@@ -1151,6 +1271,7 @@ fn run_test_mode_cargo(
                 &mut std::io::stderr(),
                 &declined,
                 &skipped_oversize_mirs,
+                max_mir_mb,
                 &skipped_no_harness,
             ),
         }
@@ -1167,12 +1288,12 @@ fn run_test_mode_cargo(
         }
         selector::PickResult::NoCandidates => {
             eprintln!(
-                "cargo-floyd: no recognised decisions in any test target. \
-                 The engine currently supports `&&`, `||`, `!`, and nested \
-                 combinations; `if let`, `?`, and `match` patterns are \
-                 partially supported (2-arm const-returning shapes); \
-                 non-boolean decisions and arms that end in a function \
-                 call are out of scope."
+                "{}",
+                no_candidates_line(
+                    &skipped_oversize_mirs,
+                    build.test_artifacts.len(),
+                    max_mir_mb
+                )
             );
             return emit_decline(RuntimeVerdict::NoCandidates);
         }
@@ -1192,6 +1313,7 @@ fn run_test_mode_cargo(
                 &mut std::io::stdout(),
                 &declined,
                 &skipped_oversize_mirs,
+                max_mir_mb,
                 &skipped_no_harness,
             );
         }
@@ -1216,6 +1338,222 @@ fn run_test_mode_cargo(
         }
     }
     ExitCode::from(CoverageSummary::new(Some(&analysis), not_measurable_count).exit_code())
+}
+
+/// Default `--max-mir-size`, in megabytes.
+const DEFAULT_MAX_MIR_MB: u64 = 50;
+
+/// What a runtime run on a cargo project had collected when it
+/// stopped with an error.
+struct Partial<'a> {
+    manifest: &'a Path,
+    workspace_root: Option<&'a Path>,
+    test_targets: usize,
+    tests_discovered: &'a [String],
+    out_of_scope: &'a [DeclinedFunction],
+    skipped_oversize_mirs: &'a [(std::path::PathBuf, u64)],
+    skipped_no_harness: &'a [NoHarnessTarget],
+    max_mir_mb: u64,
+}
+
+/// Emit the document for an error exit and return exit code 1.
+/// stderr already carries the human-readable failure. JSON gets the
+/// report with `verdict`, `error` and the partial data; JUnit gets a
+/// document with one `<error>`; text prints nothing more on stdout.
+fn emit_run_error(
+    format: Format,
+    partial: &Partial<'_>,
+    verdict: RuntimeVerdict,
+    error: &failure::RunError,
+) -> ExitCode {
+    match format {
+        Format::Text => {}
+        Format::Json => {
+            let skipped = skipped_mir_entries(partial.skipped_oversize_mirs);
+            if let Err(code) = print_json(&error_report(partial, verdict, error, &skipped)) {
+                return code;
+            }
+        }
+        Format::Junit => print!(
+            "{}",
+            failure::render_error_junit(
+                &partial.manifest.display().to_string(),
+                verdict.as_str(),
+                error
+            )
+        ),
+    }
+    ExitCode::from(1)
+}
+
+/// The JSON report of an error exit: no analysis, no candidates (the
+/// candidate join had not run), `summary.percentage` null.
+fn error_report<'a>(
+    partial: &Partial<'a>,
+    verdict: RuntimeVerdict,
+    error: &'a failure::RunError,
+    skipped: &'a [SkippedMir],
+) -> CargoRuntimeReport<'a> {
+    CargoRuntimeReport {
+        manifest: partial.manifest.display().to_string(),
+        workspace_root: partial.workspace_root.map(|p| p.display().to_string()),
+        test_targets: partial.test_targets,
+        verdict,
+        error: Some(error),
+        tests_discovered: partial.tests_discovered,
+        observations: &[],
+        analysis: None,
+        summary: CoverageSummary::new(None, 0),
+        candidates: &[],
+        out_of_scope: partial.out_of_scope,
+        skipped_oversize_mirs: skipped,
+        max_mir_size_mb: partial.max_mir_mb,
+        skipped_no_harness: partial.skipped_no_harness,
+    }
+}
+
+fn skipped_mir_entries(skipped: &[(std::path::PathBuf, u64)]) -> Vec<SkippedMir> {
+    skipped
+        .iter()
+        .map(|(path, bytes)| SkippedMir {
+            path: path.display().to_string(),
+            bytes: *bytes,
+        })
+        .collect()
+}
+
+/// Print rustc's diagnostics (or the internal compiler error) for a
+/// failed instrumented build to stderr and return the `error` object.
+/// A failure before rustc ran (no Cargo.toml, `cargo metadata`
+/// failing, no test artifacts) has no diagnostics; cargo's stderr is
+/// printed as is.
+fn build_error(
+    manifest: &Path,
+    e: &instrument::InstrumentError,
+    started: std::time::SystemTime,
+) -> failure::RunError {
+    let package_dir = if manifest.is_dir() {
+        manifest
+    } else {
+        manifest.parent().unwrap_or(Path::new("."))
+    };
+    let parsed = failure::BuildFailure::parse(&e.stdout, &e.stderr, &[package_dir], Some(started));
+    let stderr = failure::trimmed_stderr(&e.stderr);
+    let message = if parsed.diagnostics.is_empty() && parsed.ice.is_none() {
+        eprintln!("cargo-floyd: {e}");
+        let first = stderr
+            .lines()
+            .find(|l| l.trim_start().starts_with("error"))
+            .or_else(|| stderr.lines().find(|l| !l.trim().is_empty()))
+            .unwrap_or("")
+            .trim();
+        if first.is_empty() {
+            format!("{} failed", e.stage)
+        } else {
+            format!("{} failed: {first}", e.stage)
+        }
+    } else {
+        parsed.print(&mut std::io::stderr());
+        parsed.summary_line()
+    };
+    failure::RunError {
+        stage: e.stage.to_string(),
+        message,
+        diagnostics: parsed.diagnostics,
+        ice: parsed.ice,
+        stderr,
+    }
+}
+
+/// The `error` object for a runner failure (`--list`, a test run,
+/// coverage export, tool lookup).
+fn runner_error(e: &runner::RunnerError) -> failure::RunError {
+    let first = e.message.lines().next().unwrap_or("").trim();
+    let first = first
+        .trim_end_matches("; binary stderr:")
+        .trim_end_matches("; stderr:");
+    failure::RunError {
+        stage: e.stage.to_string(),
+        message: format!("{}: {first}", e.stage),
+        diagnostics: Vec::new(),
+        ice: None,
+        stderr: failure::trimmed_stderr(&e.message),
+    }
+}
+
+/// A `--max-mir-size` value, in megabytes, that admits every skipped
+/// MIR file: the largest one rounded up to the next multiple of 50.
+fn suggested_mir_limit(skipped: &[(std::path::PathBuf, u64)]) -> u64 {
+    let largest_mb = skipped
+        .iter()
+        .map(|(_, b)| b.div_ceil(1024 * 1024))
+        .max()
+        .unwrap_or(DEFAULT_MAX_MIR_MB);
+    (largest_mb / 50 + 1) * 50
+}
+
+fn format_mb(bytes: u64) -> String {
+    format!("{:.0} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// The stderr notice for MIR files skipped by the size guard: each
+/// file and its size, the limit, and the flag that raises it.
+fn print_oversize_notice(
+    out: &mut dyn std::io::Write,
+    skipped: &[(std::path::PathBuf, u64)],
+    max_mir_mb: u64,
+) {
+    let _ = writeln!(
+        out,
+        "cargo-floyd: skipped {} test-target MIR file(s) larger than the \
+         --max-mir-size limit of {max_mir_mb} MB; their tests and \
+         decisions are not analysed:",
+        skipped.len()
+    );
+    for (path, bytes) in skipped {
+        let _ = writeln!(out, "  {}  ({})", path.display(), format_mb(*bytes));
+    }
+    let _ = writeln!(
+        out,
+        "  To analyse them, raise the limit: cargo floyd test --max-mir-size={} \
+         (parsing takes longer and uses more memory).",
+        suggested_mir_limit(skipped)
+    );
+}
+
+/// The stderr line for the `no_candidates` verdict. When MIR files
+/// were skipped by the size guard it says so first, since the
+/// decisions in them were never looked at.
+fn no_candidates_line(
+    skipped: &[(std::path::PathBuf, u64)],
+    test_targets: usize,
+    max_mir_mb: u64,
+) -> String {
+    const SCOPE: &str = "The engine currently supports `&&`, `||`, `!`, and nested \
+         combinations; `if let`, `?`, and `match` patterns are \
+         partially supported (2-arm const-returning shapes); \
+         non-boolean decisions and arms that end in a function \
+         call are out of scope.";
+    if skipped.is_empty() {
+        return format!("cargo-floyd: no recognised decisions in any test target. {SCOPE}");
+    }
+    let all = skipped.len() >= test_targets;
+    let which = if all {
+        format!("all {} test target(s)", skipped.len())
+    } else {
+        format!("{} of {test_targets} test target(s)", skipped.len())
+    };
+    let rest = if all {
+        String::new()
+    } else {
+        format!(" In the analysed targets: {SCOPE}")
+    };
+    format!(
+        "cargo-floyd: no recognised decisions: the MIR of {which} exceeded \
+         --max-mir-size={max_mir_mb} (MB) and was not analysed; rerun with \
+         --max-mir-size={} to include it.{rest}",
+        suggested_mir_limit(skipped)
+    )
 }
 
 fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCode {
@@ -1442,7 +1780,9 @@ fn print_usage() {
     eprintln!("cargo-floyd  MC/DC coverage analysis for Rust");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("    cargo floyd test [--format=text|json|junit] [<path>]");
+    eprintln!("    cargo floyd test [--format=text|json|junit] [--only=<pat>]...");
+    eprintln!("                     [--max-mir-size=<MB>] [--features=<list>]");
+    eprintln!("                     [--all-features] [--no-default-features] [<path>]");
     eprintln!("        Runtime MC/DC analysis: builds the project as a test");
     eprintln!("        crate with coverage instrumentation, runs each #[test]");
     eprintln!("        function individually, and reports which conditions the");
@@ -1456,6 +1796,23 @@ fn print_usage() {
     eprintln!("        per condition; pass=exercised, failure=unexercised) for");
     eprintln!("        CIs that render JUnit natively (Jenkins, GitLab CI,");
     eprintln!("        GitHub Actions, Bazel/Buck2, etc.).");
+    eprintln!();
+    eprintln!("        --only=<pat> (repeatable) analyses only functions whose");
+    eprintln!("        name contains <pat>.");
+    eprintln!();
+    eprintln!("        --max-mir-size=<MB> (default 50) skips test-target MIR");
+    eprintln!("        files larger than <MB> megabytes; skipped files are");
+    eprintln!("        listed on stderr and in the JSON `skipped_oversize_mirs`.");
+    eprintln!();
+    eprintln!("        --features=<list> (or -F <list>), --all-features and");
+    eprintln!("        --no-default-features are passed to the instrumented");
+    eprintln!("        `cargo build --tests`, as for `cargo test`.");
+    eprintln!();
+    eprintln!("        On an error (build failure, test discovery or a test run");
+    eprintln!("        failing) the exit code is 1 and --format=json/junit still");
+    eprintln!("        print a document: JSON `verdict` build_failed,");
+    eprintln!("        test_discovery_failed, test_run_failed or setup_failed,");
+    eprintln!("        with an `error` object; JUnit one testcase with <error>.");
     eprintln!();
     eprintln!("    cargo floyd [--format=text|json] <path/to/source.rs>");
     eprintln!("        Static MC/DC analysis: prints the recovered truth table");
@@ -1788,6 +2145,7 @@ fn print_out_of_scope_report(
     out: &mut dyn std::io::Write,
     declined: &[impl std::fmt::Debug],
     skipped_oversize_mirs: &[(std::path::PathBuf, u64)],
+    max_mir_mb: u64,
     skipped_no_harness: &[NoHarnessTarget],
 ) {
     if !skipped_no_harness.is_empty() {
@@ -1817,12 +2175,14 @@ fn print_out_of_scope_report(
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "Skipped {} MIR file(s) above the 50 MB scalability \
+            "Skipped {} MIR file(s) above the {max_mir_mb} MB scalability \
              threshold (monomorphisation explosion in test \
              binaries). These artifacts were not analysed — \
              candidates and tests they would have contributed are \
-             absent from the verdict:",
-            skipped_oversize_mirs.len()
+             absent from the verdict. Raise the limit with \
+             --max-mir-size={}:",
+            skipped_oversize_mirs.len(),
+            suggested_mir_limit(skipped_oversize_mirs)
         );
         for (path, size) in skipped_oversize_mirs.iter().take(5) {
             let _ = writeln!(
@@ -2041,9 +2401,10 @@ mod tests {
         }];
         let report = CargoRuntimeReport {
             manifest: "Cargo.toml".to_string(),
-            workspace_root: ".".to_string(),
+            workspace_root: Some(".".to_string()),
             test_targets: 1,
             verdict: RuntimeVerdict::AllUnobserved,
+            error: None,
             tests_discovered: &[],
             observations: &[],
             analysis: None,
@@ -2051,6 +2412,7 @@ mod tests {
             candidates: &candidates,
             out_of_scope: &declined,
             skipped_oversize_mirs: &skipped,
+            max_mir_size_mb: 50,
             skipped_no_harness: &[],
         };
         let v: serde_json::Value =
@@ -2461,6 +2823,102 @@ mod tests {
         );
         assert!(line.ends_with("loop_0, loop_1, loop_2 (+1 more)"), "{line}");
         assert!(!line.contains("UNEXERCISED"));
+    }
+
+    fn partial_for_tests<'a>(
+        tests: &'a [String],
+        skipped: &'a [(std::path::PathBuf, u64)],
+        no_harness: &'a [NoHarnessTarget],
+    ) -> Partial<'a> {
+        Partial {
+            manifest: Path::new("/w/Cargo.toml"),
+            workspace_root: Some(Path::new("/w")),
+            test_targets: 2,
+            tests_discovered: tests,
+            out_of_scope: &[],
+            skipped_oversize_mirs: skipped,
+            skipped_no_harness: no_harness,
+            max_mir_mb: 50,
+        }
+    }
+
+    /// Each error verdict serialises with `error`, a null percentage
+    /// and the partial data collected before the failure.
+    #[test]
+    fn error_reports_carry_verdict_error_and_partial_data() {
+        let tests = vec!["t1".to_string()];
+        let skipped = vec![(std::path::PathBuf::from("/w/t/big.mir"), 60 * 1024 * 1024)];
+        let no_harness = vec![NoHarnessTarget {
+            package: "p".into(),
+            target: "bench".into(),
+            binary: "/w/t/bench".into(),
+        }];
+        let partial = partial_for_tests(&tests, &skipped, &no_harness);
+        for (verdict, name) in [
+            (RuntimeVerdict::BuildFailed, "build_failed"),
+            (RuntimeVerdict::SetupFailed, "setup_failed"),
+            (RuntimeVerdict::TestDiscoveryFailed, "test_discovery_failed"),
+            (RuntimeVerdict::TestRunFailed, "test_run_failed"),
+        ] {
+            assert_eq!(verdict.as_str(), name);
+            let error = failure::RunError {
+                stage: "list_tests".into(),
+                message: "list_tests: binary exited with status 3".into(),
+                ..Default::default()
+            };
+            let entries = skipped_mir_entries(&skipped);
+            let v =
+                serde_json::to_value(error_report(&partial, verdict, &error, &entries)).unwrap();
+            assert_eq!(v["verdict"], name);
+            assert!(v["summary"]["percentage"].is_null());
+            assert_eq!(v["error"]["stage"], "list_tests");
+            assert_eq!(
+                v["error"]["message"],
+                "list_tests: binary exited with status 3"
+            );
+            assert!(v["error"]["ice"].is_null());
+            assert_eq!(v["tests_discovered"][0], "t1");
+            assert_eq!(v["skipped_oversize_mirs"][0]["path"], "/w/t/big.mir");
+            assert_eq!(v["skipped_no_harness"][0]["target"], "bench");
+            assert_eq!(v["workspace_root"], "/w");
+            assert_eq!(v["test_targets"], 2);
+            assert!(v["analysis"].is_null());
+        }
+    }
+
+    #[test]
+    fn oversize_skip_is_named_with_the_limit_and_the_flag() {
+        let skipped = vec![(std::path::PathBuf::from("/t/fixed-0dd5.mir"), 116_578_721)];
+        assert_eq!(suggested_mir_limit(&skipped), 150);
+        assert_eq!(
+            suggested_mir_limit(&[(std::path::PathBuf::new(), 100 * 1024 * 1024)]),
+            150
+        );
+        let mut out = Vec::new();
+        print_oversize_notice(&mut out, &skipped, 50);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("--max-mir-size limit of 50 MB"), "{out}");
+        assert!(out.contains("/t/fixed-0dd5.mir  (111 MB)"), "{out}");
+        assert!(out.contains("--max-mir-size=150"), "{out}");
+
+        let line = no_candidates_line(&skipped, 1, 50);
+        assert!(line.starts_with(
+            "cargo-floyd: no recognised decisions: the MIR of all 1 test target(s) \
+             exceeded --max-mir-size=50 (MB)"
+        ));
+        assert!(!line.contains("In the analysed targets"), "{line}");
+        let some = no_candidates_line(&skipped, 3, 50);
+        assert!(some.contains("1 of 3 test target(s)"));
+        assert!(some.contains("In the analysed targets: The engine"));
+        assert!(!no_candidates_line(&[], 3, 50).contains("max-mir-size"));
+
+        let mut out = Vec::new();
+        print_out_of_scope_report(&mut out, &[] as &[DeclinedFunction], &skipped, 80, &[]);
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("above the 80 MB scalability threshold"),
+            "{out}"
+        );
     }
 
     #[test]

@@ -1,0 +1,14 @@
+[package]
+name = "failure-paths"
+version = "0.0.0"
+edition = "2021"
+description = "Fixture for cargo-floyd's error paths: build failure, --list failure, test-run failure, feature passthrough."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Not a member of the Floyd workspace: without `--features builds` it
+# does not compile, by design.
+[workspace]
+
+[features]
+builds = []

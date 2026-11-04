@@ -31,6 +31,21 @@ pub struct InstrumentError {
     pub stage: &'static str,
     /// Captured `stderr` (or a message describing the exec failure).
     pub stderr: String,
+    /// Captured `stdout` of the failing command, empty when it was
+    /// not run or printed nothing. For the cargo build this is the
+    /// `--message-format=json` stream, which carries rustc's
+    /// diagnostics (`compiler-message` entries).
+    pub stdout: String,
+}
+
+impl InstrumentError {
+    fn new(stage: &'static str, stderr: impl Into<String>) -> Self {
+        InstrumentError {
+            stage,
+            stderr: stderr.into(),
+            stdout: String::new(),
+        }
+    }
 }
 
 impl std::fmt::Display for InstrumentError {
@@ -116,16 +131,30 @@ pub struct CargoBuildResult {
 /// containing one; it gets passed through to cargo as
 /// `--manifest-path`. Requires the nightly toolchain.
 pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, InstrumentError> {
+    compile_cargo_project_with_args(manifest_path, &[])
+}
+
+/// [`compile_cargo_project`] with extra arguments appended to the
+/// `cargo build --tests` command line, such as `--features=a,b`,
+/// `--all-features` or `--no-default-features`.
+///
+/// On a build failure the returned error's `stdout` holds cargo's
+/// JSON message stream, so the caller can render rustc's
+/// diagnostics.
+pub fn compile_cargo_project_with_args(
+    manifest_path: &Path,
+    cargo_args: &[String],
+) -> Result<CargoBuildResult, InstrumentError> {
     let manifest = if manifest_path.is_dir() {
         manifest_path.join("Cargo.toml")
     } else {
         manifest_path.to_path_buf()
     };
     if !manifest.exists() {
-        return Err(InstrumentError {
-            stage: "cargo project",
-            stderr: format!("Cargo.toml not found at {}", manifest.display()),
-        });
+        return Err(InstrumentError::new(
+            "cargo project",
+            format!("Cargo.toml not found at {}", manifest.display()),
+        ));
     }
 
     // Step 1: cargo metadata to discover workspace.
@@ -139,15 +168,14 @@ pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, I
         ])
         .arg(&manifest)
         .output()
-        .map_err(|e| InstrumentError {
-            stage: "cargo metadata",
-            stderr: format!("could not exec cargo: {e}"),
+        .map_err(|e| {
+            InstrumentError::new("cargo metadata", format!("could not exec cargo: {e}"))
         })?;
     if !metadata_out.status.success() {
-        return Err(InstrumentError {
-            stage: "cargo metadata",
-            stderr: String::from_utf8_lossy(&metadata_out.stderr).into_owned(),
-        });
+        return Err(InstrumentError::new(
+            "cargo metadata",
+            String::from_utf8_lossy(&metadata_out.stderr).into_owned(),
+        ));
     }
     let metadata: Option<serde_json::Value> = serde_json::from_slice(&metadata_out.stdout).ok();
     let package_manifests: std::collections::HashMap<String, PathBuf> = metadata
@@ -171,9 +199,11 @@ pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, I
                 .and_then(|w| w.as_str())
                 .map(PathBuf::from)
         })
-        .ok_or_else(|| InstrumentError {
-            stage: "cargo metadata",
-            stderr: "could not parse workspace_root".to_string(),
+        .ok_or_else(|| {
+            InstrumentError::new(
+                "cargo metadata",
+                "could not parse workspace_root".to_string(),
+            )
         })?;
 
     // Step 2: cargo build --tests. The caller sets
@@ -193,15 +223,16 @@ pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, I
             "--manifest-path",
         ])
         .arg(&manifest)
+        .args(cargo_args)
         .output()
-        .map_err(|e| InstrumentError {
-            stage: "cargo build --tests",
-            stderr: format!("could not exec cargo: {e}"),
+        .map_err(|e| {
+            InstrumentError::new("cargo build --tests", format!("could not exec cargo: {e}"))
         })?;
     if !build_out.status.success() {
         return Err(InstrumentError {
             stage: "cargo build --tests",
             stderr: String::from_utf8_lossy(&build_out.stderr).into_owned(),
+            stdout: String::from_utf8_lossy(&build_out.stdout).into_owned(),
         });
     }
 
@@ -273,11 +304,10 @@ pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, I
     }
 
     if test_artifacts.is_empty() {
-        return Err(InstrumentError {
-            stage: "cargo build --tests",
-            stderr: "no test artifacts produced; does the project have any #[test] functions?"
-                .to_string(),
-        });
+        return Err(InstrumentError::new(
+            "cargo build --tests",
+            "no test artifacts produced; does the project have any #[test] functions?".to_string(),
+        ));
     }
 
     Ok(CargoBuildResult {
@@ -404,15 +434,14 @@ fn rustc_nightly(
         cmd.arg(f);
     }
     cmd.arg("-o").arg(output).arg(source);
-    let out = cmd.output().map_err(|e| InstrumentError {
-        stage,
-        stderr: format!("could not exec rustc: {e}"),
-    })?;
+    let out = cmd
+        .output()
+        .map_err(|e| InstrumentError::new(stage, format!("could not exec rustc: {e}")))?;
     if !out.status.success() {
-        return Err(InstrumentError {
+        return Err(InstrumentError::new(
             stage,
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        });
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ));
     }
     Ok(())
 }
@@ -423,10 +452,7 @@ mod tests {
 
     #[test]
     fn error_display_includes_stage_and_stderr() {
-        let e = InstrumentError {
-            stage: "rustc --emit=mir",
-            stderr: "boom".to_string(),
-        };
+        let e = InstrumentError::new("rustc --emit=mir", "boom".to_string());
         let s = format!("{e}");
         assert!(s.contains("rustc --emit=mir"));
         assert!(s.contains("boom"));

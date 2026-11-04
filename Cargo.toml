@@ -1,3 +1,5 @@
 [workspace]
 members = ["floyd", "cargo-floyd", "fixtures/mcdc-cases"]
 resolver = "2"
+# Fixtures for cargo-floyd error paths; each is its own workspace.
+exclude = ["fixtures/failure-paths", "fixtures/proc-macro-test"]

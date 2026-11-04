@@ -291,6 +291,39 @@ in a stage and add `junit 'floyd-mcdc.xml'` in `post { always
 `junit-annotate` plugin (or call `buildkite-agent artifact
 upload floyd-mcdc.xml`).
 
+### Options
+
+| Option | Effect |
+|--------|--------|
+| `--format=text\|json\|junit` | Output format (default `text`). |
+| `--only=<pat>` | Analyse only functions whose name contains `<pat>` (repeatable). |
+| `--max-mir-size=<MB>` | Skip test-target MIR files larger than `<MB>` megabytes (default 50). Skipped files are listed on stderr with their sizes and in the JSON `skipped_oversize_mirs`; when they are why no decision was found, the `no_candidates` message says so. Raise it for crates with heavy monomorphisation (for example `fixed` needs `--max-mir-size=200`). |
+| `--features=<list>`, `-F <list>` | Enable cargo features for the instrumented `cargo build --tests` (repeatable; comma- or space-separated, as for cargo). |
+| `--all-features`, `--no-default-features` | Passed to the instrumented build, as for `cargo test`. Crates whose test suite expects `cargo test --all-features` (such as `time`) need it. |
+
+### Errors
+
+When the run stops before an analysis, the exit code is 1 and every
+format still reports why:
+
+- **Build failure.** rustc's error diagnostics (which Floyd receives
+  as cargo JSON messages) are printed to stderr, followed by a
+  one-line summary naming the failed units. If rustc crashed, its
+  internal-compiler-error lines and the path of the `rustc-ice-*.txt`
+  report are printed instead.
+- **Test discovery or a test run failing** (`<binary> --list`, or a
+  test producing no coverage data): the binary's stderr is printed.
+
+`--format=json` prints the usual report with `verdict` set to
+`build_failed`, `test_discovery_failed`, `test_run_failed` or
+`setup_failed` (llvm-tools missing), `summary.percentage` `null`, an
+`error` object (`stage`, `message`, `diagnostics`, `ice`, `stderr`),
+and whatever was collected before the failure (`tests_discovered`,
+`out_of_scope`, `skipped_no_harness`, `skipped_oversize_mirs`).
+`error` is `null` on the other verdicts. `--format=junit` prints a
+document with one `<testcase>` carrying an `<error>` whose `type` is
+the verdict.
+
 ### Exit codes
 
 | Code | Meaning |
