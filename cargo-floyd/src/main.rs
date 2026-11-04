@@ -50,7 +50,8 @@ enum RuntimeVerdict {
     /// Decomposable decisions were found but no test produced a
     /// usable observation for any of them.
     AllUnobserved,
-    /// The instrumented `cargo build --tests` failed.
+    /// The instrumented `cargo build --tests` failed (`error` carries
+    /// rustc's diagnostics, or the internal compiler error).
     BuildFailed,
     /// A required tool (`llvm-profdata`, `llvm-cov`) was not found.
     SetupFailed,
@@ -748,10 +749,11 @@ fn run_test_mode_cargo(
     };
 
     // Build all test artifacts in the cargo project.
+    let build_started = std::time::SystemTime::now();
     let build = match instrument::compile_cargo_project_with_args(manifest, cargo_args) {
         Ok(b) => b,
         Err(e) => {
-            let error = build_error(&e);
+            let error = build_error(manifest, &e, build_started);
             return emit_run_error(format, &partial(None), RuntimeVerdict::BuildFailed, &error);
         }
     };
@@ -1408,25 +1410,45 @@ fn skipped_mir_entries(skipped: &[(std::path::PathBuf, u64)]) -> Vec<SkippedMir>
         .collect()
 }
 
-/// Print a failed instrumented build's error to stderr and return
-/// the `error` object.
-fn build_error(e: &instrument::InstrumentError) -> failure::RunError {
-    eprintln!("cargo-floyd: {e}");
-    let stderr = failure::trimmed_stderr(&e.stderr);
-    let first = stderr
-        .lines()
-        .find(|l| l.trim_start().starts_with("error"))
-        .or_else(|| stderr.lines().find(|l| !l.trim().is_empty()))
-        .unwrap_or("")
-        .trim();
-    let message = if first.is_empty() {
-        format!("{} failed", e.stage)
+/// Print rustc's diagnostics (or the internal compiler error) for a
+/// failed instrumented build to stderr and return the `error` object.
+/// A failure before rustc ran (no Cargo.toml, `cargo metadata`
+/// failing, no test artifacts) has no diagnostics; cargo's stderr is
+/// printed as is.
+fn build_error(
+    manifest: &Path,
+    e: &instrument::InstrumentError,
+    started: std::time::SystemTime,
+) -> failure::RunError {
+    let package_dir = if manifest.is_dir() {
+        manifest
     } else {
-        format!("{} failed: {first}", e.stage)
+        manifest.parent().unwrap_or(Path::new("."))
+    };
+    let parsed = failure::BuildFailure::parse(&e.stdout, &e.stderr, &[package_dir], Some(started));
+    let stderr = failure::trimmed_stderr(&e.stderr);
+    let message = if parsed.diagnostics.is_empty() && parsed.ice.is_none() {
+        eprintln!("cargo-floyd: {e}");
+        let first = stderr
+            .lines()
+            .find(|l| l.trim_start().starts_with("error"))
+            .or_else(|| stderr.lines().find(|l| !l.trim().is_empty()))
+            .unwrap_or("")
+            .trim();
+        if first.is_empty() {
+            format!("{} failed", e.stage)
+        } else {
+            format!("{} failed: {first}", e.stage)
+        }
+    } else {
+        parsed.print(&mut std::io::stderr());
+        parsed.summary_line()
     };
     failure::RunError {
         stage: e.stage.to_string(),
         message,
+        diagnostics: parsed.diagnostics,
+        ice: parsed.ice,
         stderr,
     }
 }
@@ -1441,6 +1463,8 @@ fn runner_error(e: &runner::RunnerError) -> failure::RunError {
     failure::RunError {
         stage: e.stage.to_string(),
         message: format!("{}: {first}", e.stage),
+        diagnostics: Vec::new(),
+        ice: None,
         stderr: failure::trimmed_stderr(&e.message),
     }
 }
@@ -2650,6 +2674,7 @@ mod tests {
                 v["error"]["message"],
                 "list_tests: binary exited with status 3"
             );
+            assert!(v["error"]["ice"].is_null());
             assert_eq!(v["tests_discovered"][0], "t1");
             assert_eq!(v["skipped_oversize_mirs"][0]["path"], "/w/t/big.mir");
             assert_eq!(v["skipped_no_harness"][0]["target"], "bench");

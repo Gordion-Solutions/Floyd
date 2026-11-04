@@ -272,14 +272,18 @@ upload floyd-mcdc.xml`).
 When the run stops before an analysis, the exit code is 1 and every
 format still reports why:
 
-- **Build failure**: cargo's stderr is printed.
+- **Build failure.** rustc's error diagnostics (which Floyd receives
+  as cargo JSON messages) are printed to stderr, followed by a
+  one-line summary naming the failed units. If rustc crashed, its
+  internal-compiler-error lines and the path of the `rustc-ice-*.txt`
+  report are printed instead.
 - **Test discovery or a test run failing** (`<binary> --list`, or a
   test producing no coverage data): the binary's stderr is printed.
 
 `--format=json` prints the usual report with `verdict` set to
 `build_failed`, `test_discovery_failed`, `test_run_failed` or
 `setup_failed` (llvm-tools missing), `summary.percentage` `null`, an
-`error` object (`stage`, `message`, `stderr`),
+`error` object (`stage`, `message`, `diagnostics`, `ice`, `stderr`),
 and whatever was collected before the failure (`tests_discovered`,
 `out_of_scope`, `skipped_no_harness`, `skipped_oversize_mirs`).
 `error` is `null` on the other verdicts. `--format=junit` prints a
