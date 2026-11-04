@@ -4,8 +4,8 @@
 //! test. A test that evaluates a decision several times with
 //! different values must never be collapsed into one fabricated
 //! vector: Floyd derives its vectors only when the counters
-//! determine them (here: exactly one condition took both values, or
-//! the decision is a tree, whose counters are its edge flows), and
+//! determine them (here: the decision is a tree, whose counters are
+//! its edge flows, or exactly one condition took both values), and
 //! otherwise records the test as ambiguous (no condition vector).
 //! An ambiguous test leaves a condition unknown only if it took the
 //! outcomes a missing independence-pair row needs.
@@ -14,12 +14,13 @@
 /// `collapse_and_once_tf`.
 ///
 /// `collapse_and_loop` evaluates (T,T) -> T then (F,-) -> F, so its
-/// counters are a = [1 T, 1 F], b = [1 T, 0 F]: only `a` took both
-/// values, so the counters determine both vectors.
+/// counters are a = [1 T, 1 F], b = [1 T, 0 F]. `a && b` is a tree,
+/// so the counters are its edge flows and determine both vectors.
 ///
 /// Expected (`--only=collapse_and`): verdict `analysed`, three
 /// vector observations, none ambiguous: `collapse_and_loop`'s
-/// (`a=T, b=T -> T` and `a=F -> F`, each `evaluations: 2`) and
+/// (`a=T, b=T -> T` and `a=F -> F`, each `evaluations: 1` and
+/// `resolved_by: "tree_counters"`) and
 /// `collapse_and_once_tf`'s (`a=T, b=F -> F`); both conditions
 /// exercised, `summary.percentage == 100`, exit 0.
 pub fn collapse_and(a: bool, b: bool) -> bool {
@@ -69,6 +70,24 @@ pub fn and_or_tree(a: bool, b: bool, c: bool) -> bool {
 /// counter; `summary.unknown == 1`, `summary.percentage == null`,
 /// text output says "no percentage", exit code 2.
 pub fn dag_or_and(a: bool, b: bool, c: bool) -> Option<u8> {
+    if (a || b) && c {
+        return None;
+    }
+    Some(1)
+}
+
+/// `(a || b) && c`, the shape of `dag_or_and`, evaluated three
+/// times by `dag_one_two_sided_loop`: (T,-,T) -> T twice and
+/// (F,T,T) -> T once, so a = [2 T, 1 F], b = [1 T, 0 F],
+/// c = [3 T, 0 F]. Not a tree, but only `a` took both values, so
+/// each evaluation's walk is fixed by `a`'s value and the counters
+/// determine both vectors.
+///
+/// Expected (`--only=dag_one_two_sided`): two vector observations,
+/// none ambiguous: `a=T, c=T -> T` and `a=F, b=T, c=T -> T`, each
+/// `evaluations: 3` and `resolved_by: "single_two_sided"`. No test
+/// made the decision false, so no condition is exercised.
+pub fn dag_one_two_sided(a: bool, b: bool, c: bool) -> Option<u8> {
     if (a || b) && c {
         return None;
     }
@@ -140,6 +159,17 @@ mod tests {
             }
         }
         assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn dag_one_two_sided_loop() {
+        let mut hits = 0;
+        for (a, b, c) in [(true, false, true), (true, true, true), (false, true, true)] {
+            if dag_one_two_sided(a, b, c).is_none() {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 3);
     }
 
     #[test]

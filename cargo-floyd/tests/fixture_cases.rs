@@ -126,6 +126,7 @@ const EXPECTED: &[(&str, Expect)] = &[
     ("tree_and", measured(1, None)),
     ("and_or_tree", measured(1, None)),
     ("dag_or_and", measured(1, Some("value_arms"))),
+    ("dag_one_two_sided", measured(1, Some("value_arms"))),
     ("single_and", measured(3, None)),
     // 2. Name-based correlation.
     ("impl_or", measured(3, None)),
@@ -397,8 +398,10 @@ fn harness_false_target_is_skipped_and_never_run() {
 
 #[test]
 #[ignore = "requires nightly Rust + llvm-tools-preview component"]
-fn multi_evaluation_test_with_one_two_sided_condition_is_resolved() {
-    // `collapse_and_loop`'s counters determine its two vectors.
+fn multi_evaluation_tree_test_with_one_two_sided_condition_is_resolved() {
+    // `collapse_and_loop`'s counters determine its two vectors; the
+    // decision is a tree, so the tree rule (tried first) gives each
+    // its own count.
     let run = floyd("json", &["--only=collapse_and"]);
     assert_report_shape(&run, "collapse_and");
     assert_eq!(conditions(&run), vec!["a", "b"]);
@@ -420,10 +423,10 @@ fn multi_evaluation_test_with_one_two_sided_condition_is_resolved() {
     assert_eq!(looped[0]["result"].as_bool(), Some(true));
     assert_eq!(looped[1]["inputs"], serde_json::json!({"a": false}));
     assert_eq!(looped[1]["result"].as_bool(), Some(false));
-    assert!(looped.iter().all(|o| o["evaluations"].as_u64() == Some(2)));
+    assert!(looped.iter().all(|o| o["evaluations"].as_u64() == Some(1)));
     assert!(looped
         .iter()
-        .all(|o| str_field(o, "resolved_by") == Some("single_two_sided")));
+        .all(|o| str_field(o, "resolved_by") == Some("tree_counters")));
     assert_eq!(
         percentage(&run),
         Some(100.0),
@@ -431,6 +434,39 @@ fn multi_evaluation_test_with_one_two_sided_condition_is_resolved() {
         run.json["summary"]
     );
     assert_eq!(run.code, 0);
+}
+
+#[test]
+#[ignore = "requires nightly Rust + llvm-tools-preview component"]
+fn multi_evaluation_dag_test_with_one_two_sided_condition_is_resolved() {
+    // `(a || b) && c` is not a tree, so the tree rule declines; only
+    // `a` took both values, so the single-two-sided rule determines
+    // both vectors, each recorded with the test's 3 evaluations.
+    let run = floyd("json", &["--only=dag_one_two_sided"]);
+    assert_report_shape(&run, "dag_one_two_sided");
+    assert_eq!(conditions(&run), vec!["a", "b", "c"]);
+    let obs = observations(&run);
+    assert_eq!(obs.len(), 2, "{obs:?}");
+    assert!(
+        obs.iter().all(|o| o["ambiguous"].as_bool() == Some(false)
+            && o["evaluations"].as_u64() == Some(3)
+            && str_field(o, "resolved_by") == Some("single_two_sided")
+            && str_field(o, "test_name") == Some("observation::tests::dag_one_two_sided_loop")),
+        "{obs:?}"
+    );
+    assert_eq!(obs[0]["inputs"], serde_json::json!({"a": true, "c": true}));
+    assert_eq!(
+        obs[1]["inputs"],
+        serde_json::json!({"a": false, "b": true, "c": true})
+    );
+    assert!(
+        obs.iter().all(|o| o["result"].as_bool() == Some(true)),
+        "{obs:?}"
+    );
+    assert_eq!(
+        run.json["analysis"]["ambiguous_observations"].as_u64(),
+        Some(0)
+    );
 }
 
 /// The observations of `test` (a test of the `observation` module),

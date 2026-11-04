@@ -141,11 +141,12 @@ pub struct ConditionObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Resolution {
-    /// Rule 4: exactly one condition took both values, so every
-    /// evaluation followed one of two walks. Each vector's
+    /// Rule 5: exactly one condition took both values, so every
+    /// evaluation followed one of two walks (used when the decision
+    /// is not a tree of distinct counters). Each vector's
     /// `evaluations` is the test's total evaluation count.
     SingleTwoSided,
-    /// Rule 5: the decision is a tree with one counter per node, so
+    /// Rule 4: the decision is a tree with one counter per node, so
     /// the counters are edge flows and each leaf's inflow is the
     /// number of evaluations that took its vector. Each vector's
     /// `evaluations` is that leaf flow.
@@ -1182,8 +1183,8 @@ mod tests {
     fn missing_outcome_never_taken_anywhere_is_unexercised() {
         // anyhow `test_whitespace` (cut from its llvm-cov export): 9
         // evaluations, `b == 32` = [1 T, 8 F], `b == 10` = [0 T, 8 F],
-        // kept ambiguous here (as before rule 4 of
-        // `observations_from_counts`), plus a single-pass test that
+        // kept ambiguous here (as before `observations_from_counts`
+        // resolved it), plus a single-pass test that
         // saw (F,F) -> F. `b == 10`'s only pair needs
         // (b == 32 = F, b == 10 = T) -> T; no test ever took
         // `b == 10` = T, so it is unexercised, not unknown.

@@ -12,12 +12,14 @@
 //! reported `a` UNEXERCISED. `a && b` is a tree (each condition at
 //! one node), so the counters are edge flows and determine every
 //! vector: a's true count is b's inflow, and the leaves carry
-//! (T,T) x1, (T,F) x1, (F,-) x1 (rule 5 of
+//! (T,T) x1, (T,F) x1, (F,-) x1 (rule 4 of
 //! `correlate::observations_from_counts`).
 //!
 //! `loop_tt_then_f` ((T,T) then (F,-): a = [1 T, 1 F], b = [1 T,
-//! 0 F]) has only one two-sided condition, so rule 4 already
-//! determines its two vectors.
+//! 0 F]) is resolved the same way, one evaluation per vector (it
+//! has only one two-sided condition, so rule 5 would also determine
+//! its two vectors, but rule 4 is tried first and is exact per
+//! vector).
 //!
 //! `(a || b) && c` is not a tree: `c` is reached from `a = T` and
 //! from `a = F, b = T`. A loop test over it whose counters do not
@@ -275,8 +277,9 @@ fn dag_loop_test_is_ambiguous_and_its_conditions_are_unknown_not_unexercised() {
 #[test]
 fn loop_with_one_two_sided_condition_is_resolved_and_demonstrates_mcdc() {
     // (T,T) then (F,-) in one test, (T,F) in another: the counters of
-    // the loop test determine both its vectors, so all three rows
-    // are observed and both conditions are exercised.
+    // the loop test determine both its vectors (tree counters, one
+    // evaluation each), so all three rows are observed and both
+    // conditions are exercised.
     let mir = mir::parse_text(AND_MIR).expect("MIR parses");
     let tree = decision::decompose(&mir);
     let tests = [
@@ -286,8 +289,10 @@ fn loop_with_one_two_sided_condition_is_resolved_and_demonstrates_mcdc() {
     let observations = observe(&mir, &tree, &tests);
     assert_eq!(observations.len(), 3);
     assert!(observations.iter().all(|o| !o.ambiguous));
-    assert_eq!(observations[0].evaluations, Some(2));
+    assert_eq!(observations[0].evaluations, Some(1));
+    assert_eq!(observations[0].resolved_by, Some(Resolution::TreeCounters));
     assert_eq!(observations[0].result, Some(true));
+    assert_eq!(observations[1].evaluations, Some(1));
     assert_eq!(observations[1].inputs.get("b"), None);
     assert_eq!(observations[1].result, Some(false));
     for variant in [Variant::Masking, Variant::UniqueCause] {
@@ -337,12 +342,13 @@ fn loop_inside_a_function_called_once_is_still_multi_evaluation() {
     let mir = mir::parse_text(AND_MIR).expect("MIR parses");
     let tree = decision::decompose(&mir);
 
-    // Two evaluations, one two-sided condition: both vectors, N = 2.
+    // Two evaluations, one two-sided condition: both vectors from
+    // the tree's edge flows, one evaluation each.
     let observations = observe(&mir, &tree, &[("twice", coverage(1, (1, 1), (1, 0)))]);
     assert_eq!(observations.len(), 2);
     assert!(observations
         .iter()
-        .all(|o| !o.ambiguous && o.evaluations == Some(2)));
+        .all(|o| !o.ambiguous && o.evaluations == Some(1)));
 
     // Three evaluations, two two-sided conditions: three vectors
     // from the tree's edge flows, one evaluation each.

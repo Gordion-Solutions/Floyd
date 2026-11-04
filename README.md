@@ -158,22 +158,6 @@ vector from a test only when
 - the decision has a single condition (its true and false counters
   each prove that outcome occurred, however many evaluations there
   were), or
-- exactly one condition was both true and false in that test, every
-  other condition was only ever true or only ever false, and the
-  counters add up exactly. Every other condition then always takes
-  its one value, so each evaluation's path through the decision is
-  fixed by the two-sided condition's value: the test evaluated
-  exactly two condition vectors, one per value of that condition,
-  with outcomes computed from the decision. Floyd checks the counts
-  before it relies on this: the two-sided condition's total must
-  equal the evaluation count, and every condition's counters must
-  equal the number of times those two paths test it (a condition
-  short-circuited on one path counts only the other path's
-  evaluations). Otherwise the test stays ambiguous. For example,
-  `b == b' ' || b == b'\n'` evaluated 9 times with `b == 32 = 1 T /
-  8 F` and `b == 10 = 0 T / 8 F` gives (T,-) -> T once and (F,F) -> F
-  8 times. These vectors carry `"resolved_by": "single_two_sided"`
-  in `--format=json`.
 - the decision is a **tree** and the counters are consistent with
   it, however many conditions were both true and false. A decision
   is a tree when every condition is reached along one path only:
@@ -191,12 +175,34 @@ vector from a test only when
   condition with no counter is never reached, that no condition
   appears at two places and no two conditions share a branch
   counter, and that the leaf counts add up to the evaluation count.
-  Otherwise the test stays ambiguous. For example, rust-base64's
+  Otherwise the next rule is tried. For example, rust-base64's
   `byte >= 32 && byte <= 126` evaluated 256 times with
   `byte >= 32 = 224 T / 32 F` and `byte <= 126 = 95 T / 129 F` gives
   (T,T) -> T 95 times, (T,F) -> F 129 times and (F,-) -> F 32 times.
   Each such vector's `evaluations` is its own count and it carries
   `"resolved_by": "tree_counters"`.
+- the decision is not a tree (or the tree check fails), but exactly
+  one condition was both true and false in that test, every
+  other condition was only ever true or only ever false, and the
+  counters add up exactly. Every other condition then always takes
+  its one value, so each evaluation's path through the decision is
+  fixed by the two-sided condition's value: the test evaluated
+  exactly two condition vectors, one per value of that condition,
+  with outcomes computed from the decision. Floyd checks the counts
+  before it relies on this: the two-sided condition's total must
+  equal the evaluation count, and every condition's counters must
+  equal the number of times those two paths test it (a condition
+  short-circuited on one path counts only the other path's
+  evaluations). Otherwise the test stays ambiguous. For example,
+  `(a || b) && c` evaluated 3 times with `a = 2 T / 1 F`,
+  `b = 1 T / 0 F` and `c = 3 T / 0 F` gives (T,-,T) -> T and
+  (F,T,T) -> T. These vectors carry `"resolved_by":
+  "single_two_sided"` in `--format=json`, and each records the
+  test's total evaluation count (here 3): the counters fix which
+  two vectors occurred, and Floyd does not split the count between
+  them. Where both this and the tree rule apply they give the same
+  vectors, so Floyd tries the tree rule first for its exact
+  per-vector counts.
 
 Any other test, such as one where two or more conditions were both
 true and false in a decision that is not a tree, is reported as an

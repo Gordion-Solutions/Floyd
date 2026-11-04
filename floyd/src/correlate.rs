@@ -187,70 +187,37 @@ fn root_condition(node: &Node) -> Option<&str> {
 ///    `{c: F}`, however many evaluations there were: with one
 ///    condition the vector is the condition's value, so each
 ///    non-zero counter proves its vector occurred.
-/// 4. **One two-sided condition.** `N > 1`, exactly one condition
-///    was both true and false, every other condition was one-sided,
-///    and the counters account exactly for one evaluation path per
-///    value of the two-sided condition. Two vectors, one per value
-///    (see "Why rule 4 is sound" below for the proof and the exact
-///    consistency check), each with `evaluations: N` and
-///    `resolved_by: single_two_sided`.
-/// 5. **Tree counters.** `N > 1`, any number of two-sided
+/// 4. **Tree counters.** `N > 1`, any number of two-sided
 ///    conditions, the decision's [`Node`] tree is a tree of
 ///    distinct counters (every condition sits at exactly one node,
 ///    and no two conditions share a counter), and the counters are
 ///    flow-consistent over that tree. One vector per leaf the
 ///    evaluations reached, each with `evaluations` equal to the
 ///    number of evaluations that reached that leaf and
-///    `resolved_by: tree_counters` (see "Why rule 5 is sound").
+///    `resolved_by: tree_counters` (see "Why rule 4 is sound").
+/// 5. **One two-sided condition.** `N > 1`, exactly one condition
+///    was both true and false, every other condition was one-sided,
+///    and the counters account exactly for one evaluation path per
+///    value of the two-sided condition. Two vectors, one per value
+///    (see "Why rule 5 is sound" below for the proof and the exact
+///    consistency check), each with `evaluations: N` and
+///    `resolved_by: single_two_sided`. Tried only when rule 4 does
+///    not apply (a decision that is not a tree, two conditions on
+///    one counter, or counters that do not fit the tree): where
+///    both apply they give the same vectors, but rule 4 gives each
+///    vector its own evaluation count and its checks are the
+///    stricter.
 /// 6. Otherwise the test is **ambiguous**: recorded with its
 ///    evaluation count and raw counters, no vector, no result.
 ///
 /// # Why rule 4 is sound
-///
-/// Let `p` be the only condition with both counters non-zero
-/// (`p = [k_T T, k_F F]`) and let every other condition `d` with a
-/// non-zero counter be one-sided with value `v_d`. Each evaluation
-/// walks the decision tree from the root. Whenever it tests a
-/// condition `d != p`, `d` takes `v_d` (that is the only value it ever
-/// took in this test); whenever it tests `p`, `p` takes `T` or `F`.
-/// A condition with no evaluations in this test is never tested.
-/// So the walk is a function of `p`'s value alone (and of nothing if
-/// it never reaches `p`): there are at most two possible evaluation
-/// vectors, `P_T` (walk with `p = T`) and `P_F` (walk with `p = F`).
-/// Every evaluation that reaches `p` with value `x` is exactly `P_x`.
-///
-/// The rule only fires when the counters are *exactly* those of
-/// `k_T` evaluations of `P_T` plus `k_F` evaluations of `P_F`:
-///
-/// - `p` is on both walks, once each, and `k_T + k_F = N`, so every
-///   evaluation reached `p` (none took a `p`-free path: the walk
-///   before `p` is the same for all evaluations, so either all reach
-///   `p` or none does);
-/// - no walk reaches a condition that has no evaluations in this
-///   test (such a walk could not have happened);
-/// - no condition is tested twice on one walk;
-/// - for every condition `d`, its counter equals the number of
-///   times the two walks, weighted by `k_T` and `k_F`, test it with
-///   each value; conditions on neither walk have zero counters.
-///
-/// Under those checks, `P_T` occurred `k_T > 0` times and `P_F`
-/// occurred `k_F > 0` times, and nothing else occurred, so both
-/// vectors are sound and complete. The outcome of each comes from
-/// the tree. Short-circuited conditions are simply off a walk: a
-/// condition only on `P_T` has a counter total of `k_T`, below `N`.
-/// When any check fails, rule 5 is tried. With two or more
-/// two-sided conditions the walks are no longer a function of one
-/// value, so rule 4 does not apply; rule 5 resolves such a test
-/// when the decision is a tree.
-///
-/// # Why rule 5 is sound
 ///
 /// Read the decision's [`Node`] tree as a flow graph: each
 /// [`Node::Ite`] and each [`Node::Condition`] leaf is a node with a
 /// true edge and a false edge (an `Ite`'s edges lead to its
 /// `then_branch` / `else_branch`; a `Condition` leaf's edges lead to
 /// the outcomes `true` / `false`), and each [`Node::Const`] is an
-/// outcome leaf. Rule 5 first checks that this graph is a **tree of
+/// outcome leaf. Rule 4 first checks that this graph is a **tree of
 /// distinct counters**:
 ///
 /// - every condition name occurs at exactly one node. The
@@ -301,23 +268,61 @@ fn root_condition(node: &Node) -> Option<&str> {
 /// sum to `N` (implied by the node checks; checked anyway). A
 /// violation means the counters were not produced by this tree
 /// (a missing or merged region, a decomposition that differs from
-/// the compiled code) and the test falls through to rule 6.
+/// the compiled code) and the test falls through to rule 5.
 ///
 /// On a graph that is not a tree the counters need not determine
 /// the vectors: in `(a || b) && c`, `c` is reached from `a = T` and
 /// from `a = F, b = T`, and (T,-,T) + (F,T,F) leaves the same
 /// counters (a = [1 T, 1 F], b = [1 T, 0 F], c = [1 T, 1 F]) as
 /// (T,-,F) + (F,T,T), though the two pairs of vectors have their
-/// `true` outcome on different walks. Such tests stay ambiguous.
-/// So do tests of `(a && b) || c`, where (T,F,T) + (F,-,F) and
-/// (T,F,F) + (F,-,T) leave the same counters.
+/// `true` outcome on different walks. Such tests stay ambiguous
+/// unless rule 5 applies. So do tests of `(a && b) || c`, where
+/// (T,F,T) + (F,-,F) and (T,F,F) + (F,-,T) leave the same counters.
+///
+/// # Why rule 5 is sound
+///
+/// Let `p` be the only condition with both counters non-zero
+/// (`p = [k_T T, k_F F]`) and let every other condition `d` with a
+/// non-zero counter be one-sided with value `v_d`. Each evaluation
+/// walks the decision tree from the root. Whenever it tests a
+/// condition `d != p`, `d` takes `v_d` (that is the only value it ever
+/// took in this test); whenever it tests `p`, `p` takes `T` or `F`.
+/// A condition with no evaluations in this test is never tested.
+/// So the walk is a function of `p`'s value alone (and of nothing if
+/// it never reaches `p`): there are at most two possible evaluation
+/// vectors, `P_T` (walk with `p = T`) and `P_F` (walk with `p = F`).
+/// Every evaluation that reaches `p` with value `x` is exactly `P_x`.
+///
+/// The rule only fires when the counters are *exactly* those of
+/// `k_T` evaluations of `P_T` plus `k_F` evaluations of `P_F`:
+///
+/// - `p` is on both walks, once each, and `k_T + k_F = N`, so every
+///   evaluation reached `p` (none took a `p`-free path: the walk
+///   before `p` is the same for all evaluations, so either all reach
+///   `p` or none does);
+/// - no walk reaches a condition that has no evaluations in this
+///   test (such a walk could not have happened);
+/// - no condition is tested twice on one walk;
+/// - for every condition `d`, its counter equals the number of
+///   times the two walks, weighted by `k_T` and `k_F`, test it with
+///   each value; conditions on neither walk have zero counters.
+///
+/// Under those checks, `P_T` occurred `k_T > 0` times and `P_F`
+/// occurred `k_F > 0` times, and nothing else occurred, so both
+/// vectors are sound and complete. The outcome of each comes from
+/// the tree. Short-circuited conditions are simply off a walk: a
+/// condition only on `P_T` has a counter total of `k_T`, below `N`.
+/// When any check fails, the test is ambiguous (rule 6). With two
+/// or more two-sided conditions the walks are no longer a function
+/// of one value, so rule 5 does not apply; such a test is resolved
+/// only by rule 4, when the decision is a tree.
 ///
 /// `N == 0` (the test never evaluated the decision) or a root with
 /// no counters yields no observation at all. Condition names in
 /// `counts` that the decision does not reference are ignored.
 ///
 /// Each name in `counts` is taken to be its own counter; [`join_test`]
-/// additionally withholds rule 5 when two of the decision's
+/// additionally withholds rule 4 when two of the decision's
 /// conditions were joined to one span.
 pub fn observations_from_counts(
     test_name: Option<String>,
@@ -329,7 +334,7 @@ pub fn observations_from_counts(
 }
 
 /// [`observations_from_counts`], with `distinct_counters` false when
-/// two of the decision's conditions share one counter (rule 5 then
+/// two of the decision's conditions share one counter (rule 4 then
 /// does not apply).
 fn reduce_counts(
     test_name: Option<String>,
@@ -385,16 +390,18 @@ fn reduce_counts(
         return single_condition_rule(test_name, decision, root, evaluations);
     }
 
-    // Rule 4.
-    if let Some(obs) = one_two_sided_rule(&test_name, decision, &decision_counts, evaluations) {
-        return obs;
-    }
-
-    // Rule 5.
+    // Rule 4: tried first because, where it applies, it is exact
+    // per vector (each leaf's own flow), not `N` on every vector.
     if distinct_counters {
         if let Some(obs) = tree_counters_rule(&test_name, decision, &decision_counts, evaluations) {
             return obs;
         }
+    }
+
+    // Rule 5: the fallback for decisions that are not trees (or
+    // whose counters are shared).
+    if let Some(obs) = one_two_sided_rule(&test_name, decision, &decision_counts, evaluations) {
+        return obs;
     }
 
     // Rule 6.
@@ -431,11 +438,11 @@ fn single_condition_rule(
         .collect()
 }
 
-/// Rule 4 of [`observations_from_counts`]: exactly one condition is
+/// Rule 5 of [`observations_from_counts`]: exactly one condition is
 /// two-sided, so the counters determine every evaluation. See "Why
-/// rule 4 is sound" on [`observations_from_counts`]; this function
+/// rule 5 is sound" on [`observations_from_counts`]; this function
 /// performs every check listed there and returns `None` (the test
-/// falls through to rule 5) when one fails.
+/// stays ambiguous) when one fails.
 fn one_two_sided_rule(
     test_name: &Option<String>,
     decision: &Node,
@@ -500,14 +507,14 @@ fn one_two_sided_rule(
     exact.then_some(out)
 }
 
-/// Rule 5 of [`observations_from_counts`]: the decision is a tree
+/// Rule 4 of [`observations_from_counts`]: the decision is a tree
 /// of distinct counters, so the counters are the flows on its edges
 /// and every leaf's inflow is the number of evaluations that took
-/// its vector. See "Why rule 5 is sound" on
+/// its vector. See "Why rule 4 is sound" on
 /// [`observations_from_counts`]; this function checks the tree shape
 /// and every flow condition listed there, and returns `None` (the
-/// test stays ambiguous) when one fails. The caller has checked that
-/// no two condition names share a counter.
+/// test falls through to rule 5) when one fails. The caller has
+/// checked that no two condition names share a counter.
 fn tree_counters_rule(
     test_name: &Option<String>,
     decision: &Node,
@@ -782,7 +789,7 @@ pub fn join_test<'i>(
 }
 
 /// True iff no two conditions of `decision` were joined to the same
-/// span, so each has its own counter (rule 5 of
+/// span, so each has its own counter (rule 4 of
 /// [`observations_from_counts`] needs that).
 fn distinct_spans(decision: &Node, spans: &BTreeMap<String, SourceSpan>) -> bool {
     let mut seen = BTreeSet::new();
@@ -1520,7 +1527,7 @@ fn decide(_1: bool, _2: bool) -> bool {
 
     #[test]
     fn and_with_both_conditions_two_sided_resolves_by_tree_counters() {
-        // (T,T), (T,F), (F,-): a and b both two-sided, so rule 4 does
+        // (T,T), (T,F), (F,-): a and b both two-sided, so rule 5 could
         // not apply; `a && b` is a tree, a's true count (2) is b's
         // inflow, and the three leaves carry 1 each.
         let obs = observations_from_counts(
@@ -1666,18 +1673,46 @@ fn decide(_1: bool, _2: bool) -> bool {
 
     #[test]
     fn single_two_sided_rule_records_its_name() {
+        // `(a || b) && c` is not a tree (c sits at two nodes), so
+        // rule 4 declines; only a is two-sided: (T,-,T) -> T twice,
+        // (F,T,T) -> T once.
+        let obs = observations_from_counts(
+            None,
+            &or_and_node(),
+            &counts(&[("a", 2, 1), ("b", 1, 0), ("c", 3, 0)]),
+            None,
+        );
+        assert_eq!(obs.len(), 2);
+        assert!(
+            obs.iter()
+                .all(|o| o.resolved_by == Some(Resolution::SingleTwoSided)
+                    && o.evaluations == Some(3))
+        );
+        assert_eq!(obs[0].inputs, inputs(&[("a", true), ("c", true)]));
+        assert_eq!(obs[0].result, Some(true));
+        assert_eq!(
+            obs[1].inputs,
+            inputs(&[("a", false), ("b", true), ("c", true)])
+        );
+        assert_eq!(obs[1].result, Some(true));
+        let json = serde_json::to_value(&obs[0]).unwrap();
+        assert_eq!(json["resolved_by"], "single_two_sided");
+
+        // On a tree the same shape of counters is resolved by rule 4,
+        // tried first, with each vector's own count.
         let obs = observations_from_counts(
             None,
             &and_node(),
             &counts(&[("a", 1, 1), ("b", 1, 0)]),
             None,
         );
-        assert_eq!(obs.len(), 2);
-        assert!(obs
-            .iter()
-            .all(|o| o.resolved_by == Some(Resolution::SingleTwoSided)));
-        let json = serde_json::to_value(&obs[0]).unwrap();
-        assert_eq!(json["resolved_by"], "single_two_sided");
+        assert_eq!(
+            resolved(&obs),
+            vec![
+                tree_vector(&[("a", true), ("b", true)], true, 1),
+                tree_vector(&[("a", false)], false, 1),
+            ]
+        );
 
         let obs = observations_from_counts(
             None,
@@ -1705,22 +1740,34 @@ fn decide(_1: bool, _2: bool) -> bool {
     #[test]
     fn one_two_sided_condition_resolves_both_vectors() {
         // (T,T) then (F,-): the old collapse recorded (T,T) and lost
-        // the (F,-) evaluation; rule 5 made it ambiguous. Only a is
-        // two-sided and b (on a = T's path only) counts exactly a's
-        // one true, so the two vectors are determined.
-        let obs = observations_from_counts(
-            Some("loop_tt_then_f".into()),
-            &and_node(),
-            &counts(&[("a", 1, 1), ("b", 1, 0)]),
-            Some(1),
+        // the (F,-) evaluation. Only a is two-sided and b (on a = T's
+        // path only) counts exactly a's one true, so the two vectors
+        // are determined. `a && b` is a tree, so rule 4 resolves it
+        // first, one evaluation per vector; rule 5 alone gives the
+        // same vectors, each with the test's N = 2.
+        let raw = counts(&[("a", 1, 1), ("b", 1, 0)]);
+        let obs =
+            observations_from_counts(Some("loop_tt_then_f".into()), &and_node(), &raw, Some(1));
+        assert_eq!(
+            resolved(&obs),
+            vec![
+                tree_vector(&[("a", true), ("b", true)], true, 1),
+                tree_vector(&[("a", false)], false, 1),
+            ]
         );
+        assert!(obs.iter().all(|o| !o.ambiguous && o.counts.is_empty()));
+
+        let obs = one_two_sided_rule(&None, &and_node(), &raw, 2).expect("rule 5 applies");
         assert_eq!(obs.len(), 2);
-        assert!(obs.iter().all(|o| !o.ambiguous && o.evaluations == Some(2)));
+        assert!(
+            obs.iter()
+                .all(|o| o.evaluations == Some(2)
+                    && o.resolved_by == Some(Resolution::SingleTwoSided))
+        );
         assert_eq!(obs[0].inputs, inputs(&[("a", true), ("b", true)]));
         assert_eq!(obs[0].result, Some(true));
         assert_eq!(obs[1].inputs, inputs(&[("a", false)]));
         assert_eq!(obs[1].result, Some(false));
-        assert!(obs.iter().all(|o| o.counts.is_empty()));
     }
 
     #[test]
@@ -1745,21 +1792,34 @@ fn decide(_1: bool, _2: bool) -> bool {
         // a two-sided, b one-sided T. a = T's walk tests b, so b must
         // count exactly a's true_count (2); it counts 1. Some a = T
         // evaluation is unaccounted for: stay ambiguous.
+        // Neither rule 4 (b's total is not a's true count) nor rule 5
+        // accepts it.
         let short = counts(&[("a", 2, 1), ("b", 1, 0)]);
         let obs = observations_from_counts(None, &and_node(), &short, None);
         assert_eq!(obs.len(), 1);
         assert!(obs[0].ambiguous);
         assert_eq!(obs[0].counts, short);
+        assert!(one_two_sided_rule(&None, &and_node(), &short, 3).is_none());
 
         // b counted on a = F's walk, which short-circuits it.
         let behind = counts(&[("a", 1, 1), ("b", 2, 0)]);
         let obs = observations_from_counts(None, &and_node(), &behind, None);
         assert_eq!(obs.len(), 1);
         assert!(obs[0].ambiguous);
+        assert!(one_two_sided_rule(&None, &and_node(), &behind, 2).is_none());
 
         // a = T's walk needs b, which this test never evaluated.
         let never = counts(&[("a", 1, 1), ("b", 0, 0)]);
         let obs = observations_from_counts(None, &and_node(), &never, None);
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+        assert!(one_two_sided_rule(&None, &and_node(), &never, 2).is_none());
+
+        // The same checks on a decision that is not a tree, where
+        // rule 5 is the only rule that could apply: c counted on
+        // a = T's walk only (it is on both).
+        let raw = counts(&[("a", 2, 1), ("b", 1, 0), ("c", 2, 0)]);
+        let obs = observations_from_counts(None, &or_and_node(), &raw, None);
         assert_eq!(obs.len(), 1);
         assert!(obs[0].ambiguous);
     }
@@ -1773,9 +1833,14 @@ fn decide(_1: bool, _2: bool) -> bool {
         let obs = observations_from_counts(None, &or_and, &raw, None);
         assert_eq!(obs.len(), 1);
         assert!(obs[0].ambiguous);
+        assert!(one_two_sided_rule(&None, &or_and, &raw, 3).is_none());
 
         // Without the stray c: (T) -> T once, (F,F) -> F twice.
         let raw = counts(&[("a", 1, 2), ("b", 0, 2), ("c", 0, 0)]);
+        assert_eq!(
+            one_two_sided_rule(&None, &or_and, &raw, 3).map(|o| o.len()),
+            Some(2)
+        );
         let obs = observations_from_counts(None, &or_and, &raw, None);
         assert_eq!(obs.len(), 2);
         assert_eq!(obs[0].inputs, inputs(&[("a", true)]));
@@ -1924,7 +1989,7 @@ fn decide(_1: bool, _2: bool) -> bool {
         // its own llvm-cov export: 9 evaluations, b == b' ' (60:30)
         // = [1 T, 8 F], b == b'\n' (60:43) = [0 T, 8 F]. Sweep 7
         // recorded it as ambiguous and reported both conditions
-        // unknown.
+        // unknown. `a || b` is a tree: (T,-) once, (F,F) 8 times.
         let raw = counts(&[("b == 32", 1, 8), ("b == 10", 0, 8)]);
         let obs = observations_from_counts(
             Some("test_whitespace".into()),
@@ -1933,7 +1998,9 @@ fn decide(_1: bool, _2: bool) -> bool {
             Some(1),
         );
         assert_eq!(obs.len(), 2, "{obs:?}");
-        assert!(obs.iter().all(|o| !o.ambiguous && o.evaluations == Some(9)));
+        assert!(obs.iter().all(|o| !o.ambiguous));
+        assert_eq!(obs[0].evaluations, Some(1));
+        assert_eq!(obs[1].evaluations, Some(8));
         assert_eq!(obs[0].inputs, inputs(&[("b == 32", true)]));
         assert_eq!(obs[0].result, Some(true));
         assert_eq!(
@@ -2118,7 +2185,7 @@ fn decide(_1: bool, _2: bool) -> bool {
         // Decision evaluated twice in ONE call (loop in the body):
         // function count 1 must not make it look single-evaluation.
         // Rule 1 would read b's two counters as one value; rule 4
-        // derives (T,T) and (T,F), each recorded with N = 2.
+        // derives (T,T) and (T,F), one evaluation each.
         let obs = observations_from_counts(
             None,
             &and_node(),
@@ -2126,8 +2193,8 @@ fn decide(_1: bool, _2: bool) -> bool {
             Some(1),
         );
         assert_eq!(obs.len(), 2);
-        assert!(obs.iter().all(|o| !o.ambiguous && o.evaluations == Some(2)));
-        // Two two-sided conditions in one call: rule 5 resolves the
+        assert!(obs.iter().all(|o| !o.ambiguous && o.evaluations == Some(1)));
+        // Two two-sided conditions in one call: rule 4 resolves the
         // three evaluations into three vectors, one each.
         let obs = observations_from_counts(
             None,
@@ -2182,7 +2249,8 @@ fn decide(_1: bool, _2: bool) -> bool {
         // COVERAGE_JSON is `ff` and `tt` merged into one profile:
         // two evaluations, a = [1, 1], b = [1, 0]. The old collapse
         // reported it as the single vector (T,T); rule 4 recovers
-        // exactly the two evaluations, (T,T) -> T and (F,-) -> F.
+        // exactly the two evaluations, (T,T) -> T and (F,-) -> F,
+        // once each.
         let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
         let cov = profile::parse(COVERAGE_JSON).expect("coverage parses");
         let tree = decision::decompose(&mir);
@@ -2191,12 +2259,14 @@ fn decide(_1: bool, _2: bool) -> bool {
         let obs =
             observations_from_prepared_coverage(Some("merged".into()), &prepared, 0, &index, &tree);
         assert_eq!(obs.len(), 2);
-        assert!(obs.iter().all(|o| !o.ambiguous && o.evaluations == Some(2)));
+        assert!(obs.iter().all(|o| !o.ambiguous
+            && o.evaluations == Some(1)
+            && o.resolved_by == Some(Resolution::TreeCounters)));
         assert_eq!(obs[0].inputs, inputs(&[("a", true), ("b", true)]));
         assert_eq!(obs[1].inputs, inputs(&[("a", false)]));
 
         // A third evaluation (T,F) makes b two-sided too: `a && b`
-        // is a tree, so rule 5 gives the three vectors, once each.
+        // is a tree, so rule 4 gives the three vectors, once each.
         let three = COVERAGE_JSON
             .replace("\"count\": 2", "\"count\": 3")
             .replace("[2, 5, 2, 6, 1, 1, 0, 0, 4]", "[2, 5, 2, 6, 2, 1, 0, 0, 4]")
