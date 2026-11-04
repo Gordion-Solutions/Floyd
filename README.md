@@ -157,16 +157,44 @@ vector from a test only when
   test (every evaluation was then identical), or
 - the decision has a single condition (its true and false counters
   each prove that outcome occurred, however many evaluations there
-  were).
+  were), or
+- exactly one condition was both true and false in that test, every
+  other condition was only ever true or only ever false, and the
+  counters add up exactly. Every other condition then always takes
+  its one value, so each evaluation's path through the decision is
+  fixed by the two-sided condition's value: the test evaluated
+  exactly two condition vectors, one per value of that condition,
+  with outcomes computed from the decision. Floyd checks the counts
+  before it relies on this: the two-sided condition's total must
+  equal the evaluation count, and every condition's counters must
+  equal the number of times those two paths test it (a condition
+  short-circuited on one path counts only the other path's
+  evaluations). Otherwise the test stays ambiguous. For example,
+  `b == b' ' || b == b'\n'` evaluated 9 times with `b == 32 = 1 T /
+  8 F` and `b == 10 = 0 T / 8 F` gives (T,-) -> T once and (F,F) -> F
+  8 times.
 
-Any other test is reported as an **ambiguous observation**:
-`--format=json` marks it `"ambiguous": true` with its `evaluations`
-count and raw per-condition `counts`, the text report lists it as
-`AMBIGUOUS`, and it is excluded from independence-pair finding. A
-condition whose only evidence comes from ambiguous observations is
-reported as `UNKNOWN`, not as unexercised, with the tests that
-evaluated it (the first three by name, then `(+N more)`; JUnit:
-`type="AmbiguousCondition"`).
+Any other test, including every test where two or more conditions
+were both true and false, is reported as an **ambiguous
+observation**: `--format=json` marks it `"ambiguous": true` with its
+`evaluations` count and raw per-condition `counts`, the text report
+lists it as `AMBIGUOUS`, and it is excluded from independence-pair
+finding.
+
+A condition that no pair of condition vectors demonstrates is
+`UNKNOWN` only if ambiguous tests could have completed one of its
+independence pairs: each pair row that no vector covers must be
+*possible* in some ambiguous test, meaning that test's counters took
+every outcome the row's evaluation path needs (each condition the
+row tests has a non-zero counter for the row's value). It is then
+reported with the ambiguous tests that could hold the missing rows
+(the first three by name, then `(+N more)`; JUnit:
+`type="AmbiguousCondition"`). If every pair needs an outcome that no
+test took (a zero counter in every ambiguous test that evaluated the
+decision, and no vector), the condition is provably **UNEXERCISED**,
+and the report says why with the counters, for example
+`test_whitespace (9 evaluations) never took b == 10=T (0T/8F)`
+(text and JUnit; `ruled_out` in the JSON analysis).
 
 Floyd does not state a percentage it cannot stand behind. With no
 unknown conditions the summary line is unchanged
