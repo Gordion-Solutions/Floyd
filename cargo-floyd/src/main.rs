@@ -104,6 +104,12 @@ struct CandidateSummary {
     /// have no span). Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     conditions_without_branch_region: Vec<String>,
+    /// The lift that made the decision a candidate, when one did:
+    /// `call_arms` (both arms end in non-panic calls) or
+    /// `value_arms` (both arms write one non-`bool` value and
+    /// join). Omitted for a decision over Boolean leaves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lift: Option<decision::Lift>,
 }
 
 impl CandidateSummary {
@@ -124,6 +130,7 @@ impl CandidateSummary {
             },
             note: None,
             conditions_without_branch_region: join.conditions_without_branch_region.clone(),
+            lift: prov.lift,
         }
     }
 
@@ -793,8 +800,8 @@ fn run_test_mode_cargo(
             // are "no boolean decision at all", so they do not
             // belong in the OOS report.
             if decision::has_switchint(f) {
-                let node = match decision::try_decompose_candidate(f) {
-                    Ok(node) => node,
+                let (node, lift) = match decision::try_decompose_candidate_lifted(f) {
+                    Ok(decomposed) => decomposed,
                     Err(reason) => {
                         // Has a switchInt (so some kind of decision)
                         // but the decomposer did not match any
@@ -809,7 +816,10 @@ fn run_test_mode_cargo(
                         continue;
                     }
                 };
-                let prov = correlate::provenance_for(f);
+                let prov = floyd::DecisionProvenance {
+                    lift,
+                    ..correlate::provenance_for(f)
+                };
                 // `--only=<pattern>` scopes Floyd to the
                 // functions the user named. On real embedded
                 // crates the whole-crate scan is both slow and
@@ -1276,12 +1286,15 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     let mut artifact_candidates: Vec<(floyd::DecisionTree, floyd::DecisionProvenance, usize)> =
         Vec::new();
     for (fn_idx, f) in mir.functions.iter().enumerate() {
-        if let Ok(node) = decision::try_decompose_candidate(f) {
+        if let Ok((node, lift)) = decision::try_decompose_candidate_lifted(f) {
             artifact_candidates.push((
                 floyd::DecisionTree {
                     decisions: vec![node],
                 },
-                correlate::provenance_for(f),
+                floyd::DecisionProvenance {
+                    lift,
+                    ..correlate::provenance_for(f)
+                },
                 fn_idx,
             ));
         }
@@ -1952,6 +1965,7 @@ mod tests {
                 not_measurable: None,
                 note: Some("may be exercised by `wpt`".to_string()),
                 conditions_without_branch_region: Vec::new(),
+                lift: Some(decision::Lift::ValueArms),
             },
             CandidateSummary {
                 function_name: Some(
@@ -1972,6 +1986,7 @@ mod tests {
                 }),
                 note: None,
                 conditions_without_branch_region: Vec::new(),
+                lift: None,
             },
         ];
         let skipped = vec![SkippedMir {
@@ -2006,6 +2021,8 @@ mod tests {
         assert!(v["candidates"][0].get("not_measurable").is_none());
         assert_eq!(v["candidates"][0]["note"], "may be exercised by `wpt`");
         assert!(v["candidates"][1].get("note").is_none());
+        assert_eq!(v["candidates"][0]["lift"], "value_arms");
+        assert!(v["candidates"][1].get("lift").is_none());
         assert_eq!(v["candidates"][1]["invoked"], false);
         assert_eq!(
             v["candidates"][1]["not_measurable"]["reason"],
@@ -2047,6 +2064,7 @@ mod tests {
             }),
             note: None,
             conditions_without_branch_region: missing.iter().map(|s| s.to_string()).collect(),
+            lift: None,
         }
     }
 

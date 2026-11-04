@@ -79,9 +79,38 @@ the ground-truth analyses Floyd's output is checked against (see
 | Bool `match` | `match b { true => ..., false => ... }` |
 | **Enum `match` without binding** | `match state { State::Idle => ..., State::Running => ... }` — condition names use the rustc discriminant index (e.g. `state == State::variant_0`); use `if let` with a binding to get source variant names instead |
 | Boolean derived from a `let`-bound expression | `let fast = speed > 50; fast && brake` |
+| **Conditions whose arms are not Boolean** | `let off = if upper { 7 } else { 39 };`, `if -86_400 < secs && secs < 86_400 { Some(..) } else { None }` — the decision is the condition expression, its outcome is the arm taken (see [Non-Boolean arms](#non-boolean-arms)) |
 | **Closures capturing outer booleans** | `let f = \|x: bool\| x && b; f(a)` — works for by-value (`move \|\|`) and by-reference captures; FnMut closures with internal mutation are out of MVP scope |
 | JSON output | `cargo floyd test --format=json` — includes a `summary` object (see [JSON summary](#json-summary)) |
 | **JUnit XML output** | `cargo floyd test --format=junit` — one `<testcase>` per condition (pass = exercised, failure = unexercised or unknown); rendered natively by Jenkins, GitLab CI, GitHub Actions, Bazel/Buck2, etc. |
+
+#### Non-Boolean arms
+
+For MC/DC the decision is the Boolean condition; what its arms
+compute does not matter. Floyd lifts a `bool` condition (or a
+`&&` / `||` chain of them) whose arms are not Boolean, taking the
+arm taken as the decision's outcome (`then` = true, `else` = false),
+with the conditions' branch counters as the observations. Two
+shapes are lifted, reported per candidate as `lift` in the JSON:
+
+- `call_arms`: both arms of a single condition end in calls that are
+  not panics (`if c { f(x) } else { g(x) }`).
+- `value_arms`: both arms are straight-line code (no call,
+  `assert`, branch, loop or return) that writes one common
+  non-`bool` value, `_0` or a `let`, before the arms join
+  (`if upper { 7 } else { 39 }`,
+  `if -86_400 < secs && secs < 86_400 { Some(..) } else { None }`).
+  Only the function's entry decision is lifted. Declined (as
+  `unsupported_shape`, or `non_bool_leaf` when an arm copies a named
+  non-`bool` local): an `if` nested in an arm or an `else if`
+  (three arms; the inner `if` is a decision of its own), an arm that
+  loops, calls, panics or returns, arms writing different locals,
+  an `if` without `else`, and a `bool` result (which must decompose
+  as a Boolean expression).
+
+Outcome labels follow the branch edges, so for `if a && !b` the
+source `else` arm is reported as the `true` outcome; MC/DC
+independence pairs do not depend on which outcome is called true.
 
 ### What doesn't (yet)
 
@@ -288,11 +317,15 @@ prints the same note.
 Functions that have a decision the engine declined are listed in
 `out_of_scope`, each with a `reason`: `non_bool_leaf` when an arm's
 value is a named local that is not `bool` (for example a branch that
-returns a struct or an integer, which is not a Boolean condition),
+returns a struct or an integer, which is not a Boolean condition)
+and the arms are not a lifted shape (see
+[Non-Boolean arms](#non-boolean-arms)),
 `no_conditions` when the recovered tree is a bare constant that
 tests no condition, `ctfe_body` for the `// MIR FOR CTFE` rendering
 of a `const fn` (never run at runtime; the function's runtime body
-is considered instead), otherwise `unsupported_shape`.
+is considered instead), otherwise `unsupported_shape`. A candidate
+whose outcome is the arm taken carries `lift` (`call_arms` or
+`value_arms`).
 
 ## Why MC/DC, why this engine
 

@@ -217,6 +217,7 @@ mod tests {
                 source_file: None,
                 line: None,
                 display_name: None,
+                lift: None,
             },
             observations: (0..n_obs)
                 .map(|i| {
@@ -282,6 +283,7 @@ mod tests {
                 source_file: None,
                 line: None,
                 display_name: None,
+                lift: None,
             },
             observations: (0..5)
                 .map(|i| ConditionObservation::vector(Some(format!("t{i}")), BTreeMap::new(), true))
