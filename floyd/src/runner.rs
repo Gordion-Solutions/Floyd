@@ -168,14 +168,26 @@ fn test_binary_command(binary: &Path) -> Command {
 /// Invokes the binary with `--list --format=terse` and parses the
 /// libtest output (one `<name>: test` line per test). Filters out
 /// the summary line and any benchmark entries.
+///
+/// The instrumented binary writes a coverage profile even for
+/// `--list`; it goes to a temporary file that is removed afterwards,
+/// not to `default_*.profraw` in the current directory.
 pub fn list_tests(binary: &Path) -> Result<Vec<String>, RunnerError> {
+    static LISTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let profraw = std::env::temp_dir().join(format!(
+        "floyd-list-{}-{}.profraw",
+        std::process::id(),
+        LISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let out = test_binary_command(binary)
         .args(["--list", "--format=terse"])
-        .output()
-        .map_err(|e| RunnerError {
-            stage: "list_tests",
-            message: format!("could not exec {}: {e}", binary.display()),
-        })?;
+        .env("LLVM_PROFILE_FILE", &profraw)
+        .output();
+    let _ = std::fs::remove_file(&profraw);
+    let out = out.map_err(|e| RunnerError {
+        stage: "list_tests",
+        message: format!("could not exec {}: {e}", binary.display()),
+    })?;
     if !out.status.success() {
         return Err(RunnerError {
             stage: "list_tests",
