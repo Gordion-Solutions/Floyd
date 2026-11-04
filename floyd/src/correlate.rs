@@ -45,7 +45,7 @@
 
 use crate::coverage_index::{CoverageIndex, FunctionId, FunctionMatch, PathNormaliser};
 use crate::decision::{self, DecisionTree, Node};
-use crate::masking::{BranchCounts, ConditionObservation};
+use crate::masking::{BranchCounts, ConditionObservation, Resolution};
 use crate::mir::{Mir, MirFunction, MirStatement, MirTerminator, SourceSpan};
 use crate::profile::CoverageReport;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -192,8 +192,17 @@ fn root_condition(node: &Node) -> Option<&str> {
 ///    and the counters account exactly for one evaluation path per
 ///    value of the two-sided condition. Two vectors, one per value
 ///    (see "Why rule 4 is sound" below for the proof and the exact
-///    consistency check).
-/// 5. Otherwise the test is **ambiguous**: recorded with its
+///    consistency check), each with `evaluations: N` and
+///    `resolved_by: single_two_sided`.
+/// 5. **Tree counters.** `N > 1`, any number of two-sided
+///    conditions, the decision's [`Node`] tree is a tree of
+///    distinct counters (every condition sits at exactly one node,
+///    and no two conditions share a counter), and the counters are
+///    flow-consistent over that tree. One vector per leaf the
+///    evaluations reached, each with `evaluations` equal to the
+///    number of evaluations that reached that leaf and
+///    `resolved_by: tree_counters` (see "Why rule 5 is sound").
+/// 6. Otherwise the test is **ambiguous**: recorded with its
 ///    evaluation count and raw counters, no vector, no result.
 ///
 /// # Why rule 4 is sound
@@ -229,21 +238,105 @@ fn root_condition(node: &Node) -> Option<&str> {
 /// vectors are sound and complete. The outcome of each comes from
 /// the tree. Short-circuited conditions are simply off a walk: a
 /// condition only on `P_T` has a counter total of `k_T`, below `N`.
-/// When any check fails the test stays ambiguous (rule 5). With two
-/// or more two-sided conditions the walks are no longer a function
-/// of one value and the counters need not say which values occurred
-/// together (for `(a && b) || c`, (T,F,T) + (F,-,F) and
-/// (T,F,F) + (F,-,T) leave the same counters), so this rule does not
-/// apply and such tests stay ambiguous.
+/// When any check fails, rule 5 is tried. With two or more
+/// two-sided conditions the walks are no longer a function of one
+/// value, so rule 4 does not apply; rule 5 resolves such a test
+/// when the decision is a tree.
+///
+/// # Why rule 5 is sound
+///
+/// Read the decision's [`Node`] tree as a flow graph: each
+/// [`Node::Ite`] and each [`Node::Condition`] leaf is a node with a
+/// true edge and a false edge (an `Ite`'s edges lead to its
+/// `then_branch` / `else_branch`; a `Condition` leaf's edges lead to
+/// the outcomes `true` / `false`), and each [`Node::Const`] is an
+/// outcome leaf. Rule 5 first checks that this graph is a **tree of
+/// distinct counters**:
+///
+/// - every condition name occurs at exactly one node. The
+///   decomposer gives a MIR block reached from two predecessors (a
+///   condition the source can reach along two different walks, like
+///   `c` in `(a || b) && c`) one subtree per predecessor, with the
+///   same name; and counters are joined per name, through the
+///   name's span. A repeated name is therefore one counter shared by
+///   two nodes, and the check rejects it;
+/// - no two condition names were joined to the same span (the
+///   caller says so: [`join_test`] compares the decision's spans;
+///   hand-built counters are distinct by construction).
+///
+/// So each node `v` has its own counter `(t_v, f_v)`, and since the
+/// nodes form a tree, each node other than the root has exactly one
+/// incoming edge (from its parent `u`, the edge `u`'s value `x`
+/// selects). Every evaluation walks from the root to one leaf,
+/// testing each condition on its walk once (a condition occurs at
+/// one node only). Let `in(v)` be the number of the test's
+/// evaluations that reach `v`. Then:
+///
+/// - `in(root) = N`, by definition of `N`;
+/// - an evaluation reaching `v` tests `v`'s condition once and
+///   leaves along exactly one edge, and `v`'s counter counts exactly
+///   the evaluations that tested `v` (no other node shares it), so
+///   `t_v` evaluations take `v`'s true edge, `f_v` its false edge,
+///   and `t_v + f_v = in(v)`;
+/// - an evaluation reaches a non-root `v` only along `v`'s one
+///   incoming edge, so `in(v)` is `t_u` or `f_u` of its parent;
+/// - an evaluation reaches leaf `l` only along `l`'s one incoming
+///   edge, so the number of evaluations that end at `l` is that
+///   edge's flow.
+///
+/// Each leaf `l` is reached by one root-to-leaf walk, which fixes
+/// the value of every condition on it and leaves every other
+/// condition short-circuited: one vector, with `l`'s outcome. The
+/// vectors of distinct leaves differ (they part at some node). So
+/// the counters determine the full multiset of vectors: leaf `l`'s
+/// vector occurred exactly `flow(l)` times, and no other vector
+/// occurred. The rule emits every leaf with a non-zero flow,
+/// computing each flow top-down from the root's `N` with the edge
+/// counters of the tree (never by matching names to positions).
+///
+/// The rule fires only when the counters fit this model: for every
+/// node, `t_v + f_v` equals the flow of the edge into it (`N` at the
+/// root), a node whose inflow is non-zero has a counter (a node
+/// with no counter and no inflow is unreached), and the leaf flows
+/// sum to `N` (implied by the node checks; checked anyway). A
+/// violation means the counters were not produced by this tree
+/// (a missing or merged region, a decomposition that differs from
+/// the compiled code) and the test falls through to rule 6.
+///
+/// On a graph that is not a tree the counters need not determine
+/// the vectors: in `(a || b) && c`, `c` is reached from `a = T` and
+/// from `a = F, b = T`, and (T,-,T) + (F,T,F) leaves the same
+/// counters (a = [1 T, 1 F], b = [1 T, 0 F], c = [1 T, 1 F]) as
+/// (T,-,F) + (F,T,T), though the two pairs of vectors have their
+/// `true` outcome on different walks. Such tests stay ambiguous.
+/// So do tests of `(a && b) || c`, where (T,F,T) + (F,-,F) and
+/// (T,F,F) + (F,-,T) leave the same counters.
 ///
 /// `N == 0` (the test never evaluated the decision) or a root with
 /// no counters yields no observation at all. Condition names in
 /// `counts` that the decision does not reference are ignored.
+///
+/// Each name in `counts` is taken to be its own counter; [`join_test`]
+/// additionally withholds rule 5 when two of the decision's
+/// conditions were joined to one span.
 pub fn observations_from_counts(
     test_name: Option<String>,
     decision: &Node,
     counts: &BTreeMap<String, BranchCounts>,
     function_count: Option<u64>,
+) -> Vec<ConditionObservation> {
+    reduce_counts(test_name, decision, counts, function_count, true)
+}
+
+/// [`observations_from_counts`], with `distinct_counters` false when
+/// two of the decision's conditions share one counter (rule 5 then
+/// does not apply).
+fn reduce_counts(
+    test_name: Option<String>,
+    decision: &Node,
+    counts: &BTreeMap<String, BranchCounts>,
+    function_count: Option<u64>,
+    distinct_counters: bool,
 ) -> Vec<ConditionObservation> {
     let Some(root) = root_condition(decision) else {
         return Vec::new();
@@ -298,6 +391,13 @@ pub fn observations_from_counts(
     }
 
     // Rule 5.
+    if distinct_counters {
+        if let Some(obs) = tree_counters_rule(&test_name, decision, &decision_counts, evaluations) {
+            return obs;
+        }
+    }
+
+    // Rule 6.
     vec![ConditionObservation::ambiguous(
         test_name,
         evaluations,
@@ -335,7 +435,7 @@ fn single_condition_rule(
 /// two-sided, so the counters determine every evaluation. See "Why
 /// rule 4 is sound" on [`observations_from_counts`]; this function
 /// performs every check listed there and returns `None` (the test
-/// stays ambiguous) when one fails.
+/// falls through to rule 5) when one fails.
 fn one_two_sided_rule(
     test_name: &Option<String>,
     decision: &Node,
@@ -389,6 +489,7 @@ fn one_two_sided_rule(
         }
         let mut obs = ConditionObservation::vector(test_name.clone(), inputs, result);
         obs.evaluations = Some(evaluations);
+        obs.resolved_by = Some(Resolution::SingleTwoSided);
         out.push(obs);
     }
     let exact = counts.iter().all(|(name, c)| {
@@ -397,6 +498,124 @@ fn one_two_sided_rule(
             .map_or(c.total() == 0, |e| e == c)
     });
     exact.then_some(out)
+}
+
+/// Rule 5 of [`observations_from_counts`]: the decision is a tree
+/// of distinct counters, so the counters are the flows on its edges
+/// and every leaf's inflow is the number of evaluations that took
+/// its vector. See "Why rule 5 is sound" on
+/// [`observations_from_counts`]; this function checks the tree shape
+/// and every flow condition listed there, and returns `None` (the
+/// test stays ambiguous) when one fails. The caller has checked that
+/// no two condition names share a counter.
+fn tree_counters_rule(
+    test_name: &Option<String>,
+    decision: &Node,
+    counts: &BTreeMap<String, BranchCounts>,
+    evaluations: u64,
+) -> Option<Vec<ConditionObservation>> {
+    if !is_tree(decision) {
+        return None;
+    }
+    let mut leaves = Vec::new();
+    tree_flows(decision, evaluations, counts, &mut Vec::new(), &mut leaves)?;
+    if leaves.iter().map(|(_, _, k)| k).sum::<u64>() != evaluations {
+        return None;
+    }
+    Some(
+        leaves
+            .into_iter()
+            .map(|(path, result, k)| {
+                let mut obs = ConditionObservation::vector(
+                    test_name.clone(),
+                    path.into_iter().collect(),
+                    result,
+                );
+                obs.evaluations = Some(k);
+                obs.resolved_by = Some(Resolution::TreeCounters);
+                obs
+            })
+            .collect(),
+    )
+}
+
+/// True iff every condition of `decision` occurs at exactly one
+/// node: its [`Node`] tree is then a tree of conditions, each with
+/// one incoming edge, rather than a DAG unfolded into one subtree
+/// per predecessor (which repeats the shared condition's name).
+fn is_tree(decision: &Node) -> bool {
+    fn walk<'n>(node: &'n Node, seen: &mut BTreeSet<&'n str>) -> bool {
+        match node {
+            Node::Const { .. } => true,
+            Node::Condition { name } => seen.insert(name),
+            Node::Ite {
+                cond,
+                then_branch,
+                else_branch,
+            } => seen.insert(cond) && walk(then_branch, seen) && walk(else_branch, seen),
+        }
+    }
+    walk(decision, &mut BTreeSet::new())
+}
+
+/// A leaf of a decision tree some evaluations reached: the walk from
+/// the root (each condition tested, with its value), the outcome, and
+/// the number of evaluations that took it.
+type Leaf = (Vec<(String, bool)>, bool, u64);
+
+/// Push every leaf below `node` that `inflow > 0` evaluations reach,
+/// as (walk from the root, outcome, flow), depth first, true edge
+/// first. `path` is the walk from the root to `node`. `None` if a
+/// node's counter does not total its inflow, or a node with inflow
+/// has no counter.
+fn tree_flows(
+    node: &Node,
+    inflow: u64,
+    counts: &BTreeMap<String, BranchCounts>,
+    path: &mut Vec<(String, bool)>,
+    leaves: &mut Vec<Leaf>,
+) -> Option<()> {
+    let counter = |name: &str| -> Option<BranchCounts> {
+        match counts.get(name) {
+            Some(c) if c.total() == inflow => Some(*c),
+            None if inflow == 0 => Some(BranchCounts::default()),
+            _ => None,
+        }
+    };
+    match node {
+        Node::Const { value } => {
+            if inflow > 0 {
+                leaves.push((path.clone(), *value, inflow));
+            }
+        }
+        Node::Condition { name } => {
+            let c = counter(name)?;
+            for (value, flow) in [(true, c.true_count), (false, c.false_count)] {
+                if flow > 0 {
+                    let mut walk = path.clone();
+                    walk.push((name.clone(), value));
+                    leaves.push((walk, value, flow));
+                }
+            }
+        }
+        Node::Ite {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            let c = counter(cond)?;
+            for (value, branch, flow) in [
+                (true, then_branch, c.true_count),
+                (false, else_branch, c.false_count),
+            ] {
+                path.push((cond.clone(), value));
+                let ok = tree_flows(branch, flow, counts, path, leaves);
+                path.pop();
+                ok?;
+            }
+        }
+    }
+    Some(())
 }
 
 /// A condition-vector observation whose result is evaluated from
@@ -551,14 +770,26 @@ pub fn join_test<'i>(
         .filter_map(|(name, span)| Some((name.clone(), cov_fn.branch_counts(span)?)))
         .collect();
     TestJoin {
-        observations: observations_from_counts(
+        observations: reduce_counts(
             test_name,
             decision_node,
             &counts,
             Some(cov_fn.count),
+            distinct_spans(decision_node, spans),
         ),
         matched,
     }
+}
+
+/// True iff no two conditions of `decision` were joined to the same
+/// span, so each has its own counter (rule 5 of
+/// [`observations_from_counts`] needs that).
+fn distinct_spans(decision: &Node, spans: &BTreeMap<String, SourceSpan>) -> bool {
+    let mut seen = BTreeSet::new();
+    crate::masking::collect_conditions(decision)
+        .iter()
+        .filter_map(|c| spans.get(c))
+        .all(|span| seen.insert(span))
 }
 
 /// The observations of [`join_test`] alone.
@@ -1253,24 +1484,222 @@ fn decide(_1: bool, _2: bool) -> bool {
         assert_eq!(obs[0].result, Some(false));
     }
 
+    /// `(a || b) && c`: `c` is reached from `a = T` and from
+    /// `a = F, b = T`, so the decomposer unfolds it into two nodes.
+    fn or_and_node() -> Node {
+        let c = || ite("c", konst(true), konst(false));
+        ite("a", c(), ite("b", c(), konst(false)))
+    }
+
+    /// The observations' (inputs, result, evaluations, resolved_by).
+    type Resolved = (
+        BTreeMap<String, bool>,
+        Option<bool>,
+        Option<u64>,
+        Option<Resolution>,
+    );
+
+    fn resolved(obs: &[ConditionObservation]) -> Vec<Resolved> {
+        obs.iter()
+            .map(|o| {
+                assert!(!o.ambiguous, "{o:?}");
+                assert!(o.counts.is_empty(), "{o:?}");
+                (o.inputs.clone(), o.result, o.evaluations, o.resolved_by)
+            })
+            .collect()
+    }
+
+    fn tree_vector(entries: &[(&str, bool)], result: bool, k: u64) -> Resolved {
+        (
+            inputs(entries),
+            Some(result),
+            Some(k),
+            Some(Resolution::TreeCounters),
+        )
+    }
+
     #[test]
-    fn multi_evaluation_multi_condition_is_ambiguous() {
-        // (T,T), (T,F), (F,-): a and b both two-sided, so the
-        // counters do not say which values occurred together (rule 4
-        // needs exactly one two-sided condition).
+    fn and_with_both_conditions_two_sided_resolves_by_tree_counters() {
+        // (T,T), (T,F), (F,-): a and b both two-sided, so rule 4 does
+        // not apply; `a && b` is a tree, a's true count (2) is b's
+        // inflow, and the three leaves carry 1 each.
         let obs = observations_from_counts(
             Some("loop_three".into()),
             &and_node(),
             &counts(&[("a", 2, 1), ("b", 1, 1)]),
             Some(1),
         );
+        assert_eq!(
+            resolved(&obs),
+            [
+                tree_vector(&[("a", true), ("b", true)], true, 1),
+                tree_vector(&[("a", true), ("b", false)], false, 1),
+                tree_vector(&[("a", false)], false, 1),
+            ]
+        );
+        // Leaf flows are evaluation counts, not 1 each.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 7, 4), ("b", 5, 2)]),
+            None,
+        );
+        assert_eq!(
+            resolved(&obs),
+            [
+                tree_vector(&[("a", true), ("b", true)], true, 5),
+                tree_vector(&[("a", true), ("b", false)], false, 2),
+                tree_vector(&[("a", false)], false, 4),
+            ]
+        );
+        assert_eq!(
+            obs.iter().map(|o| o.test_name.clone()).collect::<Vec<_>>(),
+            [None, None, None]
+        );
+    }
+
+    #[test]
+    fn and_or_tree_resolves_every_leaf() {
+        // a && (b || c): a tree (each condition at one node).
+        // (T,T,-) x3, (T,F,T) x1, (T,F,F) x2, (F,-,-) x4.
+        let and_or = ite("a", ite("b", konst(true), cond("c")), konst(false));
+        let raw = counts(&[("a", 6, 4), ("b", 3, 3), ("c", 1, 2)]);
+        let obs = observations_from_counts(Some("t".into()), &and_or, &raw, Some(10));
+        assert_eq!(
+            resolved(&obs),
+            [
+                tree_vector(&[("a", true), ("b", true)], true, 3),
+                tree_vector(&[("a", true), ("b", false), ("c", true)], true, 1),
+                tree_vector(&[("a", true), ("b", false), ("c", false)], false, 2),
+                tree_vector(&[("a", false)], false, 4),
+            ]
+        );
+        assert!(obs.iter().all(|o| o.test_name.as_deref() == Some("t")));
+
+        // A leaf no evaluation reached is not emitted: c never true.
+        let raw = counts(&[("a", 2, 1), ("b", 1, 1), ("c", 0, 1)]);
+        let obs = observations_from_counts(None, &and_or, &raw, None);
+        assert_eq!(
+            resolved(&obs),
+            [
+                tree_vector(&[("a", true), ("b", true)], true, 1),
+                tree_vector(&[("a", true), ("b", false), ("c", false)], false, 1),
+                tree_vector(&[("a", false)], false, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn dag_or_and_stays_ambiguous() {
+        // (a || b) && c: (T,-,T) + (F,T,F) and (T,-,F) + (F,T,T) both
+        // leave a = [1, 1], b = [1, 0], c = [1, 1]. c sits at two
+        // nodes, so the graph is not a tree and the counters cannot
+        // split c's counts between them.
+        assert!(!is_tree(&or_and_node()));
+        let raw = counts(&[("a", 1, 1), ("b", 1, 0), ("c", 1, 1)]);
+        let obs = observations_from_counts(Some("dag".into()), &or_and_node(), &raw, Some(2));
         assert_eq!(obs.len(), 1);
-        let o = &obs[0];
-        assert!(o.ambiguous);
-        assert!(o.inputs.is_empty(), "no vector may be invented");
-        assert_eq!(o.result, None);
-        assert_eq!(o.evaluations, Some(3));
-        assert_eq!(o.counts, counts(&[("a", 2, 1), ("b", 1, 1)]));
+        assert!(obs[0].ambiguous);
+        assert!(obs[0].inputs.is_empty());
+        assert_eq!(obs[0].resolved_by, None);
+        assert_eq!(obs[0].counts, raw);
+
+        // Even when the counters happen to be flow-consistent on one
+        // of c's nodes (b never reached c): no partial resolution.
+        let raw = counts(&[("a", 2, 1), ("b", 0, 1), ("c", 1, 1)]);
+        let obs = observations_from_counts(None, &or_and_node(), &raw, None);
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+    }
+
+    #[test]
+    fn inconsistent_tree_counters_stay_ambiguous() {
+        let and_or = ite("a", ite("b", konst(true), cond("c")), konst(false));
+        for raw in [
+            // b's total (5) is not a's true count (6).
+            counts(&[("a", 6, 4), ("b", 2, 3), ("c", 1, 2)]),
+            // c's total (2) is not b's false count (3).
+            counts(&[("a", 6, 4), ("b", 3, 3), ("c", 1, 1)]),
+            // c counted, but b never false: c is unreachable.
+            counts(&[("a", 2, 1), ("b", 2, 0), ("c", 1, 1)]),
+            // b has inflow (a true twice) but no counter.
+            counts(&[("a", 2, 1), ("c", 1, 1)]),
+        ] {
+            let obs = observations_from_counts(None, &and_or, &raw, None);
+            assert_eq!(obs.len(), 1, "{raw:?}: {obs:?}");
+            assert!(obs[0].ambiguous, "{raw:?}");
+            assert_eq!(obs[0].resolved_by, None);
+        }
+    }
+
+    #[test]
+    fn shared_counter_withholds_the_tree_rule() {
+        // a ? b : c with b and c joined to one span: the counter
+        // fits both nodes' inflow (2 each) but cannot be split.
+        let select = ite("a", cond("b"), cond("c"));
+        let raw = counts(&[("a", 2, 2), ("b", 1, 1), ("c", 1, 1)]);
+        let distinct = reduce_counts(None, &select, &raw, None, true);
+        assert_eq!(distinct.len(), 4);
+        assert!(distinct.iter().all(|o| !o.ambiguous));
+        let shared = reduce_counts(None, &select, &raw, None, false);
+        assert_eq!(shared.len(), 1);
+        assert!(shared[0].ambiguous);
+
+        // join_test's check: two names at one span.
+        let span = |line| SourceSpan {
+            file: "src/lib.rs".into(),
+            start_line: line,
+            start_col: 1,
+            end_line: line,
+            end_col: 2,
+        };
+        let spans = |c| {
+            BTreeMap::from([
+                ("a".to_string(), span(1)),
+                ("b".to_string(), span(2)),
+                ("c".to_string(), span(c)),
+            ])
+        };
+        assert!(distinct_spans(&select, &spans(3)));
+        assert!(!distinct_spans(&select, &spans(2)));
+    }
+
+    #[test]
+    fn single_two_sided_rule_records_its_name() {
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 1, 1), ("b", 1, 0)]),
+            None,
+        );
+        assert_eq!(obs.len(), 2);
+        assert!(obs
+            .iter()
+            .all(|o| o.resolved_by == Some(Resolution::SingleTwoSided)));
+        let json = serde_json::to_value(&obs[0]).unwrap();
+        assert_eq!(json["resolved_by"], "single_two_sided");
+
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 2, 1), ("b", 1, 1)]),
+            None,
+        );
+        assert_eq!(
+            serde_json::to_value(&obs[0]).unwrap()["resolved_by"],
+            "tree_counters"
+        );
+        // Single-evaluation vectors carry no `resolved_by`.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 1, 0), ("b", 1, 0)]),
+            None,
+        );
+        assert!(serde_json::to_value(&obs[0])
+            .unwrap()
+            .get("resolved_by")
+            .is_none());
     }
 
     #[test]
@@ -1355,26 +1784,132 @@ fn decide(_1: bool, _2: bool) -> bool {
         assert_eq!(obs[1].result, Some(false));
     }
 
+    /// rust-base64 `alphabet::is_valid_b64_symbol`
+    /// (`byte >= 32 && byte <= 126`, src/alphabet.rs:210) as Floyd
+    /// decomposes it.
+    fn base64_symbol() -> Node {
+        ite("byte >= 32", cond("byte <= 126"), konst(false))
+    }
+
+    /// Every test that reached `is_valid_b64_symbol` in sweep
+    /// `ambig` (rust-base64 5b98ee1), with its counters cut from its
+    /// own `llvm-cov export` at the two condition spans (210:5-18
+    /// and 210:22-36): (name, byte >= 32 (T, F), byte <= 126 (T, F)).
+    /// The randomised tests' counters vary from run to run.
+    /// (true, false) counters of one condition.
+    type Tf = (u64, u64);
+
+    const BASE64_TESTS: &[(&str, Tf, Tf)] = &[
+        ("alphabet::tests::detects_duplicate_end", (63, 0), (63, 0)),
+        ("alphabet::tests::detects_duplicate_middle", (26, 0), (26, 0)),
+        ("alphabet::tests::detects_duplicate_start", (1, 0), (1, 0)),
+        ("alphabet::tests::detects_padding", (64, 0), (64, 0)),
+        ("alphabet::tests::detects_unprintable", (0, 1), (0, 0)),
+        ("alphabet::tests::same_as_unchecked", (64, 0), (64, 0)),
+        ("alphabet::tests::str_same_as_input", (64, 0), (64, 0)),
+        ("alphabet::tests::symbol_matches_char_for_all_valid_symbols", (224, 32), (95, 129)),
+        ("chunked_encoder::tests::chunked_encode_matches_normal_encode_random_string_sink", (6412640, 729404), (3468117, 2944523)),
+        ("decode::tests::decode_into_nonempty_vec_doesnt_clobber_existing_prefix", (3211594, 366571), (1736141, 1475453)),
+        ("decode::tests::decode_slice_doesnt_clobber_existing_prefix_or_suffix", (3208291, 365184), (1735965, 1472326)),
+        ("decode::tests::decode_slice_unchecked_doesnt_clobber_existing_prefix_or_suffix", (3208480, 366466), (1735153, 1473327)),
+        ("display::tests::display_encode_matches_normal_encode", (6417341, 731743), (3469745, 2947596)),
+        ("encode::tests::encode_engine_slice_into_nonempty_buffer_doesnt_clobber_suffix", (3203310, 365183), (1734114, 1469196)),
+        ("encode::tests::encode_engine_string_into_nonempty_buffer_doesnt_clobber_prefix", (3207252, 366223), (1734188, 1473064)),
+        ("encode::tests::encode_to_slice_random_valid_utf8", (3205328, 365914), (1733940, 1471388)),
+        ("encode::tests::encode_with_padding_random_valid_utf8", (3206515, 364542), (1734157, 1472358)),
+        ("engine::tests::decode_doesnt_write_extra_bytes::case_1_general_purpose", (3208587, 366013), (1734550, 1474037)),
+        ("engine::tests::decode_doesnt_write_extra_bytes::case_2_naive", (3205972, 365936), (1734049, 1471923)),
+        ("engine::tests::decode_doesnt_write_extra_bytes::case_3_decoder_reader", (3203796, 364843), (1734636, 1469160)),
+        ("engine::tests::decode_into_slice_fits_in_precisely_sized_slice::case_1_general_purpose", (3201209, 364589), (1733378, 1467831)),
+        ("engine::tests::decode_into_slice_fits_in_precisely_sized_slice::case_2_naive", (3208900, 365566), (1734964, 1473936)),
+        ("engine::tests::decode_into_slice_fits_in_precisely_sized_slice::case_3_decoder_reader", (3200273, 364573), (1732411, 1467862)),
+        ("engine::tests::decode_invalid_byte_error::case_1_general_purpose", (32063031, 3652813), (17343424, 14719607)),
+        ("engine::tests::decode_invalid_byte_error::case_2_naive", (32072554, 3654150), (17344420, 14728134)),
+        ("engine::tests::decode_invalid_byte_error::case_3_decoder_reader", (32059533, 3652309), (17338996, 14720537)),
+        ("engine::tests::encode_doesnt_write_extra_bytes::case_1_general_purpose", (3203481, 365046), (1733491, 1469990)),
+        ("engine::tests::encode_doesnt_write_extra_bytes::case_2_naive", (3207082, 365326), (1734133, 1472949)),
+        ("engine::tests::encode_doesnt_write_extra_bytes::case_3_decoder_reader", (3206877, 364792), (1733031, 1473846)),
+        ("engine::tests::encode_engine_slice_fits_into_precisely_sized_slice::case_1_general_purpose", (3206982, 365402), (1733696, 1473286)),
+        ("engine::tests::encode_engine_slice_fits_into_precisely_sized_slice::case_2_naive", (3212527, 365943), (1736081, 1476446)),
+        ("engine::tests::encode_engine_slice_fits_into_precisely_sized_slice::case_3_decoder_reader", (3209270, 365210), (1735468, 1473802)),
+        ("engine::tests::encode_matches_naive::case_1_general_purpose", (3202927, 365119), (1732642, 1470285)),
+        ("engine::tests::encode_matches_naive::case_2_naive", (3206402, 364883), (1734476, 1471926)),
+        ("engine::tests::encode_matches_naive::case_3_decoder_reader", (3206128, 364541), (1734511, 1471617)),
+        ("engine::tests::roundtrip_random_alphabet::case_1_general_purpose", (3210343, 364530), (1735305, 1475038)),
+        ("engine::tests::roundtrip_random_alphabet::case_2_naive", (3208731, 365341), (1735428, 1473303)),
+        ("engine::tests::roundtrip_random_alphabet::case_3_decoder_reader", (3208081, 365385), (1734339, 1473742)),
+        ("engine::tests::roundtrip_weird_alphabet::case_1_general_purpose", (65, 0), (65, 0)),
+        ("engine::tests::roundtrip_weird_alphabet::case_2_naive", (65, 0), (65, 0)),
+        ("engine::tests::roundtrip_weird_alphabet::case_3_decoder_reader", (65, 0), (65, 0)),
+        ("read::decoder_tests::handles_short_read_from_delegate", (3209464, 365445), (1735881, 1473583)),
+        ("read::decoder_tests::read_in_short_increments", (3207859, 366269), (1735707, 1472152)),
+        ("read::decoder_tests::read_in_short_increments_with_short_delegate_reads", (3204957, 365402), (1734390, 1470567)),
+        ("read::decoder_tests::reports_invalid_last_symbol_correctly", (321512, 36510), (173793, 147719)),
+        ("tests::roundtrip_random_config_long", (3209439, 365716), (1734814, 1474625)),
+        ("tests::roundtrip_random_config_short", (3206882, 363720), (1733894, 1472988)),
+        ("write::encoder_string_writer::tests::every_possible_split_of_input", (1603006, 183039), (867076, 735930)),
+        ("write::encoder_string_writer::tests::incremental_writes", (1602506, 182731), (867204, 735302)),
+        ("write::encoder_tests::encode_random_config_matches_normal_encode_reasonable_input_len", (320798, 36467), (173217, 147581)),
+        ("write::encoder_tests::encode_random_config_matches_normal_encode_tiny_input_len", (321050, 36741), (173311, 147739)),
+        ("write::encoder_tests::every_possible_split_of_input", (1602506, 182423), (867208, 735298)),
+        ("write::encoder_tests::retrying_writes_that_error_with_interrupted_works", (320473, 36480), (173576, 146897)),
+        ("write::encoder_tests::writes_that_only_write_part_of_input_and_sometimes_interrupt_produce_correct_encoded_data", (320840, 36753), (173976, 146864)),
+    ];
+
     #[test]
-    fn base64_is_valid_b64_symbol_counts_are_ambiguous() {
-        // rust-base64 `byte >= 32 && byte <= 126`, test
+    fn base64_is_valid_b64_symbol_counts_resolve_by_tree_counters() {
         // symbol_matches_char_for_all_valid_symbols (256 calls):
         // byte >= 32 = [224 T, 32 F], byte <= 126 = [95 T, 129 F].
-        let decision = ite("byte >= 32", cond("byte <= 126"), konst(false));
+        // Both two-sided; byte <= 126's total (224) is byte >= 32's
+        // true count, so the leaves carry 95, 129 and 32.
         let raw = counts(&[("byte >= 32", 224, 32), ("byte <= 126", 95, 129)]);
         let obs = observations_from_counts(
             Some("symbol_matches_char_for_all_valid_symbols".into()),
-            &decision,
+            &base64_symbol(),
             &raw,
             Some(256),
         );
-        assert_eq!(obs.len(), 1);
-        let o = &obs[0];
-        assert!(o.ambiguous);
-        assert!(o.inputs.is_empty());
-        assert_eq!(o.result, None);
-        assert_eq!(o.evaluations, Some(256));
-        assert_eq!(o.counts, raw);
+        assert_eq!(
+            resolved(&obs),
+            [
+                tree_vector(&[("byte >= 32", true), ("byte <= 126", true)], true, 95),
+                tree_vector(&[("byte >= 32", true), ("byte <= 126", false)], false, 129),
+                tree_vector(&[("byte >= 32", false)], false, 32),
+            ]
+        );
+    }
+
+    #[test]
+    fn base64_every_test_resolves_and_both_conditions_are_exercised() {
+        let decision = base64_symbol();
+        let mut all = Vec::new();
+        for (name, a, b) in BASE64_TESTS {
+            let raw = counts(&[("byte >= 32", a.0, a.1), ("byte <= 126", b.0, b.1)]);
+            let obs = observations_from_counts(Some(name.to_string()), &decision, &raw, None);
+            assert!(!obs.is_empty(), "{name}");
+            assert!(obs.iter().all(|o| !o.ambiguous), "{name}: {obs:?}");
+            assert_eq!(
+                obs.iter().map(|o| o.evaluations.unwrap()).sum::<u64>(),
+                a.0 + a.1,
+                "{name}"
+            );
+            all.extend(obs);
+        }
+        let tree = DecisionTree {
+            decisions: vec![decision],
+        };
+        let r = crate::masking::analyze_with_runtime(&tree, &all, crate::masking::Variant::Masking);
+        assert_eq!(r.ambiguous_observations, 0);
+        for c in ["byte >= 32", "byte <= 126"] {
+            assert!(
+                matches!(
+                    r.condition_status[c],
+                    crate::masking::ConditionStatus::Exercised(_)
+                ),
+                "{c}: {:?}",
+                r.condition_status[c]
+            );
+        }
     }
 
     /// anyhow `src/ensure.rs:60`, `|b| b == b' ' || b == b'\n'`, as
@@ -1592,16 +2127,16 @@ fn decide(_1: bool, _2: bool) -> bool {
         );
         assert_eq!(obs.len(), 2);
         assert!(obs.iter().all(|o| !o.ambiguous && o.evaluations == Some(2)));
-        // Two two-sided conditions in one call: ambiguous, N = 3.
+        // Two two-sided conditions in one call: rule 5 resolves the
+        // three evaluations into three vectors, one each.
         let obs = observations_from_counts(
             None,
             &and_node(),
             &counts(&[("a", 2, 1), ("b", 1, 1)]),
             Some(1),
         );
-        assert_eq!(obs.len(), 1);
-        assert!(obs[0].ambiguous);
-        assert_eq!(obs[0].evaluations, Some(3));
+        assert_eq!(obs.len(), 3);
+        assert!(obs.iter().all(|o| !o.ambiguous && o.evaluations == Some(1)));
     }
 
     #[test]
@@ -1660,7 +2195,8 @@ fn decide(_1: bool, _2: bool) -> bool {
         assert_eq!(obs[0].inputs, inputs(&[("a", true), ("b", true)]));
         assert_eq!(obs[1].inputs, inputs(&[("a", false)]));
 
-        // A third evaluation (T,F) makes b two-sided too: ambiguous.
+        // A third evaluation (T,F) makes b two-sided too: `a && b`
+        // is a tree, so rule 5 gives the three vectors, once each.
         let three = COVERAGE_JSON
             .replace("\"count\": 2", "\"count\": 3")
             .replace("[2, 5, 2, 6, 1, 1, 0, 0, 4]", "[2, 5, 2, 6, 2, 1, 0, 0, 4]")
@@ -1672,9 +2208,13 @@ fn decide(_1: bool, _2: bool) -> bool {
         let index = CoverageIndex::build(&cov, &scout_paths());
         let obs =
             observations_from_prepared_coverage(Some("merged".into()), &prepared, 0, &index, &tree);
-        assert_eq!(obs.len(), 1);
-        assert!(obs[0].ambiguous);
-        assert_eq!(obs[0].evaluations, Some(3));
+        assert_eq!(obs.len(), 3, "{obs:?}");
+        assert!(obs.iter().all(|o| !o.ambiguous
+            && o.evaluations == Some(1)
+            && o.resolved_by == Some(Resolution::TreeCounters)));
+        assert_eq!(obs[0].inputs, inputs(&[("a", true), ("b", true)]));
+        assert_eq!(obs[1].inputs, inputs(&[("a", true), ("b", false)]));
+        assert_eq!(obs[2].inputs, inputs(&[("a", false)]));
     }
 
     #[test]
@@ -2529,15 +3069,30 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -
             c.display_name.as_deref(),
             Some("<chrono::offset::fixed::FixedOffset>::east_opt")
         );
-        // The suite's totals mix 2339 evaluations of two conditions:
-        // ambiguous. Each single-call test yields its vector, and
-        // the arm taken is the outcome.
-        assert_eq!(c.observations.len(), 4);
-        assert!(c.observations[0].ambiguous);
-        let results: Vec<Option<bool>> = c.observations[1..].iter().map(|o| o.result).collect();
+        // The suite's totals mix 2339 evaluations of two conditions,
+        // both two-sided; the chain is a tree, so its edge flows give
+        // (T,T) x2337, (T,F) x1 and (F,-) x1. Each single-call test
+        // yields its vector, and the arm taken is the outcome.
+        assert_eq!(c.observations.len(), 6);
+        let suite: Vec<(Option<bool>, Option<u64>)> = c.observations[..3]
+            .iter()
+            .map(|o| {
+                assert_eq!(o.resolved_by, Some(Resolution::TreeCounters));
+                (o.result, o.evaluations)
+            })
+            .collect();
+        assert_eq!(
+            suite,
+            [
+                (Some(true), Some(2337)),
+                (Some(false), Some(1)),
+                (Some(false), Some(1))
+            ]
+        );
+        let results: Vec<Option<bool>> = c.observations[3..].iter().map(|o| o.result).collect();
         assert_eq!(results, [Some(true), Some(false), Some(false)]);
         assert_eq!(
-            c.observations[3].inputs,
+            c.observations[5].inputs,
             BTreeMap::from([
                 ("-86400 < secs".to_string(), true),
                 ("secs < 86400".to_string(), false)

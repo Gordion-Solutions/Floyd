@@ -125,6 +125,31 @@ pub struct ConditionObservation {
     /// by condition name. Empty for a condition vector.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub counts: BTreeMap<String, BranchCounts>,
+    /// The rule that split a multi-evaluation test's counters into
+    /// this vector, when it was not a single evaluation or a uniform
+    /// repetition of one vector (see
+    /// [`crate::correlate::observations_from_counts`]). Omitted from
+    /// JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<Resolution>,
+}
+
+/// Which rule of [`crate::correlate::observations_from_counts`]
+/// resolved a multi-evaluation test's aggregate counters into
+/// several condition vectors. Serialised in snake case
+/// (`"single_two_sided"`, `"tree_counters"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Resolution {
+    /// Rule 4: exactly one condition took both values, so every
+    /// evaluation followed one of two walks. Each vector's
+    /// `evaluations` is the test's total evaluation count.
+    SingleTwoSided,
+    /// Rule 5: the decision is a tree with one counter per node, so
+    /// the counters are edge flows and each leaf's inflow is the
+    /// number of evaluations that took its vector. Each vector's
+    /// `evaluations` is that leaf flow.
+    TreeCounters,
 }
 
 impl ConditionObservation {
@@ -138,6 +163,7 @@ impl ConditionObservation {
             ambiguous: false,
             evaluations: None,
             counts: BTreeMap::new(),
+            resolved_by: None,
         }
     }
 
@@ -155,6 +181,7 @@ impl ConditionObservation {
             ambiguous: true,
             evaluations: Some(evaluations),
             counts,
+            resolved_by: None,
         }
     }
 }
