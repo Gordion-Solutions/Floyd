@@ -116,6 +116,16 @@ pub struct CargoBuildResult {
 /// containing one; it gets passed through to cargo as
 /// `--manifest-path`. Requires the nightly toolchain.
 pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, InstrumentError> {
+    compile_cargo_project_with_args(manifest_path, &[])
+}
+
+/// [`compile_cargo_project`] with extra arguments appended to the
+/// `cargo build --tests` command line, such as `--features=a,b`,
+/// `--all-features` or `--no-default-features`.
+pub fn compile_cargo_project_with_args(
+    manifest_path: &Path,
+    cargo_args: &[String],
+) -> Result<CargoBuildResult, InstrumentError> {
     let manifest = if manifest_path.is_dir() {
         manifest_path.join("Cargo.toml")
     } else {
@@ -193,6 +203,7 @@ pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, I
             "--manifest-path",
         ])
         .arg(&manifest)
+        .args(cargo_args)
         .output()
         .map_err(|e| InstrumentError {
             stage: "cargo build --tests",

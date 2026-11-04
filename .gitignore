@@ -22,4 +22,5 @@ Thumbs.db
 *.swp
 
 # Lockfiles of the standalone fixture workspaces
+fixtures/failure-paths/Cargo.lock
 fixtures/proc-macro-test/Cargo.lock

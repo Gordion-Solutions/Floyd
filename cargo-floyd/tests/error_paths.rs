@@ -1,6 +1,8 @@
 //! End-to-end checks of `cargo floyd test`'s error paths and
-//! options, on standalone fixtures under `fixtures/`:
+//! options, on the standalone fixtures `fixtures/failure-paths` and
+//! `fixtures/proc-macro-test`:
 //!
+//! - `--features` reaches the instrumented build;
 //! - a proc-macro crate's test binary (which links `libstd`
 //!   dynamically) is listed and run.
 //!
@@ -55,6 +57,27 @@ fn floyd(name: &str, args: &[&str], env: &[(&str, &str)]) -> Run {
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         code: out.status.code().expect("exit code"),
     }
+}
+
+#[test]
+#[ignore = "requires nightly Rust + llvm-tools-preview component"]
+fn features_reach_the_instrumented_build() {
+    for args in [
+        &["--format=json", "--features", "builds"][..],
+        &["--format=json", "--features=builds"][..],
+        &["--format=json", "-F", "builds"][..],
+        &["--format=json", "--all-features"][..],
+    ] {
+        let run = floyd("failure-paths", args, &[]);
+        let j = run.json();
+        assert_eq!(j["verdict"], "analysed", "{args:?}: {}", run.stderr);
+        assert_eq!(j["summary"]["percentage"], 100.0);
+        assert_eq!(run.code, 0);
+    }
+    // --no-default-features is passed too: `builds` is not a default
+    // feature, so the build still fails.
+    let run = floyd("failure-paths", &["--no-default-features"], &[]);
+    assert_eq!(run.code, 1);
 }
 
 #[test]

@@ -257,6 +257,16 @@ in a stage and add `junit 'floyd-mcdc.xml'` in `post { always
 `junit-annotate` plugin (or call `buildkite-agent artifact
 upload floyd-mcdc.xml`).
 
+### Options
+
+| Option | Effect |
+|--------|--------|
+| `--format=text\|json\|junit` | Output format (default `text`). |
+| `--only=<pat>` | Analyse only functions whose name contains `<pat>` (repeatable). |
+| `--max-mir-size=<MB>` | Skip test-target MIR files larger than `<MB>` megabytes (default 50); they are listed in the JSON `skipped_oversize_mirs`. Raise it for crates with heavy monomorphisation (for example `fixed` needs `--max-mir-size=200`). |
+| `--features=<list>`, `-F <list>` | Enable cargo features for the instrumented `cargo build --tests` (repeatable; comma- or space-separated, as for cargo). |
+| `--all-features`, `--no-default-features` | Passed to the instrumented build, as for `cargo test`. Crates whose test suite expects `cargo test --all-features` (such as `time`) need it. |
+
 ### Exit codes
 
 | Code | Meaning |

@@ -423,8 +423,38 @@ fn main() -> ExitCode {
     // Users analysing const-generic libs like fixed (106 MB) can
     // raise it when they are willing to spend the parse time.
     let mut max_mir_mb: Option<u64> = None;
+    // Cargo feature selection, passed through to the instrumented
+    // `cargo build --tests`.
+    let mut cargo_args: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
+        if args[i] == "--all-features" || args[i] == "--no-default-features" {
+            cargo_args.push(args[i].to_string());
+            args.remove(i);
+            continue;
+        }
+        if let Some(val) = args[i]
+            .strip_prefix("--features=")
+            .or_else(|| args[i].strip_prefix("-F="))
+        {
+            cargo_args.push(format!("--features={val}"));
+            args.remove(i);
+            continue;
+        }
+        if args[i] == "--features" || args[i] == "-F" {
+            let flag = args.remove(i);
+            match args.get(i).copied() {
+                Some(v) if !v.starts_with('-') => {
+                    cargo_args.push(format!("--features={v}"));
+                    args.remove(i);
+                }
+                _ => {
+                    eprintln!("cargo-floyd: {flag} requires a value (e.g. {flag} serde,std)");
+                    return ExitCode::from(2);
+                }
+            }
+            continue;
+        }
         if let Some(pat) = args[i].strip_prefix("--only=") {
             only_patterns.push(pat.to_string());
             args.remove(i);
@@ -534,10 +564,23 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    if !cargo_args.is_empty() && !matches!(source, Source::Cargo(_)) {
+        eprintln!(
+            "cargo-floyd: --features, --all-features and --no-default-features \
+             apply to cargo projects only"
+        );
+        return ExitCode::from(2);
+    }
+
     match (is_test_mode, source) {
-        (true, Source::Cargo(p)) => {
-            run_test_mode_cargo(&p, &workdir, format, &only_patterns, max_mir_mb)
-        }
+        (true, Source::Cargo(p)) => run_test_mode_cargo(
+            &p,
+            &workdir,
+            format,
+            &only_patterns,
+            max_mir_mb,
+            &cargo_args,
+        ),
         (true, Source::SingleFile(p)) => run_test_mode_single(&p, &workdir, format),
         (false, Source::Cargo(_)) => {
             eprintln!("cargo-floyd: static analysis on a cargo project is not supported yet;");
@@ -644,6 +687,7 @@ fn run_test_mode_cargo(
     format: Format,
     only_patterns: &[String],
     max_mir_mb: Option<u64>,
+    cargo_args: &[String],
 ) -> ExitCode {
     // Scope Floyd's `--emit=mir,link -Cinstrument-coverage
     // -Zcoverage-options=branch,condition -Zmir-include-spans` to
@@ -664,7 +708,7 @@ fn run_test_mode_cargo(
     }
 
     // Build all test artifacts in the cargo project.
-    let build = match instrument::compile_cargo_project(manifest) {
+    let build = match instrument::compile_cargo_project_with_args(manifest, cargo_args) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
@@ -1442,7 +1486,9 @@ fn print_usage() {
     eprintln!("cargo-floyd  MC/DC coverage analysis for Rust");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("    cargo floyd test [--format=text|json|junit] [<path>]");
+    eprintln!("    cargo floyd test [--format=text|json|junit] [--only=<pat>]...");
+    eprintln!("                     [--max-mir-size=<MB>] [--features=<list>]");
+    eprintln!("                     [--all-features] [--no-default-features] [<path>]");
     eprintln!("        Runtime MC/DC analysis: builds the project as a test");
     eprintln!("        crate with coverage instrumentation, runs each #[test]");
     eprintln!("        function individually, and reports which conditions the");
@@ -1456,6 +1502,16 @@ fn print_usage() {
     eprintln!("        per condition; pass=exercised, failure=unexercised) for");
     eprintln!("        CIs that render JUnit natively (Jenkins, GitLab CI,");
     eprintln!("        GitHub Actions, Bazel/Buck2, etc.).");
+    eprintln!();
+    eprintln!("        --only=<pat> (repeatable) analyses only functions whose");
+    eprintln!("        name contains <pat>.");
+    eprintln!();
+    eprintln!("        --max-mir-size=<MB> (default 50) skips test-target MIR");
+    eprintln!("        files larger than <MB> megabytes.");
+    eprintln!();
+    eprintln!("        --features=<list> (or -F <list>), --all-features and");
+    eprintln!("        --no-default-features are passed to the instrumented");
+    eprintln!("        `cargo build --tests`, as for `cargo test`.");
     eprintln!();
     eprintln!("    cargo floyd [--format=text|json] <path/to/source.rs>");
     eprintln!("        Static MC/DC analysis: prints the recovered truth table");
