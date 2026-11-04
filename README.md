@@ -381,6 +381,8 @@ support with a qualified update channel. Details and enquiries:
 .
 ├── floyd/              the engine (library crate)
 ├── cargo-floyd/        cargo subcommand driver (binary)
+│   └── tests/fixture_cases.rs    gated `cargo floyd test` run on fixtures/mcdc-cases
+├── fixtures/mcdc-cases/          regression fixture: one module per engine bug class
 ├── corpus/             qualification evidence
 │   ├── v0/             synthetic decision patterns
 │   └── v1/             safety-critical decision patterns
