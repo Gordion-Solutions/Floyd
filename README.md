@@ -172,11 +172,35 @@ vector from a test only when
   evaluations). Otherwise the test stays ambiguous. For example,
   `b == b' ' || b == b'\n'` evaluated 9 times with `b == 32 = 1 T /
   8 F` and `b == 10 = 0 T / 8 F` gives (T,-) -> T once and (F,F) -> F
-  8 times.
+  8 times. These vectors carry `"resolved_by": "single_two_sided"`
+  in `--format=json`.
+- the decision is a **tree** and the counters are consistent with
+  it, however many conditions were both true and false. A decision
+  is a tree when every condition is reached along one path only:
+  `a && b`, `a || b` and `a && (b || c)` are trees; `(a || b) && c`
+  is not (`c` is reached both when `a` is true and when `a` is
+  false and `b` true), nor is `(a && b) || c`. In a tree each
+  condition's true and false counters are the number of
+  evaluations that left it along its true and its false edge, and
+  every evaluation reaching a condition came along the one edge
+  into it, so the counters give, top down from the evaluation
+  count, how many evaluations ended at each outcome leaf, and each
+  leaf is one condition vector. Floyd checks that every
+  condition's true + false equals the count of the edge leading
+  into it (the evaluation count for the first condition), that a
+  condition with no counter is never reached, that no condition
+  appears at two places and no two conditions share a branch
+  counter, and that the leaf counts add up to the evaluation count.
+  Otherwise the test stays ambiguous. For example, rust-base64's
+  `byte >= 32 && byte <= 126` evaluated 256 times with
+  `byte >= 32 = 224 T / 32 F` and `byte <= 126 = 95 T / 129 F` gives
+  (T,T) -> T 95 times, (T,F) -> F 129 times and (F,-) -> F 32 times.
+  Each such vector's `evaluations` is its own count and it carries
+  `"resolved_by": "tree_counters"`.
 
-Any other test, including every test where two or more conditions
-were both true and false, is reported as an **ambiguous
-observation**: `--format=json` marks it `"ambiguous": true` with its
+Any other test, such as one where two or more conditions were both
+true and false in a decision that is not a tree, is reported as an
+**ambiguous observation**: `--format=json` marks it `"ambiguous": true` with its
 `evaluations` count and raw per-condition `counts`, the text report
 lists it as `AMBIGUOUS`, and it is excluded from independence-pair
 finding.
