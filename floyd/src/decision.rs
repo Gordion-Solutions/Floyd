@@ -29,6 +29,38 @@
 //! [`DeclineReason::NonBoolLeaf`]. The remaining
 //! handlers (`if let`, `match`, match guards, `?`) are stubs that
 //! graduate alongside their corpus patterns.
+//!
+//! ## Lifts: conditions whose arms are not Boolean
+//!
+//! For MC/DC the decision is the Boolean condition expression; what
+//! its arms compute does not matter. When the arms of a `bool`
+//! `switchInt` produce no Boolean leaf, two lifts take the arm taken
+//! as the decision's outcome (`then` arm `true`, `else` arm
+//! `false`), and the conditions' `llvm-cov` branch counters supply
+//! the observations exactly as for a Boolean-leaf decision. Which
+//! lift fired is reported as a [`Lift`].
+//!
+//! - **Call arms** ([`Lift::CallArms`]): both arms of one `switchInt`
+//!   end in non-panic calls or checked-operation `assert`s that
+//!   rejoin without diverging (`arms_are_non_panic_calls`).
+//! - **Value arms** ([`Lift::ValueArms`]): tried only at the
+//!   decomposition root, and only when every other handler declined.
+//!   The root's `bool` `switchInt`, and every `bool` `switchInt` it
+//!   reaches through coverage-only `goto` blocks, form a
+//!   short-circuit condition chain; the chain must end in exactly two
+//!   arm blocks that run through `goto`s only (no call, `assert`,
+//!   branch or return) into one join block outside the chain, and
+//!   both arms must write one common non-`bool` local before the
+//!   join (`if upper { 7 } else { 39 }`, `if -86400 < secs && secs <
+//!   86400 { Some(..) } else { None }`). A third arm (an `if` nested
+//!   in an arm, an `else if`), an arm that loops, calls or returns,
+//!   arms writing different locals, an `if` without `else`, and a
+//!   `bool` join value all decline. See `lift_value_arms`.
+//!
+//! Both lifts label outcomes by `switchInt` edge, so for a negated
+//! last condition (`if a && !b`) the source `else` arm is the `true`
+//! outcome. Independence pairs are the same under either labelling.
+//! Leaves stay Boolean: a non-`bool` local is never a condition.
 
 use std::cell::Cell;
 
@@ -67,7 +99,30 @@ pub enum DeclineReason {
     CtfeBody,
 }
 
+/// Which lift turned a Boolean condition with non-Boolean arms into
+/// a decision whose outcome is the arm taken.
+///
+/// Recorded per candidate (`lift` in `cargo floyd test
+/// --format=json`) for triage. Serialised in snake case
+/// (`call_arms`, `value_arms`). A decision with no lift reads its
+/// outcome from Boolean leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lift {
+    /// Both arms of a `bool` `switchInt` end in non-panic calls or
+    /// checked-operation `assert`s (see `arms_are_non_panic_calls`).
+    CallArms,
+    /// Both arms of a `bool` condition (or a short-circuit chain of
+    /// them) are straight-line blocks writing one non-`bool` value
+    /// before they join (see `lift_value_arms`).
+    ValueArms,
+}
+
 thread_local! {
+    /// Set when the call-arm lift fires during the current
+    /// [`decompose_from_block`] call. Read only when that call
+    /// returns a decision.
+    static CALL_ARMS_LIFT_SEEN: Cell<bool> = const { Cell::new(false) };
     /// Set when [`extract_terminal_value`] rejects a non-`bool` leaf
     /// during the current [`try_decompose_from_block`] call. Read
     /// only when that call declines, to report
@@ -250,10 +305,23 @@ pub fn decompose_function(f: &MirFunction) -> Option<Node> {
 /// recognised as a decision by any decomposer handler, or when
 /// `block_id` does not identify a block in `f`.
 pub fn decompose_from_block(f: &MirFunction, block_id: BlockId) -> Option<Node> {
+    decompose_from_block_lifted(f, block_id).map(|(node, _)| node)
+}
+
+/// [`decompose_from_block`], with the [`Lift`] that produced the
+/// decision, if any. The ordinary handlers run first; only when they
+/// decline is the value-arm lift tried at `block_id`.
+fn decompose_from_block_lifted(f: &MirFunction, block_id: BlockId) -> Option<(Node, Option<Lift>)> {
     if !f.blocks.iter().any(|b| b.id == block_id) {
         return None;
     }
-    build_decision_from_block(block_id, f)
+    CALL_ARMS_LIFT_SEEN.with(|seen| seen.set(false));
+    let node = build_decision_from_block(block_id, f);
+    let call_arms = CALL_ARMS_LIFT_SEEN.with(|seen| seen.replace(false));
+    match node {
+        Some(node) => Some((node, call_arms.then_some(Lift::CallArms))),
+        None => lift_value_arms(block_id, f).map(|node| (node, Some(Lift::ValueArms))),
+    }
 }
 
 /// [`decompose_function`], with the reason when it declines.
@@ -270,8 +338,17 @@ pub fn try_decompose_function(f: &MirFunction) -> Result<Node, DeclineReason> {
 /// attempted decomposition was rejected because its local is not
 /// `bool`, otherwise [`DeclineReason::UnsupportedShape`].
 pub fn try_decompose_from_block(f: &MirFunction, block_id: BlockId) -> Result<Node, DeclineReason> {
+    try_decompose_from_block_lifted(f, block_id).map(|(node, _)| node)
+}
+
+/// [`try_decompose_from_block`], with the [`Lift`] that produced the
+/// decision, if any.
+fn try_decompose_from_block_lifted(
+    f: &MirFunction,
+    block_id: BlockId,
+) -> Result<(Node, Option<Lift>), DeclineReason> {
     NON_BOOL_LEAF_SEEN.with(|seen| seen.set(false));
-    let node = decompose_from_block(f, block_id);
+    let node = decompose_from_block_lifted(f, block_id);
     let non_bool_leaf = NON_BOOL_LEAF_SEEN.with(|seen| seen.replace(false));
     node.ok_or(if non_bool_leaf {
         DeclineReason::NonBoolLeaf
@@ -285,14 +362,25 @@ pub fn try_decompose_from_block(f: &MirFunction, block_id: BlockId) -> Result<No
 /// [`try_decompose_function`], then decline a tree that tests no
 /// condition ([`DeclineReason::NoConditions`]).
 pub fn try_decompose_candidate(f: &MirFunction) -> Result<Node, DeclineReason> {
+    try_decompose_candidate_lifted(f).map(|(node, _)| node)
+}
+
+/// [`try_decompose_candidate`], with the [`Lift`] that produced the
+/// decision, if any.
+pub fn try_decompose_candidate_lifted(
+    f: &MirFunction,
+) -> Result<(Node, Option<Lift>), DeclineReason> {
     if f.is_ctfe {
         return Err(DeclineReason::CtfeBody);
     }
-    let node = try_decompose_function(f)?;
+    let Some(entry) = f.blocks.first() else {
+        return Err(DeclineReason::UnsupportedShape);
+    };
+    let (node, lift) = try_decompose_from_block_lifted(f, entry.id)?;
     if crate::masking::collect_conditions(&node).is_empty() {
         return Err(DeclineReason::NoConditions);
     }
-    Ok(node)
+    Ok((node, lift))
 }
 
 /// Guard for the branch-taken-as-result lift: both arms of a
@@ -337,6 +425,248 @@ fn arms_are_non_panic_calls(f: &MirFunction, else_arm_id: BlockId, then_arm_id: 
     let else_path = arm_continuation(f, else_arm_id);
     let then_path = arm_continuation(f, then_arm_id);
     !private_path_diverges(&else_path, &then_path) && !private_path_diverges(&then_path, &else_path)
+}
+
+/// Most condition blocks [`lift_value_arms`] accepts in one decision.
+const MAX_VALUE_ARM_CONDITIONS: usize = 16;
+
+/// Most blocks [`value_arm_chain`] and [`skip_inert_gotos`] follow.
+const MAX_VALUE_ARM_BLOCKS: usize = 32;
+
+/// Value-arm lift: a Boolean decision whose two outcomes are plain
+/// non-`bool` values (`if upper { 7 } else { 39 }`, `if -86400 < secs
+/// && secs < 86400 { Some(..) } else { None }`).
+///
+/// Tried only at the decomposition root, and only after the ordinary
+/// handlers (the call-arm lift included) declined it, so it never
+/// replaces a decision they recover and its result is never nested
+/// inside another decision. The rule, all of which must hold:
+///
+/// 1. `root` ends in a `switchInt` on a `bool` local with a nameable
+///    condition (a debug name or an inline comparison). Following
+///    the `switchInt` targets, skipping blocks that hold only
+///    coverage / storage markers and a `goto`, every further block
+///    that is itself such a `switchInt` is another condition of the
+///    same short-circuit chain. Blocks of the chain do not write the
+///    return place `_0`, and the chain has at most
+///    [`MAX_VALUE_ARM_CONDITIONS`] conditions and no cycle.
+/// 2. The chain ends in exactly two distinct arm blocks. A third
+///    arm, as `if a { if b { .. } else { .. } } else { .. }` has,
+///    means an arm holds a decision of its own: the function is
+///    declined, not lifted.
+/// 3. Each arm runs straight-line through `goto`s only (no call, no
+///    `assert`, no `switchInt`, no return) into a join block that
+///    both arms reach, and neither arm, nor the join, is a block of
+///    the condition chain (a loop back edge).
+/// 4. Both arms write one common local before the join (the return
+///    place, or the `let` the `if` initialises), and that local is
+///    not `bool`. A `bool` value is the ordinary handlers' job; a
+///    `bool` write on both arms is typically a drop flag.
+/// 5. Every condition `switchInt` whose two targets are both arms
+///    sends its `otherwise` edge to the same arm. That arm is
+///    outcome `true`, the other `false`.
+///
+/// The outcome labels follow the `switchInt` edges, like the
+/// call-arm lift: for `if a && !b` the source `else` arm is labelled
+/// `true`. MC/DC independence pairs do not depend on which outcome
+/// is called `true`, only on the two being told apart, which they
+/// are.
+fn lift_value_arms(root: BlockId, f: &MirFunction) -> Option<Node> {
+    let mut conditions: Vec<(BlockId, String, BlockId, BlockId)> = Vec::new();
+    let mut arms: Vec<BlockId> = Vec::new();
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
+        if conditions.iter().any(|c| c.0 == id) {
+            continue;
+        }
+        match value_arm_condition(id, f) {
+            Some((name, else_id, then_id)) => {
+                if conditions.len() >= MAX_VALUE_ARM_CONDITIONS {
+                    return None;
+                }
+                let else_id = skip_inert_gotos(f, else_id);
+                let then_id = skip_inert_gotos(f, then_id);
+                conditions.push((id, name, else_id, then_id));
+                pending.push(else_id);
+                pending.push(then_id);
+            }
+            None if id == root => return None,
+            None => {
+                if !arms.contains(&id) {
+                    arms.push(id);
+                }
+            }
+        }
+    }
+    if arms.len() != 2 {
+        return None;
+    }
+    let mut orientation: Option<(BlockId, BlockId)> = None;
+    for &(_, _, else_id, then_id) in &conditions {
+        if arms.contains(&else_id) && arms.contains(&then_id) {
+            if else_id == then_id || orientation.is_some_and(|o| o != (then_id, else_id)) {
+                return None;
+            }
+            orientation = Some((then_id, else_id));
+        }
+    }
+    let (then_arm, else_arm) = orientation?;
+    if !arms_join_with_value(f, then_arm, else_arm, &conditions) {
+        return None;
+    }
+    value_arm_tree(root, &conditions, then_arm, &mut Vec::new())
+}
+
+/// A block of a value-arm condition chain: its `switchInt` tests a
+/// nameable `bool` local (`[0: else, otherwise: then]`) and no
+/// statement writes `_0`. Returns the condition name and the
+/// `else` and `then` targets.
+fn value_arm_condition(id: BlockId, f: &MirFunction) -> Option<(String, BlockId, BlockId)> {
+    let block = f.blocks.iter().find(|b| b.id == id)?;
+    let MirTerminator::SwitchInt {
+        discr,
+        targets,
+        otherwise,
+        ..
+    } = &block.terminator
+    else {
+        return None;
+    };
+    if local_type(f, *discr) != Some("bool") || targets.len() != 1 || targets[0].0 != 0 {
+        return None;
+    }
+    let writes_return_place = block
+        .statements
+        .iter()
+        .any(|s| statement_dst(s).or_else(|| other_statement_dst(s)) == Some(RETURN_PLACE));
+    if writes_return_place {
+        return None;
+    }
+    let name = match f.debug_names.get(discr) {
+        Some(name) => name.clone(),
+        None => synthesize_compare_name(block, *discr, f)?,
+    };
+    Some((name, targets[0].1, *otherwise))
+}
+
+/// Is `stmt` a marker with no value: a coverage counter,
+/// `StorageLive`, `StorageDead`, or any other unparsed statement
+/// that is not an assignment?
+fn is_inert_statement(stmt: &MirStatement) -> bool {
+    matches!(stmt, MirStatement::Other { text, .. } if !text.contains(" = "))
+}
+
+/// Follow `goto`s out of `start` through blocks that hold only
+/// inert statements ([`is_inert_statement`]), and return the first
+/// block that does something else. rustc emits such a block per
+/// short-circuit exit (`bb2: { Coverage::VirtualCounter(bcb6); goto
+/// -> bb5; }`), so the `else` arm of `a && b` is reached through two
+/// of them.
+fn skip_inert_gotos(f: &MirFunction, start: BlockId) -> BlockId {
+    let mut current = start;
+    let mut seen = Vec::new();
+    while seen.len() < MAX_VALUE_ARM_BLOCKS && !seen.contains(&current) {
+        seen.push(current);
+        let Some(block) = f.blocks.iter().find(|b| b.id == current) else {
+            break;
+        };
+        match &block.terminator {
+            MirTerminator::Goto { target, .. }
+                if block.statements.iter().all(is_inert_statement) =>
+            {
+                current = *target;
+            }
+            _ => break,
+        }
+    }
+    current
+}
+
+/// The blocks control runs through from `start` along `goto`s: each
+/// `goto`-terminated block and then the first block that is not one
+/// (or the first block seen twice).
+fn value_arm_chain(f: &MirFunction, start: BlockId) -> Vec<BlockId> {
+    let mut chain = Vec::new();
+    let mut current = start;
+    while chain.len() < MAX_VALUE_ARM_BLOCKS && !chain.contains(&current) {
+        chain.push(current);
+        match goto_target(f, current) {
+            Some(target) => current = target,
+            None => break,
+        }
+    }
+    chain
+}
+
+/// Rules 3 and 4 of [`lift_value_arms`]: the two arms run through
+/// `goto`s into a common join block outside the condition chain and
+/// both write a common non-`bool` local on the way.
+fn arms_join_with_value(
+    f: &MirFunction,
+    then_arm: BlockId,
+    else_arm: BlockId,
+    conditions: &[(BlockId, String, BlockId, BlockId)],
+) -> bool {
+    let then_chain = value_arm_chain(f, then_arm);
+    let else_chain = value_arm_chain(f, else_arm);
+    let Some(else_join) = else_chain.iter().position(|b| then_chain.contains(b)) else {
+        return false;
+    };
+    let join = else_chain[else_join];
+    let then_join = then_chain
+        .iter()
+        .position(|b| *b == join)
+        .expect("join is on the then chain");
+    if then_join == 0 || else_join == 0 {
+        // One arm is the join itself: an `if` without `else`.
+        return false;
+    }
+    let then_private = &then_chain[..then_join];
+    let else_private = &else_chain[..else_join];
+    let in_chain = |b: &BlockId| conditions.iter().any(|c| c.0 == *b);
+    if then_private.iter().chain(else_private).any(in_chain) || in_chain(&join) {
+        return false;
+    }
+    let writes = |blocks: &[BlockId]| -> Vec<LocalId> {
+        blocks
+            .iter()
+            .filter_map(|id| f.blocks.iter().find(|b| b.id == *id))
+            .flat_map(|b| b.statements.iter())
+            .filter_map(|s| statement_dst(s).or_else(|| other_statement_dst(s)))
+            .collect()
+    };
+    let else_writes = writes(else_private);
+    writes(then_private).iter().any(|local| {
+        else_writes.contains(local) && local_type(f, *local).is_some_and(|ty| !is_bool_type(ty))
+    })
+}
+
+/// Build the lifted tree from condition block `id`: an [`Node::Ite`]
+/// per condition, [`Node::Const`] `true` at `then_arm` and `false`
+/// at the other arm. `None` on a cycle through `path`.
+fn value_arm_tree(
+    id: BlockId,
+    conditions: &[(BlockId, String, BlockId, BlockId)],
+    then_arm: BlockId,
+    path: &mut Vec<BlockId>,
+) -> Option<Node> {
+    let Some((_, name, else_id, then_id)) = conditions.iter().find(|c| c.0 == id) else {
+        return Some(Node::Const {
+            value: id == then_arm,
+        });
+    };
+    if path.contains(&id) {
+        return None;
+    }
+    path.push(id);
+    let then_branch = value_arm_tree(*then_id, conditions, then_arm, path)?;
+    let else_branch = value_arm_tree(*else_id, conditions, then_arm, path)?;
+    path.pop();
+    Some(Node::Ite {
+        cond: name.clone(),
+        then_branch: Box::new(then_branch),
+        else_branch: Box::new(else_branch),
+    })
 }
 
 /// Is `func_text` (a call's function expression) one of rustc's
@@ -596,6 +926,7 @@ fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node>
                         // panic/noreturn Calls are rejected via
                         // `arms_are_non_panic_calls` so assert /
                         // unwrap / expect patterns do not fire.
+                        CALL_ARMS_LIFT_SEEN.with(|seen| seen.set(true));
                         return Some(handle_boolean(&BoolExpr {
                             cond,
                             then_branch: Node::Const { value: true },
@@ -4353,11 +4684,17 @@ fn not_u32(_1: bool, _2: u32) -> u32 {
     }
 
     #[test]
-    fn deref_non_bool_copy_leaf_declines() {
-        // `if c { *a } else { *b }` with `a, b: &u8`.
+    fn deref_non_bool_copy_leaf_is_not_a_condition() {
+        // `if c { *a } else { *b }` with `a, b: &u8`. The `u8` arms
+        // are not conditions; the ordinary handlers decline, and the
+        // decision is `c` with the arm taken as its outcome.
         let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
         let f = leaf_fn(&mir, "pick_ref");
-        assert_eq!(try_decompose_function(f), Err(DeclineReason::NonBoolLeaf));
+        assert_eq!(build_decision_from_block(0, f), None);
+        assert_eq!(
+            try_decompose_candidate_lifted(f),
+            Ok((ite("c", const_(true), const_(false)), Some(Lift::ValueArms)))
+        );
     }
 
     #[test]
@@ -4368,9 +4705,11 @@ fn not_u32(_1: bool, _2: u32) -> u32 {
         let f = leaf_fn(&mir, "call_u32");
         assert_eq!(local_type(f, 3), Some("u32"));
         assert_eq!(decompose_from_block(f, 2), None, "`v` arm is not a leaf");
+        assert_eq!(build_decision_from_block(1, f), None);
+        // The `u32` arms are lifted as values, not read as `v`.
         assert_eq!(
             try_decompose_from_block(f, 1),
-            Err(DeclineReason::NonBoolLeaf)
+            Ok(ite("c", const_(true), const_(false)))
         );
 
         // `let v = is_even(x)` (`-> bool`): the same shape decomposes.
@@ -4383,15 +4722,20 @@ fn not_u32(_1: bool, _2: u32) -> u32 {
     }
 
     #[test]
-    fn not_of_integer_leaf_declines() {
-        // `if c { !x } else { x }` with `x: u32`: bitwise complement.
+    fn not_of_integer_leaf_is_not_a_condition() {
+        // `if c { !x } else { x }` with `x: u32`: bitwise complement,
+        // not a condition `!x`. The arms are lifted as values.
         let mir = mir::parse_text(LEAF_TYPES_MIR).expect("MIR parses");
         let f = leaf_fn(&mir, "not_u32");
         assert!(matches!(
             f.blocks[1].statements[1],
             MirStatement::AssignUnaryNot { dst: 0, src: 2, .. }
         ));
-        assert_eq!(try_decompose_function(f), Err(DeclineReason::NonBoolLeaf));
+        assert_eq!(build_decision_from_block(0, f), None);
+        assert_eq!(
+            try_decompose_candidate_lifted(f),
+            Ok((ite("c", const_(true), const_(false)), Some(Lift::ValueArms)))
+        );
     }
 
     #[test]
@@ -5722,5 +6066,757 @@ fn uts46::<impl at idna/src/uts46.rs:276:1: 276:19>::new(_1: bool, _2: &str) -> 
             try_decompose_candidate(runtime),
             Err(DeclineReason::CtfeBody)
         );
+    }
+
+    /// `cargo floyd test` MIR (rustc nightly 1.101, coverage flags,
+    /// comment lines stripped) for uuid 1.x `format_simple` in
+    /// `src/fmt.rs`, runtime body then `MIR FOR CTFE` body:
+    ///
+    /// ```text
+    /// const fn format_simple(src: &[u8; 16], upper: bool) -> [u8; 32] {
+    ///     let alpha_offset = if upper { 0x07 } else { 0x27 };
+    ///     let mut dst = [0; 32];
+    ///     let mut i = 0;
+    ///     while i < 16 { .. i += 1; }
+    ///     dst
+    /// }
+    /// ```
+    const FORMAT_SIMPLE_MIR: &str = r#"
+fn format_simple(_1: &[u8; 16], _2: bool) -> [u8; 32] {
+    debug src => _1;                     // in scope 0 at src/fmt.rs:190:24: 190:27
+    debug upper => _2;                   // in scope 0 at src/fmt.rs:190:40: 190:45
+    let mut _0: [u8; 32];                // return place in scope 0 at src/fmt.rs:190:56: 190:64
+    let _3: u8;                          // in scope 0 at src/fmt.rs:191:9: 191:21
+    let mut _6: bool;                    // in scope 0 at src/fmt.rs:194:11: 194:17
+    let mut _7: usize;                   // in scope 0 at src/fmt.rs:194:11: 194:12
+    let _9: usize;                       // in scope 0 at src/fmt.rs:195:21: 195:22
+    let mut _10: bool;                   // in scope 0 at src/fmt.rs:195:17: 195:23
+    let mut _11: u8;                     // in scope 0 at src/fmt.rs:196:22: 196:57
+    let mut _12: u8;                     // in scope 0 at src/fmt.rs:196:36: 196:42
+    let mut _13: u32;                    // in scope 0 at src/fmt.rs:196:36: 196:42
+    let mut _14: bool;                   // in scope 0 at src/fmt.rs:196:36: 196:42
+    let mut _15: u8;                     // in scope 0 at src/fmt.rs:196:44: 196:56
+    let _16: usize;                      // in scope 0 at src/fmt.rs:196:13: 196:18
+    let mut _17: usize;                  // in scope 0 at src/fmt.rs:196:13: 196:14
+    let mut _18: (usize, bool);          // in scope 0 at src/fmt.rs:196:13: 196:18
+    let mut _19: bool;                   // in scope 0 at src/fmt.rs:196:9: 196:19
+    let mut _20: u8;                     // in scope 0 at src/fmt.rs:197:26: 197:63
+    let mut _21: u8;                     // in scope 0 at src/fmt.rs:197:40: 197:48
+    let mut _22: u8;                     // in scope 0 at src/fmt.rs:197:50: 197:62
+    let _23: usize;                      // in scope 0 at src/fmt.rs:197:13: 197:22
+    let mut _24: usize;                  // in scope 0 at src/fmt.rs:197:13: 197:18
+    let mut _25: usize;                  // in scope 0 at src/fmt.rs:197:13: 197:14
+    let mut _26: (usize, bool);          // in scope 0 at src/fmt.rs:197:13: 197:18
+    let mut _27: (usize, bool);          // in scope 0 at src/fmt.rs:197:13: 197:22
+    let mut _28: bool;                   // in scope 0 at src/fmt.rs:197:9: 197:23
+    let mut _29: (usize, bool);          // in scope 0 at src/fmt.rs:198:9: 198:15
+    scope 1 {
+        debug alpha_offset => _3;        // in scope 1 at src/fmt.rs:191:9: 191:21
+        let mut _4: [u8; 32];            // in scope 1 at src/fmt.rs:192:9: 192:16
+        scope 2 {
+            debug dst => _4;             // in scope 2 at src/fmt.rs:192:9: 192:16
+            let mut _5: usize;           // in scope 2 at src/fmt.rs:193:9: 193:14
+            scope 3 {
+                debug i => _5;           // in scope 3 at src/fmt.rs:193:9: 193:14
+                let _8: u8;              // in scope 3 at src/fmt.rs:195:13: 195:14
+                scope 4 {
+                    debug x => _8;       // in scope 4 at src/fmt.rs:195:13: 195:14
+                }
+            }
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/fmt.rs:191:27: 191:32 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/fmt.rs:194:11: 194:17 (#0)
+
+    coverage Code { bcb: bcb0 } => src/fmt.rs:190:1: 190:64 (#0);
+    coverage Code { bcb: bcb0 } => src/fmt.rs:191:27: 191:32 (#0);
+    coverage Code { bcb: bcb1 } => src/fmt.rs:191:35: 191:39 (#0);
+    coverage Code { bcb: bcb6 } => src/fmt.rs:191:49: 191:53 (#0);
+    coverage Code { bcb: bcb2 } => src/fmt.rs:192:19: 192:26 (#0);
+    coverage Code { bcb: bcb2 } => src/fmt.rs:193:17: 193:18 (#0);
+    coverage Code { bcb: bcb3 } => src/fmt.rs:194:11: 194:17 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:195:17: 195:23 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:9: 196:12 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:9: 196:19 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:22: 196:35 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:9: 196:57 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:9: 197:12 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:9: 197:23 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:26: 197:39 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:9: 197:63 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:198:9: 198:15 (#0);
+    coverage Code { bcb: bcb5 } => src/fmt.rs:200:5: 200:8 (#0);
+    coverage Code { bcb: bcb5 } => src/fmt.rs:201:1: 201:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb6 } => src/fmt.rs:191:27: 191:32 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb5 } => src/fmt.rs:194:11: 194:17 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/fmt.rs:191:27: 191:32
+        switchInt(copy _2) -> [0: bb2, otherwise: bb1]; // scope 0 at src/fmt.rs:191:27: 191:32
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/fmt.rs:191:24: 191:55
+        _3 = const 7_u8;                 // scope 0 at src/fmt.rs:191:35: 191:39
+        goto -> bb3;                     // scope 0 at src/fmt.rs:191:24: 191:55
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at src/fmt.rs:191:24: 191:55
+        _3 = const 39_u8;                // scope 0 at src/fmt.rs:191:49: 191:53
+        goto -> bb3;                     // scope 0 at src/fmt.rs:191:24: 191:55
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 3 at src/fmt.rs:194:5: 199:6
+        _4 = [const 0_u8; 32];           // scope 1 at src/fmt.rs:192:19: 192:26
+        _5 = const 0_usize;              // scope 2 at src/fmt.rs:193:17: 193:18
+        goto -> bb4;                     // scope 3 at src/fmt.rs:194:5: 199:6
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb3);  // scope 3 at src/fmt.rs:194:5: 199:6
+        _7 = copy _5;                    // scope 3 at src/fmt.rs:194:11: 194:12
+        _6 = Lt(move _7, const 16_usize); // scope 3 at src/fmt.rs:194:11: 194:17
+        switchInt(move _6) -> [0: bb6, otherwise: bb5]; // scope 3 at src/fmt.rs:194:11: 194:17
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb4);  // scope 3 at src/fmt.rs:195:17: 195:23
+        _9 = copy _5;                    // scope 3 at src/fmt.rs:195:21: 195:22
+        _10 = Lt(copy _9, const 16_usize); // scope 3 at src/fmt.rs:195:17: 195:23
+        assert(move _10, "index out of bounds: the length is {} but the index is {}", const 16_usize, copy _9) -> [success: bb7, unwind continue]; // scope 3 at src/fmt.rs:195:17: 195:23
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/fmt.rs:201:2: 201:2
+        _0 = copy _4;                    // scope 3 at src/fmt.rs:200:5: 200:8
+        return;                          // scope 0 at src/fmt.rs:201:2: 201:2
+    }
+
+    bb7: {
+        _8 = copy (*_1)[_9];             // scope 3 at src/fmt.rs:195:17: 195:23
+        _13 = const 4_i32 as u32 (IntToInt); // scope 4 at src/fmt.rs:196:36: 196:42
+        _14 = Lt(move _13, const 8_u32); // scope 4 at src/fmt.rs:196:36: 196:42
+        assert(move _14, "attempt to shift right by `{}`, which would overflow", const 4_i32) -> [success: bb8, unwind continue]; // scope 4 at src/fmt.rs:196:36: 196:42
+    }
+
+    bb8: {
+        _12 = Shr(copy _8, const 4_i32); // scope 4 at src/fmt.rs:196:36: 196:42
+        _15 = copy _3;                   // scope 4 at src/fmt.rs:196:44: 196:56
+        _11 = nibble_to_hex(move _12, move _15) -> [return: bb9, unwind continue]; // scope 4 at src/fmt.rs:196:22: 196:57
+    }
+
+    bb9: {
+        _17 = copy _5;                   // scope 4 at src/fmt.rs:196:13: 196:14
+        _18 = MulWithOverflow(copy _17, const 2_usize); // scope 4 at src/fmt.rs:196:13: 196:18
+        assert(!move (_18.1: bool), "attempt to compute `{} * {}`, which would overflow", move _17, const 2_usize) -> [success: bb10, unwind continue]; // scope 4 at src/fmt.rs:196:13: 196:18
+    }
+
+    bb10: {
+        _16 = move (_18.0: usize);       // scope 4 at src/fmt.rs:196:13: 196:18
+        _19 = Lt(copy _16, const 32_usize); // scope 4 at src/fmt.rs:196:9: 196:19
+        assert(move _19, "index out of bounds: the length is {} but the index is {}", const 32_usize, copy _16) -> [success: bb11, unwind continue]; // scope 4 at src/fmt.rs:196:9: 196:19
+    }
+
+    bb11: {
+        _4[_16] = move _11;              // scope 4 at src/fmt.rs:196:9: 196:57
+        _21 = BitAnd(copy _8, const 15_u8); // scope 4 at src/fmt.rs:197:40: 197:48
+        _22 = copy _3;                   // scope 4 at src/fmt.rs:197:50: 197:62
+        _20 = nibble_to_hex(move _21, move _22) -> [return: bb12, unwind continue]; // scope 4 at src/fmt.rs:197:26: 197:63
+    }
+
+    bb12: {
+        _25 = copy _5;                   // scope 4 at src/fmt.rs:197:13: 197:14
+        _26 = MulWithOverflow(copy _25, const 2_usize); // scope 4 at src/fmt.rs:197:13: 197:18
+        assert(!move (_26.1: bool), "attempt to compute `{} * {}`, which would overflow", move _25, const 2_usize) -> [success: bb13, unwind continue]; // scope 4 at src/fmt.rs:197:13: 197:18
+    }
+
+    bb13: {
+        _24 = move (_26.0: usize);       // scope 4 at src/fmt.rs:197:13: 197:18
+        _27 = AddWithOverflow(copy _24, const 1_usize); // scope 4 at src/fmt.rs:197:13: 197:22
+        assert(!move (_27.1: bool), "attempt to compute `{} + {}`, which would overflow", move _24, const 1_usize) -> [success: bb14, unwind continue]; // scope 4 at src/fmt.rs:197:13: 197:22
+    }
+
+    bb14: {
+        _23 = move (_27.0: usize);       // scope 4 at src/fmt.rs:197:13: 197:22
+        _28 = Lt(copy _23, const 32_usize); // scope 4 at src/fmt.rs:197:9: 197:23
+        assert(move _28, "index out of bounds: the length is {} but the index is {}", const 32_usize, copy _23) -> [success: bb15, unwind continue]; // scope 4 at src/fmt.rs:197:9: 197:23
+    }
+
+    bb15: {
+        _4[_23] = move _20;              // scope 4 at src/fmt.rs:197:9: 197:63
+        _29 = AddWithOverflow(copy _5, const 1_usize); // scope 4 at src/fmt.rs:198:9: 198:15
+        assert(!move (_29.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _5, const 1_usize) -> [success: bb16, unwind continue]; // scope 4 at src/fmt.rs:198:9: 198:15
+    }
+
+    bb16: {
+        _5 = move (_29.0: usize);        // scope 4 at src/fmt.rs:198:9: 198:15
+        goto -> bb4;                     // scope 3 at src/fmt.rs:194:5: 199:6
+    }
+}
+
+// MIR FOR CTFE
+fn format_simple(_1: &[u8; 16], _2: bool) -> [u8; 32] {
+    debug src => _1;                     // in scope 0 at src/fmt.rs:190:24: 190:27
+    debug upper => _2;                   // in scope 0 at src/fmt.rs:190:40: 190:45
+    let mut _0: [u8; 32];                // return place in scope 0 at src/fmt.rs:190:56: 190:64
+    let _3: u8;                          // in scope 0 at src/fmt.rs:191:9: 191:21
+    let mut _4: bool;                    // in scope 0 at src/fmt.rs:191:27: 191:32
+    let _7: ();                          // in scope 0 at src/fmt.rs:194:5: 199:6
+    let mut _8: ();                      // in scope 0 at src/fmt.rs:190:1: 201:2
+    let mut _9: bool;                    // in scope 0 at src/fmt.rs:194:11: 194:17
+    let mut _10: usize;                  // in scope 0 at src/fmt.rs:194:11: 194:12
+    let _12: usize;                      // in scope 0 at src/fmt.rs:195:21: 195:22
+    let mut _13: bool;                   // in scope 0 at src/fmt.rs:195:17: 195:23
+    let mut _14: u8;                     // in scope 0 at src/fmt.rs:196:22: 196:57
+    let mut _15: u8;                     // in scope 0 at src/fmt.rs:196:36: 196:42
+    let mut _16: u8;                     // in scope 0 at src/fmt.rs:196:36: 196:37
+    let mut _17: u32;                    // in scope 0 at src/fmt.rs:196:36: 196:42
+    let mut _18: bool;                   // in scope 0 at src/fmt.rs:196:36: 196:42
+    let mut _19: u8;                     // in scope 0 at src/fmt.rs:196:44: 196:56
+    let _20: usize;                      // in scope 0 at src/fmt.rs:196:13: 196:18
+    let mut _21: usize;                  // in scope 0 at src/fmt.rs:196:13: 196:14
+    let mut _22: (usize, bool);          // in scope 0 at src/fmt.rs:196:13: 196:18
+    let mut _23: bool;                   // in scope 0 at src/fmt.rs:196:9: 196:19
+    let mut _24: u8;                     // in scope 0 at src/fmt.rs:197:26: 197:63
+    let mut _25: u8;                     // in scope 0 at src/fmt.rs:197:40: 197:48
+    let mut _26: u8;                     // in scope 0 at src/fmt.rs:197:40: 197:41
+    let mut _27: u8;                     // in scope 0 at src/fmt.rs:197:50: 197:62
+    let _28: usize;                      // in scope 0 at src/fmt.rs:197:13: 197:22
+    let mut _29: usize;                  // in scope 0 at src/fmt.rs:197:13: 197:18
+    let mut _30: usize;                  // in scope 0 at src/fmt.rs:197:13: 197:14
+    let mut _31: (usize, bool);          // in scope 0 at src/fmt.rs:197:13: 197:18
+    let mut _32: (usize, bool);          // in scope 0 at src/fmt.rs:197:13: 197:22
+    let mut _33: bool;                   // in scope 0 at src/fmt.rs:197:9: 197:23
+    let mut _34: (usize, bool);          // in scope 0 at src/fmt.rs:198:9: 198:15
+    let mut _35: !;                      // in scope 0 at src/fmt.rs:194:5: 199:6
+    let _36: ();                         // in scope 0 at src/fmt.rs:194:5: 199:6
+    let mut _37: !;                      // in scope 0 at src/fmt.rs:194:5: 199:6
+    scope 1 {
+        debug alpha_offset => _3;        // in scope 1 at src/fmt.rs:191:9: 191:21
+        let mut _5: [u8; 32];            // in scope 1 at src/fmt.rs:192:9: 192:16
+        scope 2 {
+            debug dst => _5;             // in scope 2 at src/fmt.rs:192:9: 192:16
+            let mut _6: usize;           // in scope 2 at src/fmt.rs:193:9: 193:14
+            scope 3 {
+                debug i => _6;           // in scope 3 at src/fmt.rs:193:9: 193:14
+                let _11: u8;             // in scope 3 at src/fmt.rs:195:13: 195:14
+                scope 4 {
+                    debug x => _11;      // in scope 4 at src/fmt.rs:195:13: 195:14
+                }
+            }
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/fmt.rs:191:27: 191:32 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/fmt.rs:194:11: 194:17 (#0)
+
+    coverage Code { bcb: bcb0 } => src/fmt.rs:190:1: 190:64 (#0);
+    coverage Code { bcb: bcb0 } => src/fmt.rs:191:27: 191:32 (#0);
+    coverage Code { bcb: bcb1 } => src/fmt.rs:191:35: 191:39 (#0);
+    coverage Code { bcb: bcb6 } => src/fmt.rs:191:49: 191:53 (#0);
+    coverage Code { bcb: bcb2 } => src/fmt.rs:192:19: 192:26 (#0);
+    coverage Code { bcb: bcb2 } => src/fmt.rs:193:17: 193:18 (#0);
+    coverage Code { bcb: bcb3 } => src/fmt.rs:194:11: 194:17 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:195:17: 195:23 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:9: 196:12 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:9: 196:19 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:22: 196:35 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:196:9: 196:57 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:9: 197:12 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:9: 197:23 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:26: 197:39 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:197:9: 197:63 (#0);
+    coverage Code { bcb: bcb4 } => src/fmt.rs:198:9: 198:15 (#0);
+    coverage Code { bcb: bcb5 } => src/fmt.rs:200:5: 200:8 (#0);
+    coverage Code { bcb: bcb5 } => src/fmt.rs:201:1: 201:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb6 } => src/fmt.rs:191:27: 191:32 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb5 } => src/fmt.rs:194:11: 194:17 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/fmt.rs:191:27: 191:32
+        StorageLive(_3);                 // scope 0 at src/fmt.rs:191:9: 191:21
+        StorageLive(_4);                 // scope 0 at src/fmt.rs:191:27: 191:32
+        _4 = copy _2;                    // scope 0 at src/fmt.rs:191:27: 191:32
+        switchInt(move _4) -> [0: bb2, otherwise: bb1]; // scope 0 at src/fmt.rs:191:27: 191:32
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/fmt.rs:191:24: 191:55
+        _3 = const 7_u8;                 // scope 0 at src/fmt.rs:191:35: 191:39
+        goto -> bb3;                     // scope 0 at src/fmt.rs:191:24: 191:55
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at src/fmt.rs:191:24: 191:55
+        _3 = const 39_u8;                // scope 0 at src/fmt.rs:191:49: 191:53
+        goto -> bb3;                     // scope 0 at src/fmt.rs:191:24: 191:55
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 3 at src/fmt.rs:194:5: 199:6
+        StorageDead(_4);                 // scope 0 at src/fmt.rs:191:54: 191:55
+        StorageLive(_5);                 // scope 1 at src/fmt.rs:192:9: 192:16
+        _5 = [const 0_u8; 32];           // scope 1 at src/fmt.rs:192:19: 192:26
+        StorageLive(_6);                 // scope 2 at src/fmt.rs:193:9: 193:14
+        _6 = const 0_usize;              // scope 2 at src/fmt.rs:193:17: 193:18
+        StorageLive(_7);                 // scope 3 at src/fmt.rs:194:5: 199:6
+        goto -> bb4;                     // scope 3 at src/fmt.rs:194:5: 199:6
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb3);  // scope 3 at src/fmt.rs:194:5: 199:6
+        StorageLive(_9);                 // scope 3 at src/fmt.rs:194:11: 194:17
+        StorageLive(_10);                // scope 3 at src/fmt.rs:194:11: 194:12
+        _10 = copy _6;                   // scope 3 at src/fmt.rs:194:11: 194:12
+        _9 = Lt(move _10, const 16_usize); // scope 3 at src/fmt.rs:194:11: 194:17
+        switchInt(move _9) -> [0: bb6, otherwise: bb5]; // scope 3 at src/fmt.rs:194:11: 194:17
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb4);  // scope 3 at src/fmt.rs:195:17: 195:23
+        StorageDead(_10);                // scope 3 at src/fmt.rs:194:16: 194:17
+        StorageLive(_11);                // scope 3 at src/fmt.rs:195:13: 195:14
+        StorageLive(_12);                // scope 3 at src/fmt.rs:195:21: 195:22
+        _12 = copy _6;                   // scope 3 at src/fmt.rs:195:21: 195:22
+        _13 = Lt(copy _12, const 16_usize); // scope 3 at src/fmt.rs:195:17: 195:23
+        assert(move _13, "index out of bounds: the length is {} but the index is {}", const 16_usize, copy _12) -> [success: bb7, unwind continue]; // scope 3 at src/fmt.rs:195:17: 195:23
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/fmt.rs:201:2: 201:2
+        StorageDead(_10);                // scope 3 at src/fmt.rs:194:16: 194:17
+        StorageLive(_36);                // scope 3 at src/fmt.rs:194:5: 199:6
+        _7 = const ();                   // scope 3 at src/fmt.rs:194:5: 199:6
+        StorageDead(_36);                // scope 3 at src/fmt.rs:199:5: 199:6
+        StorageDead(_9);                 // scope 3 at src/fmt.rs:199:5: 199:6
+        StorageDead(_7);                 // scope 3 at src/fmt.rs:199:5: 199:6
+        _0 = copy _5;                    // scope 3 at src/fmt.rs:200:5: 200:8
+        StorageDead(_6);                 // scope 2 at src/fmt.rs:201:1: 201:2
+        StorageDead(_5);                 // scope 1 at src/fmt.rs:201:1: 201:2
+        StorageDead(_3);                 // scope 0 at src/fmt.rs:201:1: 201:2
+        return;                          // scope 0 at src/fmt.rs:201:2: 201:2
+    }
+
+    bb7: {
+        _11 = copy (*_1)[_12];           // scope 3 at src/fmt.rs:195:17: 195:23
+        StorageDead(_12);                // scope 3 at src/fmt.rs:195:23: 195:24
+        StorageLive(_14);                // scope 4 at src/fmt.rs:196:22: 196:57
+        StorageLive(_15);                // scope 4 at src/fmt.rs:196:36: 196:42
+        StorageLive(_16);                // scope 4 at src/fmt.rs:196:36: 196:37
+        _16 = copy _11;                  // scope 4 at src/fmt.rs:196:36: 196:37
+        _17 = const 4_i32 as u32 (IntToInt); // scope 4 at src/fmt.rs:196:36: 196:42
+        _18 = Lt(move _17, const 8_u32); // scope 4 at src/fmt.rs:196:36: 196:42
+        assert(move _18, "attempt to shift right by `{}`, which would overflow", const 4_i32) -> [success: bb8, unwind continue]; // scope 4 at src/fmt.rs:196:36: 196:42
+    }
+
+    bb8: {
+        _15 = Shr(move _16, const 4_i32); // scope 4 at src/fmt.rs:196:36: 196:42
+        StorageDead(_16);                // scope 4 at src/fmt.rs:196:41: 196:42
+        StorageLive(_19);                // scope 4 at src/fmt.rs:196:44: 196:56
+        _19 = copy _3;                   // scope 4 at src/fmt.rs:196:44: 196:56
+        ConstEvalCounter;                // scope 4 at src/fmt.rs:196:22: 196:57
+        _14 = nibble_to_hex(move _15, move _19) -> [return: bb9, unwind continue]; // scope 4 at src/fmt.rs:196:22: 196:57
+    }
+
+    bb9: {
+        StorageDead(_19);                // scope 4 at src/fmt.rs:196:56: 196:57
+        StorageDead(_15);                // scope 4 at src/fmt.rs:196:56: 196:57
+        StorageLive(_20);                // scope 4 at src/fmt.rs:196:13: 196:18
+        StorageLive(_21);                // scope 4 at src/fmt.rs:196:13: 196:14
+        _21 = copy _6;                   // scope 4 at src/fmt.rs:196:13: 196:14
+        _22 = MulWithOverflow(copy _21, const 2_usize); // scope 4 at src/fmt.rs:196:13: 196:18
+        assert(!move (_22.1: bool), "attempt to compute `{} * {}`, which would overflow", move _21, const 2_usize) -> [success: bb10, unwind continue]; // scope 4 at src/fmt.rs:196:13: 196:18
+    }
+
+    bb10: {
+        _20 = move (_22.0: usize);       // scope 4 at src/fmt.rs:196:13: 196:18
+        StorageDead(_21);                // scope 4 at src/fmt.rs:196:17: 196:18
+        _23 = Lt(copy _20, const 32_usize); // scope 4 at src/fmt.rs:196:9: 196:19
+        assert(move _23, "index out of bounds: the length is {} but the index is {}", const 32_usize, copy _20) -> [success: bb11, unwind continue]; // scope 4 at src/fmt.rs:196:9: 196:19
+    }
+
+    bb11: {
+        _5[_20] = move _14;              // scope 4 at src/fmt.rs:196:9: 196:57
+        StorageDead(_14);                // scope 4 at src/fmt.rs:196:56: 196:57
+        StorageDead(_20);                // scope 4 at src/fmt.rs:196:57: 196:58
+        StorageLive(_24);                // scope 4 at src/fmt.rs:197:26: 197:63
+        StorageLive(_25);                // scope 4 at src/fmt.rs:197:40: 197:48
+        StorageLive(_26);                // scope 4 at src/fmt.rs:197:40: 197:41
+        _26 = copy _11;                  // scope 4 at src/fmt.rs:197:40: 197:41
+        _25 = BitAnd(move _26, const 15_u8); // scope 4 at src/fmt.rs:197:40: 197:48
+        StorageDead(_26);                // scope 4 at src/fmt.rs:197:47: 197:48
+        StorageLive(_27);                // scope 4 at src/fmt.rs:197:50: 197:62
+        _27 = copy _3;                   // scope 4 at src/fmt.rs:197:50: 197:62
+        ConstEvalCounter;                // scope 4 at src/fmt.rs:197:26: 197:63
+        _24 = nibble_to_hex(move _25, move _27) -> [return: bb12, unwind continue]; // scope 4 at src/fmt.rs:197:26: 197:63
+    }
+
+    bb12: {
+        StorageDead(_27);                // scope 4 at src/fmt.rs:197:62: 197:63
+        StorageDead(_25);                // scope 4 at src/fmt.rs:197:62: 197:63
+        StorageLive(_28);                // scope 4 at src/fmt.rs:197:13: 197:22
+        StorageLive(_29);                // scope 4 at src/fmt.rs:197:13: 197:18
+        StorageLive(_30);                // scope 4 at src/fmt.rs:197:13: 197:14
+        _30 = copy _6;                   // scope 4 at src/fmt.rs:197:13: 197:14
+        _31 = MulWithOverflow(copy _30, const 2_usize); // scope 4 at src/fmt.rs:197:13: 197:18
+        assert(!move (_31.1: bool), "attempt to compute `{} * {}`, which would overflow", move _30, const 2_usize) -> [success: bb13, unwind continue]; // scope 4 at src/fmt.rs:197:13: 197:18
+    }
+
+    bb13: {
+        _29 = move (_31.0: usize);       // scope 4 at src/fmt.rs:197:13: 197:18
+        StorageDead(_30);                // scope 4 at src/fmt.rs:197:17: 197:18
+        _32 = AddWithOverflow(copy _29, const 1_usize); // scope 4 at src/fmt.rs:197:13: 197:22
+        assert(!move (_32.1: bool), "attempt to compute `{} + {}`, which would overflow", move _29, const 1_usize) -> [success: bb14, unwind continue]; // scope 4 at src/fmt.rs:197:13: 197:22
+    }
+
+    bb14: {
+        _28 = move (_32.0: usize);       // scope 4 at src/fmt.rs:197:13: 197:22
+        StorageDead(_29);                // scope 4 at src/fmt.rs:197:21: 197:22
+        _33 = Lt(copy _28, const 32_usize); // scope 4 at src/fmt.rs:197:9: 197:23
+        assert(move _33, "index out of bounds: the length is {} but the index is {}", const 32_usize, copy _28) -> [success: bb15, unwind continue]; // scope 4 at src/fmt.rs:197:9: 197:23
+    }
+
+    bb15: {
+        _5[_28] = move _24;              // scope 4 at src/fmt.rs:197:9: 197:63
+        StorageDead(_24);                // scope 4 at src/fmt.rs:197:62: 197:63
+        StorageDead(_28);                // scope 4 at src/fmt.rs:197:63: 197:64
+        _34 = AddWithOverflow(copy _6, const 1_usize); // scope 4 at src/fmt.rs:198:9: 198:15
+        assert(!move (_34.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _6, const 1_usize) -> [success: bb16, unwind continue]; // scope 4 at src/fmt.rs:198:9: 198:15
+    }
+
+    bb16: {
+        _6 = move (_34.0: usize);        // scope 4 at src/fmt.rs:198:9: 198:15
+        _8 = const ();                   // scope 3 at src/fmt.rs:194:18: 199:6
+        StorageDead(_11);                // scope 3 at src/fmt.rs:199:5: 199:6
+        StorageDead(_9);                 // scope 3 at src/fmt.rs:199:5: 199:6
+        ConstEvalCounter;                // scope 3 at src/fmt.rs:194:5: 199:6
+        goto -> bb4;                     // scope 3 at src/fmt.rs:194:5: 199:6
+    }
+}
+
+format_simple::{constant#0}: usize = {
+    let mut _0: usize;                   // return place in scope 0 at src/fmt.rs:190:35: 190:37
+
+    bb0: {
+        _0 = const 16_usize;             // scope 0 at src/fmt.rs:190:35: 190:37
+        return;                          // scope 0 at src/fmt.rs:190:35: 190:37
+    }
+}
+
+format_simple::{constant#1}: usize = {
+    let mut _0: usize;                   // return place in scope 0 at src/fmt.rs:190:61: 190:63
+
+    bb0: {
+        _0 = const 32_usize;             // scope 0 at src/fmt.rs:190:61: 190:63
+        return;                          // scope 0 at src/fmt.rs:190:61: 190:63
+    }
+}
+
+format_simple::{constant#2}: usize = {
+    let mut _0: usize;                   // return place in scope 0 at src/fmt.rs:192:23: 192:25
+
+    bb0: {
+        _0 = const 32_usize;             // scope 0 at src/fmt.rs:192:23: 192:25
+        return;                          // scope 0 at src/fmt.rs:192:23: 192:25
+    }
+}
+"#;
+
+    /// `rustc +nightly --emit=mir -Cinstrument-coverage
+    /// -Zcoverage-options=branch,condition -Zmir-include-spans`
+    /// (comment lines stripped) for:
+    ///
+    /// ```text
+    /// pub fn nested(a: bool, b: bool) -> u8 {
+    ///     if a { if b { 1 } else { 2 } } else { 3 }
+    /// }
+    /// pub fn spin(c: bool, n: u32) -> u32 {
+    ///     let x = if c { 3 } else { let mut k = n; while k > 9 { k -= 1; } k };
+    ///     x
+    /// }
+    /// pub fn split(c: bool) -> u32 {
+    ///     let mut a = 0u32;
+    ///     let mut b = 0u32;
+    ///     if c { a = 5; } else { b = 7; }
+    ///     a + b
+    /// }
+    /// ```
+    const VALUE_ARM_DECLINES_MIR: &str = r#"
+fn nested(_1: bool, _2: bool) -> u8 {
+    debug a => _1;                       // in scope 0 at lift.rs:1:15: 1:16
+    debug b => _2;                       // in scope 0 at lift.rs:1:24: 1:25
+    let mut _0: u8;                      // return place in scope 0 at lift.rs:1:36: 1:38
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => lift.rs:2:8: 2:9 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => lift.rs:3:12: 3:13 (#0)
+
+    coverage Code { bcb: bcb0 } => lift.rs:1:1: 1:38 (#0);
+    coverage Code { bcb: bcb0 } => lift.rs:2:8: 2:9 (#0);
+    coverage Code { bcb: bcb1 } => lift.rs:3:12: 3:13 (#0);
+    coverage Code { bcb: bcb2 } => lift.rs:3:16: 3:17 (#0);
+    coverage Code { bcb: bcb5 } => lift.rs:3:27: 3:28 (#0);
+    coverage Code { bcb: bcb6 } => lift.rs:5:9: 5:10 (#0);
+    coverage Code { bcb: bcb4 } => lift.rs:7:1: 7:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb6 } => lift.rs:2:8: 2:9 (#0);
+    coverage Branch { true_bcb: bcb2, false_bcb: bcb5 } => lift.rs:3:12: 3:13 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at lift.rs:2:8: 2:9
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 0 at lift.rs:2:8: 2:9
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at lift.rs:3:12: 3:13
+        switchInt(copy _2) -> [0: bb4, otherwise: bb3]; // scope 0 at lift.rs:3:12: 3:13
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at lift.rs:2:5: 6:6
+        _0 = const 3_u8;                 // scope 0 at lift.rs:5:9: 5:10
+        goto -> bb6;                     // scope 0 at lift.rs:2:5: 6:6
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at lift.rs:3:9: 3:30
+        _0 = const 1_u8;                 // scope 0 at lift.rs:3:16: 3:17
+        goto -> bb5;                     // scope 0 at lift.rs:3:9: 3:30
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at lift.rs:3:9: 3:30
+        _0 = const 2_u8;                 // scope 0 at lift.rs:3:27: 3:28
+        goto -> bb5;                     // scope 0 at lift.rs:3:9: 3:30
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at lift.rs:2:5: 6:6
+        goto -> bb6;                     // scope 0 at lift.rs:2:5: 6:6
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at lift.rs:7:2: 7:2
+        return;                          // scope 0 at lift.rs:7:2: 7:2
+    }
+}
+
+fn spin(_1: bool, _2: u32) -> u32 {
+    debug c => _1;                       // in scope 0 at lift.rs:9:13: 9:14
+    debug n => _2;                       // in scope 0 at lift.rs:9:22: 9:23
+    let mut _0: u32;                     // return place in scope 0 at lift.rs:9:33: 9:36
+    let _3: u32;                         // in scope 0 at lift.rs:10:9: 10:10
+    let mut _4: u32;                     // in scope 0 at lift.rs:13:13: 13:18
+    let mut _5: bool;                    // in scope 0 at lift.rs:14:15: 14:20
+    let mut _6: u32;                     // in scope 0 at lift.rs:14:15: 14:16
+    let mut _7: (u32, bool);             // in scope 0 at lift.rs:15:13: 15:19
+    scope 1 {
+        debug x => _3;                   // in scope 1 at lift.rs:10:9: 10:10
+    }
+    scope 2 {
+        debug k => _4;                   // in scope 2 at lift.rs:13:13: 13:18
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => lift.rs:10:16: 10:17 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => lift.rs:14:15: 14:20 (#0)
+
+    coverage Code { bcb: bcb0 } => lift.rs:9:1: 9:36 (#0);
+    coverage Code { bcb: bcb0 } => lift.rs:10:16: 10:17 (#0);
+    coverage Code { bcb: bcb1 } => lift.rs:11:9: 11:10 (#0);
+    coverage Code { bcb: bcb3 } => lift.rs:13:21: 13:22 (#0);
+    coverage Code { bcb: bcb4 } => lift.rs:14:15: 14:20 (#0);
+    coverage Code { bcb: bcb5 } => lift.rs:15:13: 15:19 (#0);
+    coverage Code { bcb: bcb6 } => lift.rs:17:9: 17:10 (#0);
+    coverage Code { bcb: bcb2 } => lift.rs:19:5: 19:6 (#0);
+    coverage Code { bcb: bcb2 } => lift.rs:20:1: 20:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => lift.rs:10:16: 10:17 (#0);
+    coverage Branch { true_bcb: bcb5, false_bcb: bcb6 } => lift.rs:14:15: 14:20 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at lift.rs:10:16: 10:17
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 0 at lift.rs:10:16: 10:17
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at lift.rs:10:13: 18:6
+        _3 = const 3_u32;                // scope 0 at lift.rs:11:9: 11:10
+        goto -> bb7;                     // scope 0 at lift.rs:10:13: 18:6
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 2 at lift.rs:14:9: 16:10
+        _4 = copy _2;                    // scope 0 at lift.rs:13:21: 13:22
+        goto -> bb3;                     // scope 2 at lift.rs:14:9: 16:10
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb4);  // scope 2 at lift.rs:14:9: 16:10
+        _6 = copy _4;                    // scope 2 at lift.rs:14:15: 14:16
+        _5 = Gt(move _6, const 9_u32);   // scope 2 at lift.rs:14:15: 14:20
+        switchInt(move _5) -> [0: bb5, otherwise: bb4]; // scope 2 at lift.rs:14:15: 14:20
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb5);  // scope 2 at lift.rs:15:13: 15:19
+        _7 = SubWithOverflow(copy _4, const 1_u32); // scope 2 at lift.rs:15:13: 15:19
+        assert(!move (_7.1: bool), "attempt to compute `{} - {}`, which would overflow", copy _4, const 1_u32) -> [success: bb6, unwind continue]; // scope 2 at lift.rs:15:13: 15:19
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at lift.rs:10:13: 18:6
+        _3 = copy _4;                    // scope 2 at lift.rs:17:9: 17:10
+        goto -> bb7;                     // scope 0 at lift.rs:10:13: 18:6
+    }
+
+    bb6: {
+        _4 = move (_7.0: u32);           // scope 2 at lift.rs:15:13: 15:19
+        goto -> bb3;                     // scope 2 at lift.rs:14:9: 16:10
+    }
+
+    bb7: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at lift.rs:20:2: 20:2
+        _0 = copy _3;                    // scope 1 at lift.rs:19:5: 19:6
+        return;                          // scope 0 at lift.rs:20:2: 20:2
+    }
+}
+
+fn split(_1: bool) -> u32 {
+    debug c => _1;                       // in scope 0 at lift.rs:22:14: 22:15
+    let mut _0: u32;                     // return place in scope 0 at lift.rs:22:26: 22:29
+    let mut _2: u32;                     // in scope 0 at lift.rs:23:9: 23:14
+    let mut _4: u32;                     // in scope 0 at lift.rs:30:5: 30:6
+    let mut _5: u32;                     // in scope 0 at lift.rs:30:9: 30:10
+    let mut _6: (u32, bool);             // in scope 0 at lift.rs:30:5: 30:10
+    scope 1 {
+        debug a => _2;                   // in scope 1 at lift.rs:23:9: 23:14
+        let mut _3: u32;                 // in scope 1 at lift.rs:24:9: 24:14
+        scope 2 {
+            debug b => _3;               // in scope 2 at lift.rs:24:9: 24:14
+        }
+    }
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => lift.rs:25:8: 25:9 (#0)
+
+    coverage Code { bcb: bcb0 } => lift.rs:22:1: 22:29 (#0);
+    coverage Code { bcb: bcb0 } => lift.rs:23:17: 23:21 (#0);
+    coverage Code { bcb: bcb0 } => lift.rs:24:17: 24:21 (#0);
+    coverage Code { bcb: bcb0 } => lift.rs:25:8: 25:9 (#0);
+    coverage Code { bcb: bcb1 } => lift.rs:26:9: 26:14 (#0);
+    coverage Code { bcb: bcb3 } => lift.rs:28:9: 28:14 (#0);
+    coverage Code { bcb: bcb2 } => lift.rs:30:5: 30:10 (#0);
+    coverage Code { bcb: bcb2 } => lift.rs:31:1: 31:2 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => lift.rs:25:8: 25:9 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 2 at lift.rs:25:8: 25:9
+        _2 = const 0_u32;                // scope 0 at lift.rs:23:17: 23:21
+        _3 = const 0_u32;                // scope 1 at lift.rs:24:17: 24:21
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1]; // scope 2 at lift.rs:25:8: 25:9
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 2 at lift.rs:25:5: 29:6
+        _2 = const 5_u32;                // scope 2 at lift.rs:26:9: 26:14
+        goto -> bb3;                     // scope 2 at lift.rs:25:5: 29:6
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 2 at lift.rs:25:5: 29:6
+        _3 = const 7_u32;                // scope 2 at lift.rs:28:9: 28:14
+        goto -> bb3;                     // scope 2 at lift.rs:25:5: 29:6
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 2 at lift.rs:30:5: 30:10
+        _4 = copy _2;                    // scope 2 at lift.rs:30:5: 30:6
+        _5 = copy _3;                    // scope 2 at lift.rs:30:9: 30:10
+        _6 = AddWithOverflow(copy _4, copy _5); // scope 2 at lift.rs:30:5: 30:10
+        assert(!move (_6.1: bool), "attempt to compute `{} + {}`, which would overflow", move _4, move _5) -> [success: bb4, unwind continue]; // scope 2 at lift.rs:30:5: 30:10
+    }
+
+    bb4: {
+        _0 = move (_6.0: u32);           // scope 2 at lift.rs:30:5: 30:10
+        return;                          // scope 0 at lift.rs:31:2: 31:2
+    }
+}
+"#;
+
+    #[test]
+    fn value_arms_lift_format_simple_to_one_condition() {
+        let mir = mir::parse_text(FORMAT_SIMPLE_MIR).expect("MIR parses");
+        assert_eq!(mir.functions.len(), 2, "runtime and CTFE bodies");
+        let runtime = &mir.functions[0];
+        assert!(!runtime.is_ctfe);
+        // Arms `_3 = const 7_u8` / `_3 = const 39_u8` join at bb3.
+        assert_eq!(local_type(runtime, 3), Some("u8"));
+        assert_eq!(build_decision_from_block(0, runtime), None);
+        assert_eq!(
+            try_decompose_candidate_lifted(runtime),
+            Ok((
+                ite("upper", const_(true), const_(false)),
+                Some(Lift::ValueArms)
+            ))
+        );
+        assert_eq!(serde_json::to_value(Lift::ValueArms).unwrap(), "value_arms");
+    }
+
+    #[test]
+    fn value_arms_lift_leaves_the_ctfe_twin_declined() {
+        let mir = mir::parse_text(FORMAT_SIMPLE_MIR).expect("MIR parses");
+        let ctfe = &mir.functions[1];
+        assert!(ctfe.is_ctfe);
+        assert_eq!(ctfe.name, mir.functions[0].name);
+        assert_eq!(try_decompose_candidate(ctfe), Err(DeclineReason::CtfeBody));
+    }
+
+    #[test]
+    fn value_arms_lift_declines_a_nested_if() {
+        // Three arms (`1`, `2`, `3`): the inner `if b` is a decision
+        // of its own, so neither it nor `a` is lifted.
+        let mir = mir::parse_text(VALUE_ARM_DECLINES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "nested");
+        assert_eq!(lift_value_arms(0, f), None);
+        assert_eq!(
+            try_decompose_candidate(f),
+            Err(DeclineReason::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn value_arms_lift_declines_an_arm_that_loops() {
+        // The `else` arm runs into the `while k > 9` header, not a
+        // join with the `then` arm.
+        let mir = mir::parse_text(VALUE_ARM_DECLINES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "spin");
+        assert_eq!(lift_value_arms(0, f), None);
+        assert_eq!(
+            try_decompose_candidate(f),
+            Err(DeclineReason::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn value_arms_lift_declines_arms_writing_different_locals() {
+        // `a = 5` / `b = 7`: no common value reaches the join.
+        let mir = mir::parse_text(VALUE_ARM_DECLINES_MIR).expect("MIR parses");
+        let f = leaf_fn(&mir, "split");
+        assert_eq!(lift_value_arms(0, f), None);
+        assert_eq!(
+            try_decompose_candidate(f),
+            Err(DeclineReason::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn call_arms_lift_is_recorded() {
+        let mir = mir::parse_text(PICK_ASSERT_ARMS_MIR).expect("MIR parses");
+        let (_, lift) = try_decompose_candidate_lifted(&mir.functions[0]).expect("a candidate");
+        assert_eq!(lift, Some(Lift::CallArms));
+        assert_eq!(serde_json::to_value(Lift::CallArms).unwrap(), "call_arms");
+        // A Boolean-leaf decision carries no lift.
+        let mir = mir::parse_text(DECIDE_AND_MIR).expect("MIR parses");
+        let (_, lift) = try_decompose_candidate_lifted(&mir.functions[0]).expect("a candidate");
+        assert_eq!(lift, None);
     }
 }

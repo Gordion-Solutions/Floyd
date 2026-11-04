@@ -772,6 +772,7 @@ pub fn provenance_for(f: &MirFunction) -> crate::masking::DecisionProvenance {
         source_file: earliest.map(|s| s.file.clone()),
         line: earliest.map(|s| s.start_line),
         display_name: None,
+        lift: None,
     }
 }
 
@@ -1651,7 +1652,13 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -
             .iter()
             .find(|f| f.name.contains("east_opt"))
             .expect("function in fixture");
-        assert_eq!(decision::decompose_function(f), None);
+        // The two comparisons are its conditions (value-arm lift),
+        // and `secs` is not one.
+        let node = decision::decompose_function(f).expect("value arms lift");
+        assert_eq!(
+            crate::masking::collect_conditions(&node),
+            ["-86400 < secs", "secs < 86400"]
+        );
         // It is the `// MIR FOR CTFE` body, so it is declined as a
         // candidate before decomposition; the two runtime bodies
         // before it are not tagged.
@@ -2008,5 +2015,146 @@ fn <impl at src/lib.rs:699:1: 699:22>::yes(_1: &IncrementCounter) -> bool {
         assert_eq!(nm.reason, NotMeasurableReason::NoBranchRegion);
         assert!(nm.detail.ends_with("never entered"), "{}", nm.detail);
         assert!(!c.entered);
+    }
+
+    /// The runtime body of chrono's `const fn FixedOffset::east_opt`
+    /// (`if -86_400 < secs && secs < 86_400 { Some(..) } else { None
+    /// }`), from the same compilation as [`CHRONO_MIR`], comment
+    /// lines stripped.
+    const EAST_OPT_RUNTIME_MIR: &str = r#"
+fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -> Option<offset::fixed::FixedOffset> {
+    debug secs => _1;                    // in scope 0 at src/offset/fixed.rs:62:27: 62:31
+    let mut _0: std::option::Option<offset::fixed::FixedOffset>; // return place in scope 0 at src/offset/fixed.rs:62:41: 62:60
+    let mut _2: bool;                    // in scope 0 at src/offset/fixed.rs:63:12: 63:26
+    let mut _3: bool;                    // in scope 0 at src/offset/fixed.rs:63:30: 63:43
+    let mut _4: offset::fixed::FixedOffset; // in scope 0 at src/offset/fixed.rs:64:18: 64:55
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/offset/fixed.rs:63:12: 63:26 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/offset/fixed.rs:63:30: 63:43 (#0)
+
+    coverage Code { bcb: bcb0 } => src/offset/fixed.rs:62:5: 62:60 (#0);
+    coverage Code { bcb: bcb0 } => src/offset/fixed.rs:63:12: 63:26 (#0);
+    coverage Code { bcb: bcb1 } => src/offset/fixed.rs:63:30: 63:43 (#0);
+    coverage Code { bcb: bcb2 } => src/offset/fixed.rs:64:13: 64:56 (#0);
+    coverage Code { bcb: bcb5 } => src/offset/fixed.rs:66:13: 66:17 (#0);
+    coverage Code { bcb: bcb3 } => src/offset/fixed.rs:68:5: 68:6 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb6 } => src/offset/fixed.rs:63:12: 63:26 (#0);
+    coverage Branch { true_bcb: bcb2, false_bcb: bcb4 } => src/offset/fixed.rs:63:30: 63:43 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/offset/fixed.rs:63:12: 63:26
+        _2 = Lt(const -86400_i32, copy _1); // scope 0 at src/offset/fixed.rs:63:12: 63:26
+        switchInt(move _2) -> [0: bb2, otherwise: bb1]; // scope 0 at src/offset/fixed.rs:63:12: 63:26
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/offset/fixed.rs:63:30: 63:43
+        _3 = Lt(copy _1, const 86400_i32); // scope 0 at src/offset/fixed.rs:63:30: 63:43
+        switchInt(move _3) -> [0: bb4, otherwise: bb3]; // scope 0 at src/offset/fixed.rs:63:30: 63:43
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb6);  // scope 0 at no-location
+        goto -> bb5;                     // scope 0 at no-location
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/offset/fixed.rs:63:9: 67:10
+        _4 = offset::fixed::FixedOffset { local_minus_utc: copy _1 }; // scope 0 at src/offset/fixed.rs:64:18: 64:55
+        _0 = Option::<offset::fixed::FixedOffset>::Some(move _4); // scope 0 at src/offset/fixed.rs:64:13: 64:56
+        goto -> bb6;                     // scope 0 at src/offset/fixed.rs:63:9: 67:10
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at no-location
+        goto -> bb5;                     // scope 0 at no-location
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/offset/fixed.rs:63:9: 67:10
+        _0 = Option::<offset::fixed::FixedOffset>::None; // scope 0 at src/offset/fixed.rs:66:13: 66:17
+        goto -> bb6;                     // scope 0 at src/offset/fixed.rs:63:9: 67:10
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/offset/fixed.rs:68:6: 68:6
+        return;                          // scope 0 at src/offset/fixed.rs:68:6: 68:6
+    }
+}
+"#;
+
+    /// `east_opt`'s whole-suite record from chrono's `llvm-cov
+    /// export`: branch regions at both condition spans.
+    const EAST_OPT_SUITE_RECORD: &str = r#"{"branches": [[63, 12, 63, 26, 2338, 1, 0, 0, 4], [63, 30, 63, 43, 2337, 1, 0, 0, 4]], "count": 2339, "filenames": ["/home/ubuntu/work/verify-span/chrono/src-copy/src/offset/fixed.rs"], "mcdc_records": [], "name": "_RNvMNtNtCseI4Ere5mNTx_6chrono6offset5fixedNtB2_11FixedOffset8east_opt", "regions": [[62, 5, 62, 60, 2339, 0, 0, 0], [63, 12, 63, 26, 2339, 0, 0, 0], [63, 30, 63, 43, 2338, 0, 0, 0], [64, 13, 64, 56, 2337, 0, 0, 0], [66, 13, 66, 17, 2, 0, 0, 0], [68, 5, 68, 6, 2339, 0, 0, 0]]}"#;
+
+    /// [`EAST_OPT_SUITE_RECORD`] for one call, with the two
+    /// conditions' `(true, false)` counters substitutable.
+    fn east_opt_record(a: (u64, u64), b: (u64, u64)) -> String {
+        EAST_OPT_SUITE_RECORD
+            .replace(
+                "[[63, 12, 63, 26, 2338, 1, 0, 0, 4], [63, 30, 63, 43, 2337, 1, 0, 0, 4]]",
+                &format!(
+                    "[[63, 12, 63, 26, {}, {}, 0, 0, 4], [63, 30, 63, 43, {}, {}, 0, 0, 4]]",
+                    a.0, a.1, b.0, b.1
+                ),
+            )
+            .replace("2339", "1")
+    }
+
+    #[test]
+    fn value_arm_chain_joins_both_conditions_by_span() {
+        let mir = mir::parse_text(EAST_OPT_RUNTIME_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        assert!(!f.is_ctfe);
+        let (node, lift) = decision::try_decompose_candidate_lifted(f).expect("a candidate");
+        assert_eq!(lift, Some(decision::Lift::ValueArms));
+        assert_eq!(
+            crate::masking::collect_conditions(&node),
+            ["-86400 < secs", "secs < 86400"]
+        );
+        let tree = DecisionTree {
+            decisions: vec![node],
+        };
+        let paths = chrono_paths();
+        let prepared = prepare_mir(&mir, &paths);
+        let tests = vec![
+            (
+                "suite".to_string(),
+                CoverageIndex::build(&export(&[EAST_OPT_SUITE_RECORD]), &paths),
+            ),
+            (
+                "in_range".to_string(),
+                CoverageIndex::build(&export(&[&east_opt_record((1, 0), (1, 0))]), &paths),
+            ),
+            (
+                "too_low".to_string(),
+                CoverageIndex::build(&export(&[&east_opt_record((0, 1), (0, 0))]), &paths),
+            ),
+            (
+                "too_high".to_string(),
+                CoverageIndex::build(&export(&[&east_opt_record((1, 0), (0, 1))]), &paths),
+            ),
+        ];
+        let c = join_candidate(&prepared, 0, &tree, &tests);
+        assert_eq!(c.status, CoverageStatus::Invoked);
+        assert!(c.conditions_without_branch_region.is_empty());
+        assert_eq!(
+            c.display_name.as_deref(),
+            Some("<chrono::offset::fixed::FixedOffset>::east_opt")
+        );
+        // The suite's totals mix 2339 evaluations of two conditions:
+        // ambiguous. Each single-call test yields its vector, and
+        // the arm taken is the outcome.
+        assert_eq!(c.observations.len(), 4);
+        assert!(c.observations[0].ambiguous);
+        let results: Vec<Option<bool>> = c.observations[1..].iter().map(|o| o.result).collect();
+        assert_eq!(results, [Some(true), Some(false), Some(false)]);
+        assert_eq!(
+            c.observations[3].inputs,
+            BTreeMap::from([
+                ("-86400 < secs".to_string(), true),
+                ("secs < 86400".to_string(), false)
+            ])
+        );
     }
 }
