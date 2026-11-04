@@ -1128,13 +1128,25 @@ fn parse_fn_header(line: &str) -> Option<MirFunction> {
     })
 }
 
+/// Is the `>` at byte `i` of `s` the head of a `->` arrow (the return
+/// type of a fn pointer, `impl Fn..`, `dyn Fn..` or `for<'a> fn..`
+/// type) rather than a closing angle bracket? `>>`, `>=`, `<<` and
+/// `<=` need no such care: in a type, `>>` is two closing brackets
+/// (`Vec<Vec<u8>>`) and `<<` two opening ones (`<<T as A>::B as C>`),
+/// and comparisons never appear in a type.
+fn is_arrow_head(s: &str, i: usize) -> bool {
+    s[..i].ends_with('-')
+}
+
 /// Find the matching closing bracket for an open bracket that is
 /// considered to sit just before `s`. Returns the index inside `s` of
-/// the matching close. Honours nested `()`, `<>`, `[]` and `{}`.
+/// the matching close. Honours nested `()`, `<>`, `[]` and `{}`; the
+/// `>` of a `->` arrow is not a bracket.
 fn find_matching_close(s: &str, open: char, close: char) -> Option<usize> {
     let mut depth: i32 = 1;
     for (i, c) in s.char_indices() {
         match c {
+            '>' if is_arrow_head(s, i) => {}
             c if c == open => depth += 1,
             c if c == close => {
                 depth -= 1;
@@ -1151,13 +1163,15 @@ fn find_matching_close(s: &str, open: char, close: char) -> Option<usize> {
 }
 
 /// Split `s` on `sep` at top level — i.e. ignoring separators that
-/// appear inside balanced `()`, `<>`, `[]` or `{}`.
+/// appear inside balanced `()`, `<>`, `[]` or `{}`. The `>` of a `->`
+/// arrow is not a bracket.
 fn split_top_level(s: &str, sep: char) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth: i32 = 0;
     let mut start = 0;
     for (i, c) in s.char_indices() {
         match c {
+            '>' if is_arrow_head(s, i) => {}
             '(' | '<' | '[' | '{' => depth += 1,
             ')' | '>' | ']' | '}' => depth -= 1,
             x if x == sep && depth == 0 => {
@@ -2831,6 +2845,67 @@ fn decide(_1: i32, _2: i32) -> bool {
         assert_eq!(f.args[0].local, 1);
         assert_eq!(f.args[0].ty, "Result<bool, ()>");
         assert_eq!(f.return_ty, "bool");
+    }
+
+    /// Real headers from base64 (`decode_helper`, `encode_helper`,
+    /// `do_roundtrip_test`) whose argument types carry a `->` return
+    /// type: the `>` of the arrow was taken as a closing angle
+    /// bracket, so the args list never balanced and the function was
+    /// reported as unrecognised.
+    #[test]
+    fn fn_header_with_arrow_in_impl_fn_arg() {
+        let cases: &[(&str, &str, &[&str], &str)] = &[
+            (
+                "fn decode_helper(_1: &[u8], _7: DecodePaddingMode, _8: impl FnOnce(&[u8], usize, &mut [u8]) -> (usize, usize)) -> Result<DecodeMetadata, decode::DecodeSliceError> {",
+                "decode_helper",
+                &["&[u8]", "DecodePaddingMode", "impl FnOnce(&[u8], usize, &mut [u8]) -> (usize, usize)"],
+                "Result<DecodeMetadata, decode::DecodeSliceError>",
+            ),
+            (
+                "fn encode_helper(_1: &[u8; 64], _4: impl FnOnce(&[u8], &mut [u8]) -> (usize, usize)) -> usize {",
+                "encode_helper",
+                &["&[u8; 64]", "impl FnOnce(&[u8], &mut [u8]) -> (usize, usize)"],
+                "usize",
+            ),
+            (
+                "fn do_roundtrip_test(_1: impl Fn(&mut rngs::SmallRng) -> E::Engine) -> () {",
+                "do_roundtrip_test",
+                &["impl Fn(&mut rngs::SmallRng) -> E::Engine"],
+                "()",
+            ),
+        ];
+        for (header, name, arg_tys, ret) in cases {
+            let src = format!("{header}\n    bb0: {{ return; }}\n}}\n");
+            let mir = parse_text(&src).expect("parse ok");
+            assert!(mir.parse_problems().is_empty(), "{header}");
+            assert_eq!(mir.functions.len(), 1, "{header}");
+            let f = &mir.functions[0];
+            assert_eq!(f.name, *name);
+            let tys: Vec<&str> = f.args.iter().map(|a| a.ty.as_str()).collect();
+            assert_eq!(tys, *arg_tys);
+            assert_eq!(f.return_ty, *ret);
+        }
+    }
+
+    /// Fn pointer, `for<'a>` binder and `dyn Fn` argument types, and
+    /// an arrow inside generic args, next to nested `>>` closes.
+    #[test]
+    fn fn_header_with_fn_pointer_dyn_and_binder_arg_types() {
+        let src = "fn f(_1: for<'a> fn(&'a str) -> Result<&'a str, ()>, _2: &dyn Fn(u8) -> Option<Vec<u8>>, _3: Box<dyn FnMut(&mut [u8]) -> usize + Send>, _4: Option<fn() -> u8>) -> for<'b> fn(&'b u8) -> &'b u8 {\n    bb0: { return; }\n}\n";
+        let mir = parse_text(src).expect("parse ok");
+        assert!(mir.parse_problems().is_empty());
+        let f = &mir.functions[0];
+        let tys: Vec<&str> = f.args.iter().map(|a| a.ty.as_str()).collect();
+        assert_eq!(
+            tys,
+            [
+                "for<'a> fn(&'a str) -> Result<&'a str, ()>",
+                "&dyn Fn(u8) -> Option<Vec<u8>>",
+                "Box<dyn FnMut(&mut [u8]) -> usize + Send>",
+                "Option<fn() -> u8>",
+            ]
+        );
+        assert_eq!(f.return_ty, "for<'b> fn(&'b u8) -> &'b u8");
     }
 
     #[test]
