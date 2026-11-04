@@ -198,6 +198,8 @@ mod tests {
             provenance: None,
             ambiguous_observations: ambiguous,
             ruled_out: Default::default(),
+            missing_rows: Default::default(),
+            suggested_pairs: Default::default(),
         }
     }
 

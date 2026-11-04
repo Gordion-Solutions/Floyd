@@ -1971,15 +1971,8 @@ fn print_runtime_report_body(
                 println!("  ? {cond}: {}", unknown_reason(tests, observations));
             }
             Some(ConditionStatus::Unexercised) | None => {
-                let missing = analysis
-                    .matrix
-                    .independence_pairs
-                    .get(cond)
-                    .and_then(|pairs| pairs.first());
-                if let Some(p) = missing {
-                    let t1 = format_inputs(&analysis.matrix.conditions, &p.test_1);
-                    let t2 = format_inputs(&analysis.matrix.conditions, &p.test_2);
-                    println!("  ✗ {cond}: UNEXERCISED — needs a test exercising ({t1}) or ({t2})",);
+                if let Some(needs) = missing_rows_text(analysis, cond) {
+                    println!("  ✗ {cond}: UNEXERCISED — {needs}");
                 } else {
                     println!("  ✗ {cond}: UNEXERCISED (no valid pair available)");
                 }
@@ -2051,6 +2044,49 @@ fn ruled_out_note(analysis: &RuntimeAnalysis, cond: &str) -> Option<String> {
             .len(),
         summary::cap_tests(&labels, str::to_string)
     ))
+}
+
+/// What an unexercised condition still needs, from
+/// [`RuntimeAnalysis::missing_rows`]: both rows of an independence
+/// pair are required, so name the rows no test covers, and when one
+/// row of the pair is already covered, say which:
+///
+/// - `needs a test where (a=T, b=F) -> F [the matching row (a=T, b=T)
+///   -> T is already covered]`
+/// - `needs tests for both (a=T, b=F) -> F and (a=T, b=T) -> T`
+///
+/// `None` when the condition has no pair whose two rows both evaluate
+/// it.
+fn missing_rows_text(analysis: &RuntimeAnalysis, cond: &str) -> Option<String> {
+    let conditions = &analysis.matrix.conditions;
+    let row = |r: &TruthTableRow| {
+        format!(
+            "({}) -> {}",
+            format_inputs(conditions, r),
+            bool_glyph(r.result)
+        )
+    };
+    match analysis.missing_rows.get(cond)?.as_slice() {
+        [] => None,
+        [missing] => {
+            let covered = analysis
+                .suggested_pairs
+                .get(cond)
+                .and_then(|p| [&p.test_1, &p.test_2].into_iter().find(|r| *r != missing));
+            Some(match covered {
+                Some(c) => format!(
+                    "needs a test where {} [the matching row {} is already covered]",
+                    row(missing),
+                    row(c)
+                ),
+                None => format!("needs a test where {}", row(missing)),
+            })
+        }
+        rows => Some(format!(
+            "needs tests for both {}",
+            rows.iter().map(row).collect::<Vec<_>>().join(" and ")
+        )),
+    }
 }
 
 /// `evaluated 256x: c1=224T/32F  c2=95T/129F` for an ambiguous
@@ -2287,20 +2323,7 @@ fn render_runtime_junit(source: &str, analysis: &RuntimeAnalysis, not_measurable
             ),
             Some(ConditionStatus::Unexercised) | None => (
                 "UnexercisedCondition",
-                analysis
-                    .matrix
-                    .independence_pairs
-                    .get(cond.as_str())
-                    .and_then(|pairs| pairs.first())
-                    .map(|p| {
-                        let t1 = format_inputs(conditions, &p.test_1);
-                        let t2 = format_inputs(conditions, &p.test_2);
-                        format!(
-                            "needs a test exercising ({t1}) -> {} or ({t2}) -> {}",
-                            bool_glyph(p.test_1.result),
-                            bool_glyph(p.test_2.result),
-                        )
-                    })
+                missing_rows_text(analysis, cond)
                     .map(|needs| match ruled_out_note(analysis, cond) {
                         Some(note) => format!("{needs}; {note}"),
                         None => needs,
@@ -2808,6 +2831,56 @@ mod tests {
         assert_eq!(r["counts"]["true_count"], 0);
         assert_eq!(r["counts"]["false_count"], 8);
         assert_eq!(v["condition_status"]["b == 10"], "Unexercised");
+    }
+
+    fn and_tree() -> floyd::DecisionTree {
+        floyd::DecisionTree {
+            decisions: vec![decision::Node::Ite {
+                cond: "a".to_string(),
+                then_branch: Box::new(decision::Node::Condition {
+                    name: "b".to_string(),
+                }),
+                else_branch: Box::new(decision::Node::Const { value: false }),
+            }],
+        }
+    }
+
+    #[test]
+    fn unexercised_text_names_the_missing_row_and_the_covered_one() {
+        let tt = ConditionObservation::vector(
+            Some("t_tt".to_string()),
+            [("a".to_string(), true), ("b".to_string(), true)]
+                .into_iter()
+                .collect(),
+            true,
+        );
+        let analysis = masking::analyze_with_runtime(&and_tree(), &[tt], Variant::Masking);
+        assert_eq!(
+            missing_rows_text(&analysis, "b").as_deref(),
+            Some(
+                "needs a test where (a=T, b=F) -> F \
+                 [the matching row (a=T, b=T) -> T is already covered]"
+            )
+        );
+        let xml = render_runtime_junit("lib.rs", &analysis, 0);
+        assert!(
+            xml.contains(
+                "needs a test where (a=T, b=F) -&gt; F [the matching row (a=T, b=T) -&gt; T \
+                 is already covered]"
+            ),
+            "{xml}"
+        );
+        assert!(!xml.contains(" or ("), "{xml}");
+    }
+
+    #[test]
+    fn unexercised_text_asks_for_both_rows_when_neither_is_covered() {
+        let analysis = masking::analyze_with_runtime(&and_tree(), &[], Variant::Masking);
+        assert_eq!(
+            missing_rows_text(&analysis, "b").as_deref(),
+            Some("needs tests for both (a=T, b=F) -> F and (a=T, b=T) -> T")
+        );
+        assert!(missing_rows_text(&analysis, "c").is_none());
     }
 
     #[test]

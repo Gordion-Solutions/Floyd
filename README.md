@@ -232,6 +232,19 @@ and the report says why with the counters, for example
 `test_whitespace (9 evaluations) never took b == 10=T (0T/8F)`
 (text and JUnit; `ruled_out` in the JSON analysis).
 
+An independence pair needs both of its rows, so for an unexercised
+condition the report names the rows still missing from one pair
+whose two rows both evaluate the condition (the pair with the fewest
+missing rows), and says when the other row is already covered:
+
+```text
+  ✗ b: UNEXERCISED — needs a test where (a=T, b=F) -> F [the matching row (a=T, b=T) -> T is already covered]
+  ✗ b: UNEXERCISED — needs tests for both (a=T, b=F) -> F and (a=T, b=T) -> T
+```
+
+The JUnit failure message says the same; the JSON analysis lists the
+missing rows per condition under `missing_rows`.
+
 Floyd does not state a percentage it cannot stand behind. With no
 unknown conditions the summary line is unchanged
 (`MC/DC coverage: 2 of 3 conditions exercised (67%)`); with any

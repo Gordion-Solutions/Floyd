@@ -297,7 +297,8 @@ pub struct RuntimeAnalysis {
     pub ambiguous_observations: usize,
     /// For each [`ConditionStatus::Unexercised`] condition that some
     /// ambiguous observation evaluated: why each such test cannot
-    /// hold a row the condition's first independence pair is missing
+    /// hold a row the condition's suggested independence pair (the
+    /// one [`Self::missing_rows`] is taken from) is missing
     /// (the counter of an outcome that row needs is zero in that
     /// test). Lets reports say the condition is unexercised *with
     /// the counts*, rather than leave the reader to wonder why an
@@ -305,6 +306,21 @@ pub struct RuntimeAnalysis {
     /// ambiguous test evaluated.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ruled_out: BTreeMap<String, Vec<RuledOut>>,
+    /// For each [`ConditionStatus::Unexercised`] condition with an
+    /// independence pair whose two rows both evaluate it: the rows of
+    /// that pair no condition vector covers, i.e. the tests still to
+    /// write. The pair is the one with the fewest uncovered rows
+    /// (the first such pair on a tie), so a condition whose pair is
+    /// half covered names the one row it still needs. Absent for
+    /// conditions with no such pair.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub missing_rows: BTreeMap<String, Vec<TruthTableRow>>,
+    /// The independence pair [`Self::missing_rows`] was taken from,
+    /// per condition, so a report can name the row that is already
+    /// covered alongside the missing one. Not serialized: the JSON
+    /// report carries `missing_rows` only.
+    #[serde(skip)]
+    pub suggested_pairs: BTreeMap<String, IndependencePair>,
 }
 
 /// Why one ambiguous observation cannot hold one missing row of an
@@ -358,13 +374,19 @@ pub fn analyze_with_runtime(
         observations.iter().partition(|o| o.ambiguous);
     let mut condition_status = BTreeMap::new();
     let mut ruled_out = BTreeMap::new();
+    let mut missing_rows = BTreeMap::new();
+    let mut suggested_pairs = BTreeMap::new();
     if let Some(decision) = tree.decisions.first() {
         for (cond, pairs) in &matrix.independence_pairs {
-            let (status, why) = classify_condition(cond, pairs, decision, &vectors, &ambiguous);
-            if !why.is_empty() {
-                ruled_out.insert(cond.clone(), why);
+            let c = classify_condition(cond, pairs, decision, &vectors, &ambiguous);
+            if !c.ruled_out.is_empty() {
+                ruled_out.insert(cond.clone(), c.ruled_out);
             }
-            condition_status.insert(cond.clone(), status);
+            if let Some((pair, missing)) = c.missing {
+                missing_rows.insert(cond.clone(), missing);
+                suggested_pairs.insert(cond.clone(), pair);
+            }
+            condition_status.insert(cond.clone(), c.status);
         }
     }
     RuntimeAnalysis {
@@ -373,7 +395,19 @@ pub fn analyze_with_runtime(
         provenance: None,
         ambiguous_observations: ambiguous.len(),
         ruled_out,
+        missing_rows,
+        suggested_pairs,
     }
+}
+
+/// What [`classify_condition`] found for one condition.
+struct Classified {
+    status: ConditionStatus,
+    /// See [`RuntimeAnalysis::ruled_out`].
+    ruled_out: Vec<RuledOut>,
+    /// For an unexercised condition, the suggested pair and its
+    /// uncovered rows; see [`RuntimeAnalysis::missing_rows`].
+    missing: Option<(IndependencePair, Vec<TruthTableRow>)>,
 }
 
 /// Classify one condition, and for an unexercised one that an
@@ -406,7 +440,7 @@ fn classify_condition(
     decision: &Node,
     observations: &[&ConditionObservation],
     ambiguous: &[&ConditionObservation],
-) -> (ConditionStatus, Vec<RuledOut>) {
+) -> Classified {
     let evaluates = |row: &TruthTableRow| {
         evaluation_path(decision, &row.inputs)
             .is_some_and(|path| path.iter().any(|(c, _)| c == cond))
@@ -422,7 +456,11 @@ fn classify_condition(
     };
     for pair in &pairs {
         if covered(&pair.test_1) && covered(&pair.test_2) {
-            return (ConditionStatus::Exercised((*pair).clone()), Vec::new());
+            return Classified {
+                status: ConditionStatus::Exercised((*pair).clone()),
+                ruled_out: Vec::new(),
+                missing: None,
+            };
         }
     }
     let mut takers: BTreeSet<usize> = BTreeSet::new();
@@ -447,10 +485,18 @@ fn classify_condition(
             .into_iter()
             .map(|i| test_label(ambiguous[i]))
             .collect();
-        return (ConditionStatus::Ambiguous { tests }, Vec::new());
+        return Classified {
+            status: ConditionStatus::Ambiguous { tests },
+            ruled_out: Vec::new(),
+            missing: None,
+        };
     }
-    let why = pairs
-        .first()
+    // The pair to ask for: the one with the fewest rows still to
+    // cover, the first such pair on a tie.
+    let suggested = pairs
+        .iter()
+        .min_by_key(|p| usize::from(!covered(&p.test_1)) + usize::from(!covered(&p.test_2)));
+    let why = suggested
         .map(|pair| {
             [&pair.test_1, &pair.test_2]
                 .into_iter()
@@ -464,7 +510,19 @@ fn classify_condition(
                 .collect()
         })
         .unwrap_or_default();
-    (ConditionStatus::Unexercised, why)
+    let missing = suggested.map(|pair| {
+        let rows = [&pair.test_1, &pair.test_2]
+            .into_iter()
+            .filter(|row| !covered(row))
+            .cloned()
+            .collect();
+        ((*pair).clone(), rows)
+    });
+    Classified {
+        status: ConditionStatus::Unexercised,
+        ruled_out: why,
+        missing,
+    }
 }
 
 fn test_label(o: &ConditionObservation) -> String {
@@ -1388,6 +1446,18 @@ mod tests {
             r.condition_status["nano >= 2000000000"],
             ConditionStatus::Unexercised
         ));
+        // The rows asked for come from a pair that evaluates n2 in
+        // both rows, never from the short-circuited one.
+        let n2 = "nano >= 2000000000";
+        let pair = &r.suggested_pairs[n2];
+        for row in [&pair.test_1, &pair.test_2] {
+            let path = evaluation_path(&tree.decisions[0], &row.inputs).unwrap();
+            assert!(path.iter().any(|(c, _)| c == n2), "{row:?}");
+        }
+        assert!(!r.missing_rows[n2].is_empty());
+        for row in &r.missing_rows[n2] {
+            assert!(row == &pair.test_1 || row == &pair.test_2);
+        }
         // The pairs that do evaluate n1 and s59 are still found.
         for c in ["nano >= 1000000000", "sec != 59"] {
             assert!(
@@ -1478,6 +1548,55 @@ mod tests {
     }
 
     #[test]
+    fn missing_rows_name_only_the_rows_no_test_covers() {
+        // `a && b` with only (T,T) -> T observed: each condition's
+        // pair is half covered, so one row is missing for each, and
+        // the pair chosen is one that contains the covered row.
+        let tree = and_tree();
+        let r = analyze_with_runtime(
+            &tree,
+            &[obs("t_tt", &[("a", true), ("b", true)], true)],
+            Variant::Masking,
+        );
+        let row = |a: bool, b: bool, result: bool| TruthTableRow {
+            inputs: [("a".to_string(), a), ("b".to_string(), b)]
+                .into_iter()
+                .collect(),
+            result,
+        };
+        assert_eq!(r.missing_rows["b"], vec![row(true, false, false)]);
+        assert_eq!(r.missing_rows["a"].len(), 1);
+        assert!(!r.missing_rows["a"][0].inputs["a"]);
+        for c in ["a", "b"] {
+            let p = &r.suggested_pairs[c];
+            assert!(p.test_1 == row(true, true, true) || p.test_2 == row(true, true, true));
+        }
+
+        // Nothing observed: both rows of the first pair are missing.
+        let r = analyze_with_runtime(&tree, &[], Variant::Masking);
+        assert_eq!(
+            r.missing_rows["b"],
+            vec![row(true, false, false), row(true, true, true)]
+        );
+
+        // Exercised conditions have no missing rows; the JSON carries
+        // `missing_rows` but not the suggested pairs.
+        let r = analyze_with_runtime(
+            &tree,
+            &[
+                obs("t_tt", &[("a", true), ("b", true)], true),
+                obs("t_tf", &[("a", true), ("b", false)], false),
+            ],
+            Variant::Masking,
+        );
+        assert!(!r.missing_rows.contains_key("b"));
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["missing_rows"]["a"][0]["inputs"]["a"], false);
+        assert_eq!(v["missing_rows"]["a"][0]["result"], false);
+        assert!(v.get("suggested_pairs").is_none());
+    }
+
+    #[test]
     fn runtime_analysis_json_round_trip() {
         // The public types derive Deserialize alongside Serialize so
         // downstream tools (reporters, dashboards, qualification kits)
@@ -1527,6 +1646,8 @@ mod tests {
             }),
             ambiguous_observations: 0,
             ruled_out: BTreeMap::new(),
+            missing_rows: BTreeMap::new(),
+            suggested_pairs: BTreeMap::new(),
         };
         let json = serde_json::to_string(&analysis).expect("serialize");
         assert!(json.contains("\"provenance\""));
@@ -1552,6 +1673,8 @@ mod tests {
             provenance: None,
             ambiguous_observations: 0,
             ruled_out: BTreeMap::new(),
+            missing_rows: BTreeMap::new(),
+            suggested_pairs: BTreeMap::new(),
         };
         let json = serde_json::to_string(&analysis).expect("serialize");
         assert!(
