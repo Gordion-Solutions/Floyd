@@ -267,6 +267,25 @@ upload floyd-mcdc.xml`).
 | `--features=<list>`, `-F <list>` | Enable cargo features for the instrumented `cargo build --tests` (repeatable; comma- or space-separated, as for cargo). |
 | `--all-features`, `--no-default-features` | Passed to the instrumented build, as for `cargo test`. Crates whose test suite expects `cargo test --all-features` (such as `time`) need it. |
 
+### Errors
+
+When the run stops before an analysis, the exit code is 1 and every
+format still reports why:
+
+- **Build failure**: cargo's stderr is printed.
+- **Test discovery or a test run failing** (`<binary> --list`, or a
+  test producing no coverage data): the binary's stderr is printed.
+
+`--format=json` prints the usual report with `verdict` set to
+`build_failed`, `test_discovery_failed`, `test_run_failed` or
+`setup_failed` (llvm-tools missing), `summary.percentage` `null`, an
+`error` object (`stage`, `message`, `stderr`),
+and whatever was collected before the failure (`tests_discovered`,
+`out_of_scope`, `skipped_no_harness`, `skipped_oversize_mirs`).
+`error` is `null` on the other verdicts. `--format=junit` prints a
+document with one `<testcase>` carrying an `<error>` whose `type` is
+the verdict.
+
 ### Exit codes
 
 | Code | Meaning |
