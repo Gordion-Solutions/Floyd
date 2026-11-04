@@ -181,6 +181,12 @@ observation**: `--format=json` marks it `"ambiguous": true` with its
 lists it as `AMBIGUOUS`, and it is excluded from independence-pair
 finding.
 
+A pair counts only through vectors that evaluated the condition
+under test. Under masking, the truth table also pairs rows where the
+condition is short-circuited in one of them (the outcome flips
+because other, masked conditions differ); such a row cannot show the
+condition's effect, so those pairs are never credited.
+
 A condition that no pair of condition vectors demonstrates is
 `UNKNOWN` only if ambiguous tests could have completed one of its
 independence pairs: each pair row that no vector covers must be

@@ -365,6 +365,13 @@ pub fn analyze_with_runtime(
 /// This is the decision-level check too: a row's outcome is fixed by
 /// its path, so a row that is possible in a test is one whose path,
 /// and therefore outcome, the test's counters allow.
+///
+/// Only pairs whose two rows both *evaluate* `cond` (it is on both
+/// rows' evaluation paths) are considered, and a vector covers a row
+/// only if it evaluated `cond`. Under masking, the truth table also
+/// admits pairs where `cond` is short-circuited in one row (the
+/// outcome flips because of other, masked conditions); no test can
+/// show `cond`'s effect through a row that never evaluates it.
 fn classify_condition(
     cond: &str,
     pairs: &[IndependencePair],
@@ -372,14 +379,26 @@ fn classify_condition(
     observations: &[&ConditionObservation],
     ambiguous: &[&ConditionObservation],
 ) -> (ConditionStatus, Vec<RuledOut>) {
-    let covered = |row: &TruthTableRow| observations.iter().any(|o| observation_covers_row(o, row));
-    for pair in pairs {
+    let evaluates = |row: &TruthTableRow| {
+        evaluation_path(decision, &row.inputs)
+            .is_some_and(|path| path.iter().any(|(c, _)| c == cond))
+    };
+    let pairs: Vec<&IndependencePair> = pairs
+        .iter()
+        .filter(|p| evaluates(&p.test_1) && evaluates(&p.test_2))
+        .collect();
+    let covered = |row: &TruthTableRow| {
+        observations
+            .iter()
+            .any(|o| o.inputs.contains_key(cond) && observation_covers_row(o, row))
+    };
+    for pair in &pairs {
         if covered(&pair.test_1) && covered(&pair.test_2) {
-            return (ConditionStatus::Exercised(pair.clone()), Vec::new());
+            return (ConditionStatus::Exercised((*pair).clone()), Vec::new());
         }
     }
     let mut takers: BTreeSet<usize> = BTreeSet::new();
-    for pair in pairs {
+    for pair in &pairs {
         let mut pair_takers = Vec::new();
         let completable = [&pair.test_1, &pair.test_2]
             .into_iter()
@@ -1284,6 +1303,69 @@ mod tests {
                 assert_eq!(tests, &vec!["loop_a".to_string(), "loop_b".to_string()])
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_row_that_short_circuits_the_condition_never_demonstrates_it() {
+        // chrono: the masking truth table pairs `nano >= 2000000000`
+        // via (n1 F, s59 F, n2 F) -> F vs (n1 T, s59 T, n2 T) -> T,
+        // where n2 is masked by n1 and s59 differing too. A test that
+        // evaluated (n1 T, s59 T) -> T never evaluated n2, so it
+        // cannot show n2's effect. With the multi-evaluation tests
+        // that did take n2 = T kept ambiguous, n2 is unknown, not
+        // exercised.
+        let tree = chrono_tree();
+        let f = false;
+        let t = true;
+        let obs_list = [
+            obs("plain", &chrono_row(f, f, f, Some(f), None, Some(f)), false),
+            obs("leap_t", &chrono_row(f, f, f, Some(t), Some(t), None), true),
+            obs(
+                "leap_f",
+                &chrono_row(f, f, f, Some(t), Some(f), Some(f)),
+                false,
+            ),
+            ambiguous_obs(
+                "naive::time::tests::test_time_from_hms_milli",
+                7,
+                &[
+                    ("hour >= 24", 0, 7),
+                    ("min >= 60", 0, 7),
+                    ("sec >= 60", 0, 7),
+                    ("nano >= 1000000000", 3, 4),
+                    ("sec != 59", 0, 3),
+                    ("nano >= 2000000000", 1, 6),
+                ],
+            ),
+        ];
+        let matrix = analyze_with_variant(&tree, Variant::Masking);
+        assert!(
+            matrix.independence_pairs["nano >= 2000000000"]
+                .iter()
+                .any(|p| p.test_2.inputs["sec != 59"] && p.test_2.inputs["nano >= 1000000000"]),
+            "the truth table admits the short-circuited pair"
+        );
+        let r = analyze_with_runtime(&tree, &obs_list, Variant::Masking);
+        match &r.condition_status["nano >= 2000000000"] {
+            ConditionStatus::Ambiguous { tests } => assert_eq!(
+                tests,
+                &vec!["naive::time::tests::test_time_from_hms_milli".to_string()]
+            ),
+            other => panic!("{other:?}"),
+        }
+        // Without the ambiguous test, nothing ever took n2 = T.
+        let r = analyze_with_runtime(&tree, &obs_list[..3], Variant::Masking);
+        assert!(matches!(
+            r.condition_status["nano >= 2000000000"],
+            ConditionStatus::Unexercised
+        ));
+        // The pairs that do evaluate n1 and s59 are still found.
+        for c in ["nano >= 1000000000", "sec != 59"] {
+            assert!(
+                matches!(r.condition_status[c], ConditionStatus::Exercised(_)),
+                "{c}"
+            );
         }
     }
 
