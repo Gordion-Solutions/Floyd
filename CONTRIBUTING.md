@@ -73,11 +73,18 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
 ```
 
 If your change touches the runtime pipeline, also run the gated
-end-to-end test (requires nightly + `llvm-tools-preview`):
+end-to-end tests (requires nightly + `llvm-tools-preview`):
 
 ```sh
-cargo test --test end_to_end_001 -- --ignored
+cargo test --workspace -- --ignored
 ```
+
+This includes `cargo-floyd/tests/fixture_cases.rs`, which runs
+`cargo floyd test` on `fixtures/mcdc-cases` and checks the outcome
+of every function there. When you fix a new class of engine bug,
+add a small function reproducing it to the matching module of the
+fixture (documenting the expected outcome) and its expectation to
+`EXPECTED` in that test.
 
 If your change adds a corpus pattern, the
 [CI corpus-check job](.github/workflows/ci.yml) validates the
