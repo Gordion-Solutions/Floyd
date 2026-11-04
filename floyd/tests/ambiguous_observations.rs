@@ -3,16 +3,22 @@
 //!
 //! `decide(a, b) = a && b` with two tests:
 //!
-//! - `loop_tt_then_f` evaluates the decision twice, (T,T) -> T then
-//!   (F,-) -> F, so its counters are a = [1 T, 1 F], b = [1 T, 0 F].
+//! - `loop_three` evaluates the decision three times, (T,T) -> T,
+//!   (T,F) -> F and (F,-) -> F, so its counters are a = [2 T, 1 F],
+//!   b = [1 T, 1 F].
 //! - `once_tf` evaluates it once, (T,F) -> F.
 //!
-//! The old correlation collapsed the loop test to the single vector
-//! (T,T) and reported `a` UNEXERCISED (50% MC/DC). The counters of a
-//! twice-evaluated two-condition decision do not identify which
+//! The old correlation collapsed a loop test to a single vector and
+//! reported `a` UNEXERCISED. With two two-sided conditions the
+//! counters of a repeatedly evaluated decision do not identify which
 //! vectors occurred, so the loop test must be recorded as ambiguous,
 //! excluded from pair finding, and `a` reported as unknown
 //! (ambiguous) rather than unexercised.
+//!
+//! `loop_tt_then_f` ((T,T) then (F,-): a = [1 T, 1 F], b = [1 T,
+//! 0 F]) has only one two-sided condition, so its counters DO
+//! determine its two vectors (rule 4 of
+//! `correlate::observations_from_counts`).
 
 use floyd::correlate;
 use floyd::coverage_index::{CoverageIndex, PathNormaliser};
@@ -84,19 +90,14 @@ fn coverage(count: u64, a: (u64, u64), b: (u64, u64)) -> profile::CoverageReport
     profile::parse(&json).expect("coverage parses")
 }
 
-#[test]
-fn loop_test_is_ambiguous_and_a_is_unknown_not_unexercised() {
-    let mir = mir::parse_text(AND_MIR).expect("MIR parses");
-    let tree = decision::decompose(&mir);
-    assert_eq!(tree.decisions.len(), 1);
-
-    let tests = [
-        ("loop_tt_then_f", coverage(2, (1, 1), (1, 0))),
-        ("once_tf", coverage(1, (1, 0), (0, 1))),
-    ];
-    // The cargo-mode Pass 3 path.
-    let prepared = correlate::prepare_mir(&mir, &paths());
-    let observations: Vec<_> = tests
+/// Observations of `tests` through the cargo-mode Pass 3 path.
+fn observe(
+    mir: &mir::Mir,
+    tree: &floyd::DecisionTree,
+    tests: &[(&str, profile::CoverageReport)],
+) -> Vec<floyd::ConditionObservation> {
+    let prepared = correlate::prepare_mir(mir, &paths());
+    tests
         .iter()
         .flat_map(|(name, cov)| {
             let index = CoverageIndex::build(cov, &paths());
@@ -105,22 +106,35 @@ fn loop_test_is_ambiguous_and_a_is_unknown_not_unexercised() {
                 &prepared,
                 0,
                 &index,
-                &tree,
+                tree,
             )
         })
-        .collect();
+        .collect()
+}
+
+#[test]
+fn loop_test_is_ambiguous_and_a_is_unknown_not_unexercised() {
+    let mir = mir::parse_text(AND_MIR).expect("MIR parses");
+    let tree = decision::decompose(&mir);
+    assert_eq!(tree.decisions.len(), 1);
+
+    let tests = [
+        ("loop_three", coverage(3, (2, 1), (1, 1))),
+        ("once_tf", coverage(1, (1, 0), (0, 1))),
+    ];
+    let observations = observe(&mir, &tree, &tests);
 
     assert_eq!(observations.len(), 2);
     let looped = &observations[0];
-    assert_eq!(looped.test_name.as_deref(), Some("loop_tt_then_f"));
+    assert_eq!(looped.test_name.as_deref(), Some("loop_three"));
     assert!(looped.ambiguous);
     assert!(looped.inputs.is_empty());
     assert_eq!(looped.result, None);
-    assert_eq!(looped.evaluations, Some(2));
-    assert_eq!(looped.counts["a"].true_count, 1);
+    assert_eq!(looped.evaluations, Some(3));
+    assert_eq!(looped.counts["a"].true_count, 2);
     assert_eq!(looped.counts["a"].false_count, 1);
     assert_eq!(looped.counts["b"].true_count, 1);
-    assert_eq!(looped.counts["b"].false_count, 0);
+    assert_eq!(looped.counts["b"].false_count, 1);
 
     let once = &observations[1];
     assert!(!once.ambiguous);
@@ -135,10 +149,41 @@ fn loop_test_is_ambiguous_and_a_is_unknown_not_unexercised() {
         for c in ["a", "b"] {
             match &analysis.condition_status[c] {
                 ConditionStatus::Ambiguous { tests } => {
-                    assert_eq!(tests, &vec!["loop_tt_then_f".to_string()]);
+                    assert_eq!(tests, &vec!["loop_three".to_string()]);
                 }
                 other => panic!("{variant:?}: {c} should be unknown (ambiguous), got {other:?}"),
             }
+        }
+    }
+}
+
+#[test]
+fn loop_with_one_two_sided_condition_is_resolved_and_demonstrates_mcdc() {
+    // (T,T) then (F,-) in one test, (T,F) in another: the counters of
+    // the loop test determine both its vectors, so all three rows
+    // are observed and both conditions are exercised.
+    let mir = mir::parse_text(AND_MIR).expect("MIR parses");
+    let tree = decision::decompose(&mir);
+    let tests = [
+        ("loop_tt_then_f", coverage(2, (1, 1), (1, 0))),
+        ("once_tf", coverage(1, (1, 0), (0, 1))),
+    ];
+    let observations = observe(&mir, &tree, &tests);
+    assert_eq!(observations.len(), 3);
+    assert!(observations.iter().all(|o| !o.ambiguous));
+    assert_eq!(observations[0].evaluations, Some(2));
+    assert_eq!(observations[0].result, Some(true));
+    assert_eq!(observations[1].inputs.get("b"), None);
+    assert_eq!(observations[1].result, Some(false));
+    for variant in [Variant::Masking, Variant::UniqueCause] {
+        let analysis = masking::analyze_with_runtime(&tree, &observations, variant);
+        assert_eq!(analysis.ambiguous_observations, 0);
+        for c in ["a", "b"] {
+            assert!(
+                matches!(analysis.condition_status[c], ConditionStatus::Exercised(_)),
+                "{variant:?} {c}: {:?}",
+                analysis.condition_status[c]
+            );
         }
     }
 }
@@ -149,25 +194,12 @@ fn single_evaluation_tests_still_demonstrate_full_mcdc() {
     // evidence: (T,T), (F,-), (T,F) -> 100% masking MC/DC.
     let mir = mir::parse_text(AND_MIR).expect("MIR parses");
     let tree = decision::decompose(&mir);
-    let prepared = correlate::prepare_mir(&mir, &paths());
     let tests = [
         ("tt", coverage(1, (1, 0), (1, 0))),
         ("f", coverage(1, (0, 1), (0, 0))),
         ("tf", coverage(1, (1, 0), (0, 1))),
     ];
-    let observations: Vec<_> = tests
-        .iter()
-        .flat_map(|(name, cov)| {
-            let index = CoverageIndex::build(cov, &paths());
-            correlate::observations_from_prepared_coverage(
-                Some(name.to_string()),
-                &prepared,
-                0,
-                &index,
-                &tree,
-            )
-        })
-        .collect();
+    let observations = observe(&mir, &tree, &tests);
     assert_eq!(observations.len(), 3);
     assert!(observations.iter().all(|o| !o.ambiguous));
     let analysis = masking::analyze_with_runtime(&tree, &observations, Variant::Masking);
@@ -183,24 +215,24 @@ fn single_evaluation_tests_still_demonstrate_full_mcdc() {
 
 #[test]
 fn loop_inside_a_function_called_once_is_still_multi_evaluation() {
-    // The decision runs twice inside ONE call (a loop in the body):
-    // the function entry count is 1, but the root condition `a` was
-    // tested twice. The evaluation count must come from the root,
-    // so the test is ambiguous rather than a single (T,T) vector.
+    // The decision runs inside ONE call (a loop in the body): the
+    // function entry count is 1, but the root condition `a` was
+    // tested several times. The evaluation count must come from the
+    // root, so the test is not read as a single vector.
     let mir = mir::parse_text(AND_MIR).expect("MIR parses");
     let tree = decision::decompose(&mir);
-    let prepared = correlate::prepare_mir(&mir, &paths());
-    let cov = coverage(1, (1, 1), (1, 0));
-    let index = CoverageIndex::build(&cov, &paths());
-    let observations = correlate::observations_from_prepared_coverage(
-        Some("loop_in_one_call".to_string()),
-        &prepared,
-        0,
-        &index,
-        &tree,
-    );
+
+    // Two evaluations, one two-sided condition: both vectors, N = 2.
+    let observations = observe(&mir, &tree, &[("twice", coverage(1, (1, 1), (1, 0)))]);
+    assert_eq!(observations.len(), 2);
+    assert!(observations
+        .iter()
+        .all(|o| !o.ambiguous && o.evaluations == Some(2)));
+
+    // Three evaluations, two two-sided conditions: ambiguous, N = 3.
+    let observations = observe(&mir, &tree, &[("thrice", coverage(1, (2, 1), (1, 1)))]);
     assert_eq!(observations.len(), 1);
     assert!(observations[0].ambiguous);
-    assert_eq!(observations[0].evaluations, Some(2));
+    assert_eq!(observations[0].evaluations, Some(3));
     assert!(observations[0].inputs.is_empty());
 }

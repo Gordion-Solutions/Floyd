@@ -187,8 +187,54 @@ fn root_condition(node: &Node) -> Option<&str> {
 ///    `{c: F}`, however many evaluations there were: with one
 ///    condition the vector is the condition's value, so each
 ///    non-zero counter proves its vector occurred.
-/// 4. Otherwise the test is **ambiguous**: recorded with its
+/// 4. **One two-sided condition.** `N > 1`, exactly one condition
+///    was both true and false, every other condition was one-sided,
+///    and the counters account exactly for one evaluation path per
+///    value of the two-sided condition. Two vectors, one per value
+///    (see "Why rule 4 is sound" below for the proof and the exact
+///    consistency check).
+/// 5. Otherwise the test is **ambiguous**: recorded with its
 ///    evaluation count and raw counters, no vector, no result.
+///
+/// # Why rule 4 is sound
+///
+/// Let `p` be the only condition with both counters non-zero
+/// (`p = [k_T T, k_F F]`) and let every other condition `d` with a
+/// non-zero counter be one-sided with value `v_d`. Each evaluation
+/// walks the decision tree from the root. Whenever it tests a
+/// condition `d != p`, `d` takes `v_d` (that is the only value it ever
+/// took in this test); whenever it tests `p`, `p` takes `T` or `F`.
+/// A condition with no evaluations in this test is never tested.
+/// So the walk is a function of `p`'s value alone (and of nothing if
+/// it never reaches `p`): there are at most two possible evaluation
+/// vectors, `P_T` (walk with `p = T`) and `P_F` (walk with `p = F`).
+/// Every evaluation that reaches `p` with value `x` is exactly `P_x`.
+///
+/// The rule only fires when the counters are *exactly* those of
+/// `k_T` evaluations of `P_T` plus `k_F` evaluations of `P_F`:
+///
+/// - `p` is on both walks, once each, and `k_T + k_F = N`, so every
+///   evaluation reached `p` (none took a `p`-free path: the walk
+///   before `p` is the same for all evaluations, so either all reach
+///   `p` or none does);
+/// - no walk reaches a condition that has no evaluations in this
+///   test (such a walk could not have happened);
+/// - no condition is tested twice on one walk;
+/// - for every condition `d`, its counter equals the number of
+///   times the two walks, weighted by `k_T` and `k_F`, test it with
+///   each value; conditions on neither walk have zero counters.
+///
+/// Under those checks, `P_T` occurred `k_T > 0` times and `P_F`
+/// occurred `k_F > 0` times, and nothing else occurred, so both
+/// vectors are sound and complete. The outcome of each comes from
+/// the tree. Short-circuited conditions are simply off a walk: a
+/// condition only on `P_T` has a counter total of `k_T`, below `N`.
+/// When any check fails the test stays ambiguous (rule 5). With two
+/// or more two-sided conditions the walks are no longer a function
+/// of one value and the counters need not say which values occurred
+/// together (for `(a && b) || c`, (T,F,T) + (F,-,F) and
+/// (T,F,F) + (F,-,T) leave the same counters), so this rule does not
+/// apply and such tests stay ambiguous.
 ///
 /// `N == 0` (the test never evaluated the decision) or a root with
 /// no counters yields no observation at all. Condition names in
@@ -247,6 +293,11 @@ pub fn observations_from_counts(
     }
 
     // Rule 4.
+    if let Some(obs) = one_two_sided_rule(&test_name, decision, &decision_counts, evaluations) {
+        return obs;
+    }
+
+    // Rule 5.
     vec![ConditionObservation::ambiguous(
         test_name,
         evaluations,
@@ -278,6 +329,74 @@ fn single_condition_rule(
             vector_observation(test_name.clone(), decision, inputs, evaluations)
         })
         .collect()
+}
+
+/// Rule 4 of [`observations_from_counts`]: exactly one condition is
+/// two-sided, so the counters determine every evaluation. See "Why
+/// rule 4 is sound" on [`observations_from_counts`]; this function
+/// performs every check listed there and returns `None` (the test
+/// stays ambiguous) when one fails.
+fn one_two_sided_rule(
+    test_name: &Option<String>,
+    decision: &Node,
+    counts: &BTreeMap<String, BranchCounts>,
+    evaluations: u64,
+) -> Option<Vec<ConditionObservation>> {
+    let two_sided = |c: &&BranchCounts| c.true_count > 0 && c.false_count > 0;
+    let mut pivots = counts.iter().filter(|(_, c)| two_sided(c));
+    let (pivot, pivot_counts) = pivots.next()?;
+    if pivots.next().is_some() || pivot_counts.total() != evaluations {
+        return None;
+    }
+    let fixed = |name: &str| -> Option<bool> {
+        if name == pivot {
+            return None;
+        }
+        counts
+            .get(name)
+            .filter(|c| c.total() > 0)
+            .map(|c| c.true_count > 0)
+    };
+    let mut expected: BTreeMap<&str, BranchCounts> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (value, times) in [
+        (true, pivot_counts.true_count),
+        (false, pivot_counts.false_count),
+    ] {
+        let (path, result) = crate::masking::evaluation_walk(decision, |name| {
+            if name == pivot {
+                Some(value)
+            } else {
+                fixed(name)
+            }
+        })?;
+        let mut inputs = BTreeMap::new();
+        for (name, v) in &path {
+            if inputs.insert(name.clone(), *v).is_some() {
+                return None; // tested twice on one walk
+            }
+            let e = expected
+                .entry(counts.get_key_value(name)?.0.as_str())
+                .or_default();
+            if *v {
+                e.true_count += times;
+            } else {
+                e.false_count += times;
+            }
+        }
+        if !inputs.contains_key(pivot) {
+            return None;
+        }
+        let mut obs = ConditionObservation::vector(test_name.clone(), inputs, result);
+        obs.evaluations = Some(evaluations);
+        out.push(obs);
+    }
+    let exact = counts.iter().all(|(name, c)| {
+        expected
+            .get(name.as_str())
+            .map_or(c.total() == 0, |e| e == c)
+    });
+    exact.then_some(out)
 }
 
 /// A condition-vector observation whose result is evaluated from
@@ -1136,12 +1255,13 @@ fn decide(_1: bool, _2: bool) -> bool {
 
     #[test]
     fn multi_evaluation_multi_condition_is_ambiguous() {
-        // (T,T) then (F,-): the old collapse recorded (T,T) and lost
-        // the (F,-) evaluation.
+        // (T,T), (T,F), (F,-): a and b both two-sided, so the
+        // counters do not say which values occurred together (rule 4
+        // needs exactly one two-sided condition).
         let obs = observations_from_counts(
-            Some("loop_tt_then_f".into()),
+            Some("loop_three".into()),
             &and_node(),
-            &counts(&[("a", 1, 1), ("b", 1, 0)]),
+            &counts(&[("a", 2, 1), ("b", 1, 1)]),
             Some(1),
         );
         assert_eq!(obs.len(), 1);
@@ -1149,8 +1269,90 @@ fn decide(_1: bool, _2: bool) -> bool {
         assert!(o.ambiguous);
         assert!(o.inputs.is_empty(), "no vector may be invented");
         assert_eq!(o.result, None);
-        assert_eq!(o.evaluations, Some(2));
-        assert_eq!(o.counts, counts(&[("a", 1, 1), ("b", 1, 0)]));
+        assert_eq!(o.evaluations, Some(3));
+        assert_eq!(o.counts, counts(&[("a", 2, 1), ("b", 1, 1)]));
+    }
+
+    #[test]
+    fn one_two_sided_condition_resolves_both_vectors() {
+        // (T,T) then (F,-): the old collapse recorded (T,T) and lost
+        // the (F,-) evaluation; rule 5 made it ambiguous. Only a is
+        // two-sided and b (on a = T's path only) counts exactly a's
+        // one true, so the two vectors are determined.
+        let obs = observations_from_counts(
+            Some("loop_tt_then_f".into()),
+            &and_node(),
+            &counts(&[("a", 1, 1), ("b", 1, 0)]),
+            Some(1),
+        );
+        assert_eq!(obs.len(), 2);
+        assert!(obs.iter().all(|o| !o.ambiguous && o.evaluations == Some(2)));
+        assert_eq!(obs[0].inputs, inputs(&[("a", true), ("b", true)]));
+        assert_eq!(obs[0].result, Some(true));
+        assert_eq!(obs[1].inputs, inputs(&[("a", false)]));
+        assert_eq!(obs[1].result, Some(false));
+        assert!(obs.iter().all(|o| o.counts.is_empty()));
+    }
+
+    #[test]
+    fn one_two_sided_condition_behind_a_short_circuit_resolves() {
+        // a && b with a = T every time and b two-sided: (T,T) x2,
+        // (T,F) x1. The pivot is not the root.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 3, 0), ("b", 2, 1)]),
+            None,
+        );
+        assert_eq!(obs.len(), 2);
+        assert_eq!(obs[0].inputs, inputs(&[("a", true), ("b", true)]));
+        assert_eq!(obs[0].result, Some(true));
+        assert_eq!(obs[1].inputs, inputs(&[("a", true), ("b", false)]));
+        assert_eq!(obs[1].result, Some(false));
+    }
+
+    #[test]
+    fn short_circuit_inconsistency_stays_ambiguous() {
+        // a two-sided, b one-sided T. a = T's walk tests b, so b must
+        // count exactly a's true_count (2); it counts 1. Some a = T
+        // evaluation is unaccounted for: stay ambiguous.
+        let short = counts(&[("a", 2, 1), ("b", 1, 0)]);
+        let obs = observations_from_counts(None, &and_node(), &short, None);
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+        assert_eq!(obs[0].counts, short);
+
+        // b counted on a = F's walk, which short-circuits it.
+        let behind = counts(&[("a", 1, 1), ("b", 2, 0)]);
+        let obs = observations_from_counts(None, &and_node(), &behind, None);
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+
+        // a = T's walk needs b, which this test never evaluated.
+        let never = counts(&[("a", 1, 1), ("b", 0, 0)]);
+        let obs = observations_from_counts(None, &and_node(), &never, None);
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+    }
+
+    #[test]
+    fn one_two_sided_rule_needs_every_condition_on_a_walk_counted() {
+        // a || (b && c): c one-sided but on no walk (b is always F),
+        // yet it has a counter: inconsistent, stay ambiguous.
+        let or_and = ite("a", konst(true), ite("b", cond("c"), konst(false)));
+        let raw = counts(&[("a", 1, 2), ("b", 0, 2), ("c", 1, 0)]);
+        let obs = observations_from_counts(None, &or_and, &raw, None);
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+
+        // Without the stray c: (T) -> T once, (F,F) -> F twice.
+        let raw = counts(&[("a", 1, 2), ("b", 0, 2), ("c", 0, 0)]);
+        let obs = observations_from_counts(None, &or_and, &raw, None);
+        assert_eq!(obs.len(), 2);
+        assert_eq!(obs[0].inputs, inputs(&[("a", true)]));
+        assert_eq!(obs[0].result, Some(true));
+        assert_eq!(obs[1].inputs, inputs(&[("a", false), ("b", false)]));
+        assert_eq!(obs[1].result, Some(false));
     }
 
     #[test]
@@ -1173,6 +1375,162 @@ fn decide(_1: bool, _2: bool) -> bool {
         assert_eq!(o.result, None);
         assert_eq!(o.evaluations, Some(256));
         assert_eq!(o.counts, raw);
+    }
+
+    /// anyhow `src/ensure.rs:60`, `|b| b == b' ' || b == b'\n'`, as
+    /// Floyd decomposes it.
+    fn anyhow_whitespace() -> Node {
+        ite("b == 32", konst(true), cond("b == 10"))
+    }
+
+    #[test]
+    fn anyhow_test_whitespace_counts_resolve_to_two_vectors() {
+        // Counters of `test_whitespace` at the two condition spans in
+        // its own llvm-cov export: 9 evaluations, b == b' ' (60:30)
+        // = [1 T, 8 F], b == b'\n' (60:43) = [0 T, 8 F]. Sweep 7
+        // recorded it as ambiguous and reported both conditions
+        // unknown.
+        let raw = counts(&[("b == 32", 1, 8), ("b == 10", 0, 8)]);
+        let obs = observations_from_counts(
+            Some("test_whitespace".into()),
+            &anyhow_whitespace(),
+            &raw,
+            Some(1),
+        );
+        assert_eq!(obs.len(), 2, "{obs:?}");
+        assert!(obs.iter().all(|o| !o.ambiguous && o.evaluations == Some(9)));
+        assert_eq!(obs[0].inputs, inputs(&[("b == 32", true)]));
+        assert_eq!(obs[0].result, Some(true));
+        assert_eq!(
+            obs[1].inputs,
+            inputs(&[("b == 32", false), ("b == 10", false)])
+        );
+        assert_eq!(obs[1].result, Some(false));
+
+        // With the 14 single-path tests' (F,F) -> F, b == 32 is
+        // exercised and b == 10 (never true anywhere) unexercised.
+        let tree = DecisionTree {
+            decisions: vec![anyhow_whitespace()],
+        };
+        let r = crate::masking::analyze_with_runtime(&tree, &obs, crate::masking::Variant::Masking);
+        assert!(matches!(
+            r.condition_status["b == 32"],
+            crate::masking::ConditionStatus::Exercised(_)
+        ));
+        assert!(matches!(
+            r.condition_status["b == 10"],
+            crate::masking::ConditionStatus::Unexercised
+        ));
+        assert_eq!(r.ambiguous_observations, 0);
+    }
+
+    /// chrono `NaiveTime::from_hms_nano_opt` (src/naive/time/mod.rs:429).
+    fn chrono_from_hms_nano() -> Node {
+        let n2 = || cond("nano >= 2000000000");
+        ite(
+            "hour >= 24",
+            konst(true),
+            ite(
+                "min >= 60",
+                konst(true),
+                ite(
+                    "sec >= 60",
+                    konst(true),
+                    ite(
+                        "nano >= 1000000000",
+                        ite("sec != 59", konst(true), n2()),
+                        n2(),
+                    ),
+                ),
+            ),
+        )
+    }
+
+    #[test]
+    fn chrono_test_leap_second_counts_resolve_to_two_vectors() {
+        // `offset::local::tests::test_leap_second`'s counters in its
+        // llvm-cov export: 2 evaluations, only `sec != 59` two-sided;
+        // `nano >= 2000000000` sits behind it and counts its false
+        // walk only.
+        let raw = counts(&[
+            ("hour >= 24", 0, 2),
+            ("min >= 60", 0, 2),
+            ("sec >= 60", 0, 2),
+            ("nano >= 1000000000", 2, 0),
+            ("sec != 59", 1, 1),
+            ("nano >= 2000000000", 0, 1),
+        ]);
+        let decision = chrono_from_hms_nano();
+        let obs = observations_from_counts(
+            Some("offset::local::tests::test_leap_second".into()),
+            &decision,
+            &raw,
+            Some(2),
+        );
+        assert_eq!(obs.len(), 2, "{obs:?}");
+        let prefix = [
+            ("hour >= 24", false),
+            ("min >= 60", false),
+            ("sec >= 60", false),
+            ("nano >= 1000000000", true),
+        ];
+        let mut t = prefix.to_vec();
+        t.push(("sec != 59", true));
+        let mut f = prefix.to_vec();
+        f.extend([("sec != 59", false), ("nano >= 2000000000", false)]);
+        assert_eq!(obs[0].inputs, inputs(&t));
+        assert_eq!(obs[0].result, Some(true));
+        assert_eq!(obs[1].inputs, inputs(&f));
+        assert_eq!(obs[1].result, Some(false));
+
+        // `round::tests::test_round_leap_nanos` (one evaluation) is
+        // the (.., n1 T, s59 F, n2 F) -> F row, and the all-false row
+        // comes from single-evaluation tests: with the leap-second
+        // vectors both `nano >= 1000000000` and `sec != 59` have a
+        // pair.
+        let mut all = obs;
+        all.push(ConditionObservation::vector(
+            Some("naive::time::tests::test_time_from_hms_milli".into()),
+            inputs(&[
+                ("hour >= 24", false),
+                ("min >= 60", false),
+                ("sec >= 60", false),
+                ("nano >= 1000000000", false),
+                ("nano >= 2000000000", false),
+            ]),
+            false,
+        ));
+        let tree = DecisionTree {
+            decisions: vec![decision],
+        };
+        let r = crate::masking::analyze_with_runtime(&tree, &all, crate::masking::Variant::Masking);
+        for c in ["nano >= 1000000000", "sec != 59"] {
+            assert!(
+                matches!(
+                    r.condition_status[c],
+                    crate::masking::ConditionStatus::Exercised(_)
+                ),
+                "{c}: {:?}",
+                r.condition_status[c]
+            );
+        }
+    }
+
+    #[test]
+    fn two_two_sided_conditions_stay_ambiguous_on_real_chrono_shape() {
+        // Same decision, a test that hit both `sec != 59` and
+        // `nano >= 1000000000` both ways: no rule applies.
+        let raw = counts(&[
+            ("hour >= 24", 0, 3),
+            ("min >= 60", 0, 3),
+            ("sec >= 60", 0, 3),
+            ("nano >= 1000000000", 2, 1),
+            ("sec != 59", 1, 1),
+            ("nano >= 2000000000", 0, 2),
+        ]);
+        let obs = observations_from_counts(None, &chrono_from_hms_nano(), &raw, Some(3));
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
     }
 
     #[test]
@@ -1224,15 +1582,26 @@ fn decide(_1: bool, _2: bool) -> bool {
     fn evaluation_count_comes_from_the_root_not_the_function_count() {
         // Decision evaluated twice in ONE call (loop in the body):
         // function count 1 must not make it look single-evaluation.
+        // Rule 1 would read b's two counters as one value; rule 4
+        // derives (T,T) and (T,F), each recorded with N = 2.
         let obs = observations_from_counts(
             None,
             &and_node(),
             &counts(&[("a", 2, 0), ("b", 1, 1)]),
             Some(1),
         );
+        assert_eq!(obs.len(), 2);
+        assert!(obs.iter().all(|o| !o.ambiguous && o.evaluations == Some(2)));
+        // Two two-sided conditions in one call: ambiguous, N = 3.
+        let obs = observations_from_counts(
+            None,
+            &and_node(),
+            &counts(&[("a", 2, 1), ("b", 1, 1)]),
+            Some(1),
+        );
         assert_eq!(obs.len(), 1);
         assert!(obs[0].ambiguous);
-        assert_eq!(obs[0].evaluations, Some(2));
+        assert_eq!(obs[0].evaluations, Some(3));
     }
 
     #[test]
@@ -1274,10 +1643,11 @@ fn decide(_1: bool, _2: bool) -> bool {
     }
 
     #[test]
-    fn merged_two_evaluation_coverage_is_ambiguous() {
+    fn merged_two_evaluation_coverage_resolves_to_both_vectors() {
         // COVERAGE_JSON is `ff` and `tt` merged into one profile:
         // two evaluations, a = [1, 1], b = [1, 0]. The old collapse
-        // reported it as the single vector (T,T).
+        // reported it as the single vector (T,T); rule 4 recovers
+        // exactly the two evaluations, (T,T) -> T and (F,-) -> F.
         let mir = mir::parse_text(SPANNED_AND_MIR).expect("MIR parses");
         let cov = profile::parse(COVERAGE_JSON).expect("coverage parses");
         let tree = decision::decompose(&mir);
@@ -1285,9 +1655,26 @@ fn decide(_1: bool, _2: bool) -> bool {
         let index = CoverageIndex::build(&cov, &scout_paths());
         let obs =
             observations_from_prepared_coverage(Some("merged".into()), &prepared, 0, &index, &tree);
+        assert_eq!(obs.len(), 2);
+        assert!(obs.iter().all(|o| !o.ambiguous && o.evaluations == Some(2)));
+        assert_eq!(obs[0].inputs, inputs(&[("a", true), ("b", true)]));
+        assert_eq!(obs[1].inputs, inputs(&[("a", false)]));
+
+        // A third evaluation (T,F) makes b two-sided too: ambiguous.
+        let three = COVERAGE_JSON
+            .replace("\"count\": 2", "\"count\": 3")
+            .replace("[2, 5, 2, 6, 1, 1, 0, 0, 4]", "[2, 5, 2, 6, 2, 1, 0, 0, 4]")
+            .replace(
+                "[2, 10, 2, 11, 1, 0, 0, 0, 4]",
+                "[2, 10, 2, 11, 1, 1, 0, 0, 4]",
+            );
+        let cov = profile::parse(&three).expect("coverage parses");
+        let index = CoverageIndex::build(&cov, &scout_paths());
+        let obs =
+            observations_from_prepared_coverage(Some("merged".into()), &prepared, 0, &index, &tree);
         assert_eq!(obs.len(), 1);
         assert!(obs[0].ambiguous);
-        assert_eq!(obs[0].evaluations, Some(2));
+        assert_eq!(obs[0].evaluations, Some(3));
     }
 
     #[test]

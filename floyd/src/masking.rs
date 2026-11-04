@@ -339,6 +339,38 @@ fn classify_condition(
     }
 }
 
+/// The conditions `decision` tests, in order, when each condition
+/// takes the value `value_of` gives it, with the value each takes,
+/// and the outcome. Conditions short-circuited under those values are
+/// not on the path. `None` if the walk reaches a condition `value_of`
+/// has no value for.
+pub(crate) fn evaluation_walk(
+    decision: &Node,
+    value_of: impl Fn(&str) -> Option<bool>,
+) -> Option<(Vec<(String, bool)>, bool)> {
+    let mut path = Vec::new();
+    let mut node = decision;
+    loop {
+        match node {
+            Node::Const { value } => return Some((path, *value)),
+            Node::Condition { name } => {
+                let v = value_of(name)?;
+                path.push((name.clone(), v));
+                return Some((path, v));
+            }
+            Node::Ite {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let v = value_of(cond)?;
+                path.push((cond.clone(), v));
+                node = if v { then_branch } else { else_branch };
+            }
+        }
+    }
+}
+
 /// True iff `observation` is compatible with `row` — every condition
 /// the observation actually saw agrees with `row`'s expected value,
 /// and the results match.
