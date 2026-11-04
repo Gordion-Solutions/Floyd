@@ -7,6 +7,8 @@
 //! - `--features` reaches the instrumented build;
 //! - a failing `--list` gives `test_discovery_failed`, a test run
 //!   that leaves no coverage profile gives `test_run_failed`;
+//! - MIR files skipped by `--max-mir-size` are named on stderr and in
+//!   the JSON, and the `no_candidates` message says they are why;
 //! - a proc-macro crate's test binary (which links `libstd`
 //!   dynamically) is listed and run.
 //!
@@ -191,6 +193,37 @@ fn failing_test_run_reports_test_run_failed() {
     let junit = floyd("failure-paths", &["--format=junit", "-F", "builds"], &env);
     assert_eq!(junit.code, 1);
     assert!(junit.stdout.contains(r#"type="test_run_failed""#));
+}
+
+#[test]
+#[ignore = "requires nightly Rust + llvm-tools-preview component"]
+fn oversize_mir_skip_is_reported() {
+    let run = floyd(
+        "failure-paths",
+        &["--format=json", "-F", "builds", "--max-mir-size=0"],
+        &[],
+    );
+    assert_eq!(run.code, 1);
+    let j = run.json();
+    assert_eq!(j["verdict"], "no_candidates");
+    assert_eq!(j["max_mir_size_mb"], 0);
+    assert_eq!(j["tests_discovered"].as_array().unwrap().len(), 0);
+    let skipped = j["skipped_oversize_mirs"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1, "{j:#}");
+    let path = skipped[0]["path"].as_str().unwrap();
+    assert!(path.ends_with(".mir"));
+    assert!(skipped[0]["bytes"].as_u64().unwrap() > 0);
+    // stderr names the file, the limit and the flag, and the decline
+    // message gives the skip as the reason.
+    assert!(run.stderr.contains(path), "{}", run.stderr);
+    assert!(run.stderr.contains("--max-mir-size limit of 0 MB"));
+    assert!(run.stderr.contains("--max-mir-size=50"));
+    assert!(run.stderr.contains(
+        "no recognised decisions: the MIR of all 1 test target(s) exceeded --max-mir-size=0"
+    ));
+
+    let text = floyd("failure-paths", &["-F", "builds", "--max-mir-size=0"], &[]);
+    assert!(text.stdout.contains("above the 0 MB scalability threshold"));
 }
 
 #[test]

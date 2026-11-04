@@ -393,6 +393,8 @@ struct CargoRuntimeReport<'a> {
     out_of_scope: &'a [DeclinedFunction],
     /// MIR files above the size guard that were not analysed.
     skipped_oversize_mirs: &'a [SkippedMir],
+    /// The size guard in effect (`--max-mir-size`, default 50).
+    max_mir_size_mb: u64,
     /// Test targets with `harness = false` that were not listed or
     /// run, and so contribute no tests or candidates.
     skipped_no_harness: &'a [NoHarnessTarget],
@@ -746,6 +748,7 @@ fn run_test_mode_cargo(
         out_of_scope: &[],
         skipped_oversize_mirs: &[],
         skipped_no_harness: &[],
+        max_mir_mb,
     };
 
     // Build all test artifacts in the cargo project.
@@ -976,6 +979,9 @@ fn run_test_mode_cargo(
         });
     }
 
+    if !skipped_oversize_mirs.is_empty() {
+        print_oversize_notice(&mut std::io::stderr(), &skipped_oversize_mirs, max_mir_mb);
+    }
     if std::env::var("FLOYD_DIAG").is_ok() {
         eprintln!("[progress] Pass 1 complete: {} candidates, {} declined, {} artifacts, {} skipped-oversize",
         raw_candidates.len(), declined.len(), artifacts.len(), skipped_oversize_mirs.len());
@@ -1242,6 +1248,7 @@ fn run_test_mode_cargo(
         candidates: &candidate_summaries,
         out_of_scope: &declined,
         skipped_oversize_mirs: &skipped_mirs,
+        max_mir_size_mb: max_mir_mb,
         skipped_no_harness: &skipped_no_harness,
     };
     // Decline paths: the human-readable explanation goes to stderr
@@ -1252,6 +1259,7 @@ fn run_test_mode_cargo(
                 &mut std::io::stdout(),
                 &declined,
                 &skipped_oversize_mirs,
+                max_mir_mb,
                 &skipped_no_harness,
             ),
             Format::Json => {
@@ -1263,6 +1271,7 @@ fn run_test_mode_cargo(
                 &mut std::io::stderr(),
                 &declined,
                 &skipped_oversize_mirs,
+                max_mir_mb,
                 &skipped_no_harness,
             ),
         }
@@ -1279,12 +1288,12 @@ fn run_test_mode_cargo(
         }
         selector::PickResult::NoCandidates => {
             eprintln!(
-                "cargo-floyd: no recognised decisions in any test target. \
-                 The engine currently supports `&&`, `||`, `!`, and nested \
-                 combinations; `if let`, `?`, and `match` patterns are \
-                 partially supported (2-arm const-returning shapes); \
-                 non-boolean decisions and arms that end in a function \
-                 call are out of scope."
+                "{}",
+                no_candidates_line(
+                    &skipped_oversize_mirs,
+                    build.test_artifacts.len(),
+                    max_mir_mb
+                )
             );
             return emit_decline(RuntimeVerdict::NoCandidates);
         }
@@ -1304,6 +1313,7 @@ fn run_test_mode_cargo(
                 &mut std::io::stdout(),
                 &declined,
                 &skipped_oversize_mirs,
+                max_mir_mb,
                 &skipped_no_harness,
             );
         }
@@ -1343,6 +1353,7 @@ struct Partial<'a> {
     out_of_scope: &'a [DeclinedFunction],
     skipped_oversize_mirs: &'a [(std::path::PathBuf, u64)],
     skipped_no_harness: &'a [NoHarnessTarget],
+    max_mir_mb: u64,
 }
 
 /// Emit the document for an error exit and return exit code 1.
@@ -1396,6 +1407,7 @@ fn error_report<'a>(
         candidates: &[],
         out_of_scope: partial.out_of_scope,
         skipped_oversize_mirs: skipped,
+        max_mir_size_mb: partial.max_mir_mb,
         skipped_no_harness: partial.skipped_no_harness,
     }
 }
@@ -1467,6 +1479,81 @@ fn runner_error(e: &runner::RunnerError) -> failure::RunError {
         ice: None,
         stderr: failure::trimmed_stderr(&e.message),
     }
+}
+
+/// A `--max-mir-size` value, in megabytes, that admits every skipped
+/// MIR file: the largest one rounded up to the next multiple of 50.
+fn suggested_mir_limit(skipped: &[(std::path::PathBuf, u64)]) -> u64 {
+    let largest_mb = skipped
+        .iter()
+        .map(|(_, b)| b.div_ceil(1024 * 1024))
+        .max()
+        .unwrap_or(DEFAULT_MAX_MIR_MB);
+    (largest_mb / 50 + 1) * 50
+}
+
+fn format_mb(bytes: u64) -> String {
+    format!("{:.0} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// The stderr notice for MIR files skipped by the size guard: each
+/// file and its size, the limit, and the flag that raises it.
+fn print_oversize_notice(
+    out: &mut dyn std::io::Write,
+    skipped: &[(std::path::PathBuf, u64)],
+    max_mir_mb: u64,
+) {
+    let _ = writeln!(
+        out,
+        "cargo-floyd: skipped {} test-target MIR file(s) larger than the \
+         --max-mir-size limit of {max_mir_mb} MB; their tests and \
+         decisions are not analysed:",
+        skipped.len()
+    );
+    for (path, bytes) in skipped {
+        let _ = writeln!(out, "  {}  ({})", path.display(), format_mb(*bytes));
+    }
+    let _ = writeln!(
+        out,
+        "  To analyse them, raise the limit: cargo floyd test --max-mir-size={} \
+         (parsing takes longer and uses more memory).",
+        suggested_mir_limit(skipped)
+    );
+}
+
+/// The stderr line for the `no_candidates` verdict. When MIR files
+/// were skipped by the size guard it says so first, since the
+/// decisions in them were never looked at.
+fn no_candidates_line(
+    skipped: &[(std::path::PathBuf, u64)],
+    test_targets: usize,
+    max_mir_mb: u64,
+) -> String {
+    const SCOPE: &str = "The engine currently supports `&&`, `||`, `!`, and nested \
+         combinations; `if let`, `?`, and `match` patterns are \
+         partially supported (2-arm const-returning shapes); \
+         non-boolean decisions and arms that end in a function \
+         call are out of scope.";
+    if skipped.is_empty() {
+        return format!("cargo-floyd: no recognised decisions in any test target. {SCOPE}");
+    }
+    let all = skipped.len() >= test_targets;
+    let which = if all {
+        format!("all {} test target(s)", skipped.len())
+    } else {
+        format!("{} of {test_targets} test target(s)", skipped.len())
+    };
+    let rest = if all {
+        String::new()
+    } else {
+        format!(" In the analysed targets: {SCOPE}")
+    };
+    format!(
+        "cargo-floyd: no recognised decisions: the MIR of {which} exceeded \
+         --max-mir-size={max_mir_mb} (MB) and was not analysed; rerun with \
+         --max-mir-size={} to include it.{rest}",
+        suggested_mir_limit(skipped)
+    )
 }
 
 fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCode {
@@ -1714,7 +1801,8 @@ fn print_usage() {
     eprintln!("        name contains <pat>.");
     eprintln!();
     eprintln!("        --max-mir-size=<MB> (default 50) skips test-target MIR");
-    eprintln!("        files larger than <MB> megabytes.");
+    eprintln!("        files larger than <MB> megabytes; skipped files are");
+    eprintln!("        listed on stderr and in the JSON `skipped_oversize_mirs`.");
     eprintln!();
     eprintln!("        --features=<list> (or -F <list>), --all-features and");
     eprintln!("        --no-default-features are passed to the instrumented");
@@ -2016,6 +2104,7 @@ fn print_out_of_scope_report(
     out: &mut dyn std::io::Write,
     declined: &[impl std::fmt::Debug],
     skipped_oversize_mirs: &[(std::path::PathBuf, u64)],
+    max_mir_mb: u64,
     skipped_no_harness: &[NoHarnessTarget],
 ) {
     if !skipped_no_harness.is_empty() {
@@ -2045,12 +2134,14 @@ fn print_out_of_scope_report(
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "Skipped {} MIR file(s) above the 50 MB scalability \
+            "Skipped {} MIR file(s) above the {max_mir_mb} MB scalability \
              threshold (monomorphisation explosion in test \
              binaries). These artifacts were not analysed — \
              candidates and tests they would have contributed are \
-             absent from the verdict:",
-            skipped_oversize_mirs.len()
+             absent from the verdict. Raise the limit with \
+             --max-mir-size={}:",
+            skipped_oversize_mirs.len(),
+            suggested_mir_limit(skipped_oversize_mirs)
         );
         for (path, size) in skipped_oversize_mirs.iter().take(5) {
             let _ = writeln!(
@@ -2275,6 +2366,7 @@ mod tests {
             candidates: &candidates,
             out_of_scope: &declined,
             skipped_oversize_mirs: &skipped,
+            max_mir_size_mb: 50,
             skipped_no_harness: &[],
         };
         let v: serde_json::Value =
@@ -2637,6 +2729,7 @@ mod tests {
             out_of_scope: &[],
             skipped_oversize_mirs: skipped,
             skipped_no_harness: no_harness,
+            max_mir_mb: 50,
         }
     }
 
@@ -2682,6 +2775,41 @@ mod tests {
             assert_eq!(v["test_targets"], 2);
             assert!(v["analysis"].is_null());
         }
+    }
+
+    #[test]
+    fn oversize_skip_is_named_with_the_limit_and_the_flag() {
+        let skipped = vec![(std::path::PathBuf::from("/t/fixed-0dd5.mir"), 116_578_721)];
+        assert_eq!(suggested_mir_limit(&skipped), 150);
+        assert_eq!(
+            suggested_mir_limit(&[(std::path::PathBuf::new(), 100 * 1024 * 1024)]),
+            150
+        );
+        let mut out = Vec::new();
+        print_oversize_notice(&mut out, &skipped, 50);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("--max-mir-size limit of 50 MB"), "{out}");
+        assert!(out.contains("/t/fixed-0dd5.mir  (111 MB)"), "{out}");
+        assert!(out.contains("--max-mir-size=150"), "{out}");
+
+        let line = no_candidates_line(&skipped, 1, 50);
+        assert!(line.starts_with(
+            "cargo-floyd: no recognised decisions: the MIR of all 1 test target(s) \
+             exceeded --max-mir-size=50 (MB)"
+        ));
+        assert!(!line.contains("In the analysed targets"), "{line}");
+        let some = no_candidates_line(&skipped, 3, 50);
+        assert!(some.contains("1 of 3 test target(s)"));
+        assert!(some.contains("In the analysed targets: The engine"));
+        assert!(!no_candidates_line(&[], 3, 50).contains("max-mir-size"));
+
+        let mut out = Vec::new();
+        print_out_of_scope_report(&mut out, &[] as &[DeclinedFunction], &skipped, 80, &[]);
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("above the 80 MB scalability threshold"),
+            "{out}"
+        );
     }
 
     #[test]

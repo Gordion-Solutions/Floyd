@@ -263,7 +263,7 @@ upload floyd-mcdc.xml`).
 |--------|--------|
 | `--format=text\|json\|junit` | Output format (default `text`). |
 | `--only=<pat>` | Analyse only functions whose name contains `<pat>` (repeatable). |
-| `--max-mir-size=<MB>` | Skip test-target MIR files larger than `<MB>` megabytes (default 50); they are listed in the JSON `skipped_oversize_mirs`. Raise it for crates with heavy monomorphisation (for example `fixed` needs `--max-mir-size=200`). |
+| `--max-mir-size=<MB>` | Skip test-target MIR files larger than `<MB>` megabytes (default 50). Skipped files are listed on stderr with their sizes and in the JSON `skipped_oversize_mirs`; when they are why no decision was found, the `no_candidates` message says so. Raise it for crates with heavy monomorphisation (for example `fixed` needs `--max-mir-size=200`). |
 | `--features=<list>`, `-F <list>` | Enable cargo features for the instrumented `cargo build --tests` (repeatable; comma- or space-separated, as for cargo). |
 | `--all-features`, `--no-default-features` | Passed to the instrumented build, as for `cargo test`. Crates whose test suite expects `cargo test --all-features` (such as `time`) need it. |
 
