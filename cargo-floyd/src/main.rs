@@ -353,6 +353,15 @@ struct SkippedMir {
     bytes: u64,
 }
 
+/// A test-target MIR file Floyd could not read or parse completely.
+/// Functions in the unparsed part are absent from `candidates` and
+/// `out_of_scope`, so the report names the file and the reason.
+#[derive(serde::Serialize, Clone, Debug)]
+struct MirParseProblem {
+    path: String,
+    problem: String,
+}
+
 /// A test target built with `harness = false`. Floyd does not run
 /// such binaries: they are plain programs that ignore libtest's
 /// `--list` / `--exact` flags and would execute their real `main`.
@@ -395,6 +404,8 @@ struct CargoRuntimeReport<'a> {
     skipped_oversize_mirs: &'a [SkippedMir],
     /// The size guard in effect (`--max-mir-size`, default 50).
     max_mir_size_mb: u64,
+    /// MIR files that could not be read or were parsed only in part.
+    mir_parse_problems: &'a [MirParseProblem],
     /// Test targets with `harness = false` that were not listed or
     /// run, and so contribute no tests or candidates.
     skipped_no_harness: &'a [NoHarnessTarget],
@@ -720,6 +731,9 @@ fn run_static_mode(source: &Path, workdir: &Path, format: Format) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    for p in parsed.parse_problems() {
+        eprintln!("cargo-floyd: {}: {p}", mir_path.display());
+    }
 
     let tree = decision::decompose(&parsed);
     let matrix = masking::analyze(&tree);
@@ -780,6 +794,7 @@ fn run_test_mode_cargo(
         tests_discovered: &[],
         out_of_scope: &[],
         skipped_oversize_mirs: &[],
+        mir_parse_problems: &[],
         skipped_no_harness: &[],
         max_mir_mb,
     };
@@ -854,6 +869,7 @@ fn run_test_mode_cargo(
     let max_mir_bytes: u64 = max_mir_mb * 1024 * 1024;
     let mut skipped_oversize_mirs: Vec<(std::path::PathBuf, u64)> = Vec::new();
     let mut skipped_no_harness: Vec<NoHarnessTarget> = Vec::new();
+    let mut mir_parse_problems: Vec<MirParseProblem> = Vec::new();
 
     if std::env::var("FLOYD_DIAG").is_ok() {
         eprintln!("[progress] starting Pass 1 (parse MIR + enumerate tests)");
@@ -890,14 +906,27 @@ fn run_test_mode_cargo(
                 continue;
             }
         }
+        let problem = |problem: String| MirParseProblem {
+            path: artifact.mir_path.display().to_string(),
+            problem,
+        };
         let mir_text = match std::fs::read_to_string(&artifact.mir_path) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                mir_parse_problems.push(problem(format!(
+                    "could not read the MIR ({e}); the target was not analysed"
+                )));
+                continue;
+            }
         };
         let mir = match mir::parse_text(&mir_text) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                mir_parse_problems.push(problem(format!("{e}; the target was not analysed")));
+                continue;
+            }
         };
+        mir_parse_problems.extend(mir.parse_problems().into_iter().map(problem));
         let tests = match runner::list_tests(&artifact.binary_path) {
             Ok(t) => t,
             Err(e) => {
@@ -910,6 +939,7 @@ fn run_test_mode_cargo(
                         tests_discovered: &all_tests,
                         out_of_scope: &declined,
                         skipped_oversize_mirs: &skipped_oversize_mirs,
+                        mir_parse_problems: &mir_parse_problems,
                         skipped_no_harness: &skipped_no_harness,
                         ..partial(None)
                     },
@@ -1014,6 +1044,9 @@ fn run_test_mode_cargo(
 
     if !skipped_oversize_mirs.is_empty() {
         print_oversize_notice(&mut std::io::stderr(), &skipped_oversize_mirs, max_mir_mb);
+    }
+    if !mir_parse_problems.is_empty() {
+        print_mir_parse_problems(&mut std::io::stderr(), &mir_parse_problems);
     }
     if std::env::var("FLOYD_DIAG").is_ok() {
         eprintln!("[progress] Pass 1 complete: {} candidates, {} declined, {} artifacts, {} skipped-oversize",
@@ -1138,6 +1171,7 @@ fn run_test_mode_cargo(
                     tests_discovered: &all_tests,
                     out_of_scope: &declined,
                     skipped_oversize_mirs: &skipped_oversize_mirs,
+                    mir_parse_problems: &mir_parse_problems,
                     skipped_no_harness: &skipped_no_harness,
                     ..partial(None)
                 },
@@ -1282,6 +1316,7 @@ fn run_test_mode_cargo(
         out_of_scope: &declined,
         skipped_oversize_mirs: &skipped_mirs,
         max_mir_size_mb: max_mir_mb,
+        mir_parse_problems: &mir_parse_problems,
         skipped_no_harness: &skipped_no_harness,
     };
     // Decline paths: the human-readable explanation goes to stderr
@@ -1293,6 +1328,7 @@ fn run_test_mode_cargo(
                 &declined,
                 &skipped_oversize_mirs,
                 max_mir_mb,
+                &mir_parse_problems,
                 &skipped_no_harness,
             ),
             Format::Json => {
@@ -1305,6 +1341,7 @@ fn run_test_mode_cargo(
                 &declined,
                 &skipped_oversize_mirs,
                 max_mir_mb,
+                &mir_parse_problems,
                 &skipped_no_harness,
             ),
         }
@@ -1347,6 +1384,7 @@ fn run_test_mode_cargo(
                 &declined,
                 &skipped_oversize_mirs,
                 max_mir_mb,
+                &mir_parse_problems,
                 &skipped_no_harness,
             );
         }
@@ -1385,6 +1423,7 @@ struct Partial<'a> {
     tests_discovered: &'a [String],
     out_of_scope: &'a [DeclinedFunction],
     skipped_oversize_mirs: &'a [(std::path::PathBuf, u64)],
+    mir_parse_problems: &'a [MirParseProblem],
     skipped_no_harness: &'a [NoHarnessTarget],
     max_mir_mb: u64,
 }
@@ -1441,6 +1480,7 @@ fn error_report<'a>(
         out_of_scope: partial.out_of_scope,
         skipped_oversize_mirs: skipped,
         max_mir_size_mb: partial.max_mir_mb,
+        mir_parse_problems: partial.mir_parse_problems,
         skipped_no_harness: partial.skipped_no_harness,
     }
 }
@@ -1554,6 +1594,21 @@ fn print_oversize_notice(
     );
 }
 
+/// The notice for MIR files Floyd could not read or parse in full:
+/// each file and what was lost. Decisions in the lost part are
+/// neither candidates nor out of scope, so they must be named here.
+fn print_mir_parse_problems(out: &mut dyn std::io::Write, problems: &[MirParseProblem]) {
+    let _ = writeln!(
+        out,
+        "cargo-floyd: {} MIR problem(s); the functions affected are not \
+         analysed and do not appear as candidates or out of scope:",
+        problems.len()
+    );
+    for p in problems {
+        let _ = writeln!(out, "  {}: {}", p.path, p.problem);
+    }
+}
+
 /// The stderr line for the `no_candidates` verdict. When MIR files
 /// were skipped by the size guard it says so first, since the
 /// decisions in them were never looked at.
@@ -1630,6 +1685,9 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
             return ExitCode::from(1);
         }
     };
+    for p in mir.parse_problems() {
+        eprintln!("cargo-floyd: {}: {p}", compiled.mir_path.display());
+    }
     // 4. Enumerate the binary's tests.
     let tests = match runner::list_tests(&compiled.binary_path) {
         Ok(t) => t,
@@ -2220,8 +2278,13 @@ fn print_out_of_scope_report(
     declined: &[impl std::fmt::Debug],
     skipped_oversize_mirs: &[(std::path::PathBuf, u64)],
     max_mir_mb: u64,
+    mir_parse_problems: &[MirParseProblem],
     skipped_no_harness: &[NoHarnessTarget],
 ) {
+    if !mir_parse_problems.is_empty() {
+        let _ = writeln!(out);
+        print_mir_parse_problems(out, mir_parse_problems);
+    }
     if !skipped_no_harness.is_empty() {
         let _ = writeln!(out);
         let _ = writeln!(
@@ -2474,6 +2537,7 @@ mod tests {
             out_of_scope: &declined,
             skipped_oversize_mirs: &skipped,
             max_mir_size_mb: 50,
+            mir_parse_problems: &[],
             skipped_no_harness: &[],
         };
         let v: serde_json::Value =
@@ -2948,6 +3012,7 @@ mod tests {
             tests_discovered: tests,
             out_of_scope: &[],
             skipped_oversize_mirs: skipped,
+            mir_parse_problems: &[],
             skipped_no_harness: no_harness,
             max_mir_mb: 50,
         }
@@ -3024,12 +3089,55 @@ mod tests {
         assert!(!no_candidates_line(&[], 3, 50).contains("max-mir-size"));
 
         let mut out = Vec::new();
-        print_out_of_scope_report(&mut out, &[] as &[DeclinedFunction], &skipped, 80, &[]);
+        print_out_of_scope_report(&mut out, &[] as &[DeclinedFunction], &skipped, 80, &[], &[]);
         let out = String::from_utf8(out).unwrap();
         assert!(
             out.contains("above the 80 MB scalability threshold"),
             "{out}"
         );
+    }
+
+    /// A MIR file parsed only in part is named in the JSON report and
+    /// the text report, with what was lost.
+    #[test]
+    fn mir_parse_problems_are_reported_in_json_and_text() {
+        let problems = vec![MirParseProblem {
+            path: "/w/t/lib.mir".into(),
+            problem: "no closing brace for the top-level item `alloc1 (size: 1, align: 1) {`; \
+                      the rest of the file (3 function(s)) was not parsed or analysed"
+                .into(),
+        }];
+        let tests: Vec<String> = Vec::new();
+        let partial = Partial {
+            mir_parse_problems: &problems,
+            ..partial_for_tests(&tests, &[], &[])
+        };
+        let error = failure::RunError::default();
+        let v = serde_json::to_value(error_report(
+            &partial,
+            RuntimeVerdict::TestRunFailed,
+            &error,
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(v["mir_parse_problems"][0]["path"], "/w/t/lib.mir");
+        assert!(v["mir_parse_problems"][0]["problem"]
+            .as_str()
+            .unwrap()
+            .contains("3 function(s)"));
+
+        let mut out = Vec::new();
+        print_out_of_scope_report(
+            &mut out,
+            &[] as &[DeclinedFunction],
+            &[],
+            50,
+            &problems,
+            &[],
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("1 MIR problem(s)"), "{out}");
+        assert!(out.contains("/w/t/lib.mir: no closing brace"), "{out}");
     }
 
     #[test]

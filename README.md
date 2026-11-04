@@ -409,7 +409,8 @@ format still reports why:
 `setup_failed` (llvm-tools missing), `summary.percentage` `null`, an
 `error` object (`stage`, `message`, `diagnostics`, `ice`, `stderr`),
 and whatever was collected before the failure (`tests_discovered`,
-`out_of_scope`, `skipped_no_harness`, `skipped_oversize_mirs`).
+`out_of_scope`, `skipped_no_harness`, `skipped_oversize_mirs`,
+`mir_parse_problems`).
 `error` is `null` on the other verdicts. `--format=junit` prints a
 document with one `<testcase>` carrying an `<error>` whose `type` is
 the verdict.
@@ -471,6 +472,12 @@ a candidate's function and its package has such a target, the
 candidate carries a `note` naming the skipped target(s), which may be
 what exercises it; the text explanation of an all-unobserved verdict
 prints the same note.
+
+A test-target MIR file Floyd could not read, could not parse, or
+parsed only in part (a function header its MIR grammar does not
+recognise, or an item whose closing brace it never found) is listed
+in `mir_parse_problems` (`path`, `problem`) and on stderr. Functions
+in the unparsed part are neither candidates nor `out_of_scope`.
 
 Functions that have a decision the engine declined are listed in
 `out_of_scope`, each with a `reason`: `non_bool_leaf` when an arm's

@@ -77,6 +77,46 @@ pub struct Mir {
     /// const-generic monomorphisation produces hundreds of such
     /// bodies, each thousands of lines of MIR).
     pub decisionless_functions: usize,
+    /// A top-level item whose closing brace the parser never found:
+    /// everything from that item to the end of the input was not
+    /// parsed, so functions after it are missing from
+    /// [`Mir::functions`]. `None` for a well-formed dump.
+    pub unterminated_item: Option<UnterminatedItem>,
+}
+
+/// A top-level MIR item that runs to end of input without its
+/// closing `}`. See [`Mir::unterminated_item`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnterminatedItem {
+    /// The item's header line, e.g. `fn f(_1: bool) -> bool {`.
+    pub header: String,
+    /// Function headers in the unparsed tail (the item itself, if it
+    /// is a function, included).
+    pub functions_lost: usize,
+}
+
+impl Mir {
+    /// One sentence per problem that made the parse incomplete:
+    /// unrecognised function headers and an unterminated item. Empty
+    /// when every function in the input was parsed.
+    pub fn parse_problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.unparseable_functions > 0 {
+            out.push(format!(
+                "{} function header(s) not recognised by Floyd's MIR grammar; \
+                 those functions were not analysed",
+                self.unparseable_functions
+            ));
+        }
+        if let Some(u) = &self.unterminated_item {
+            out.push(format!(
+                "no closing brace for the top-level item `{}`; the rest of the \
+                 file ({} function(s)) was not parsed or analysed",
+                u.header, u.functions_lost
+            ));
+        }
+        out
+    }
 }
 
 /// One function's MIR.
@@ -556,6 +596,21 @@ fn strip_switchintless_fn_bodies(input: &str) -> (String, usize) {
         // `{`. Non-fn top-level items (static X = {, const FOO =
         // {, scope ... {) are left untouched; the main parser's
         // own skip_depth / scope_nest machinery handles them.
+        // An allocation hex dump is data: its ASCII column can end
+        // in `{` (e.g. the bytes `\u{`), which must not count as a
+        // brace. Copy it through to its closing `}` uncounted.
+        if top_depth == 0 && is_alloc_dump_header(trimmed) {
+            loop {
+                out.push_str(lines[i]);
+                out.push('\n');
+                i += 1;
+                if i >= lines.len() || lines[i - 1].trim() == "}" {
+                    break;
+                }
+            }
+            continue;
+        }
+
         if top_depth == 0 && is_fn_header_line(trimmed) {
             // Scan ahead for the matching close brace, tracking
             // local depth. We only consider `switchInt` occurrences
@@ -654,6 +709,20 @@ fn is_fn_header_line(line: &str) -> bool {
     line.starts_with("fn ") && line.ends_with('{')
 }
 
+/// Is this line the header of an allocation dump, e.g.
+/// `alloc196 (size: 16, align: 8) {`? rustc prints one after the
+/// functions that use a constant allocation. Its body is a hex dump
+/// with an ASCII rendering of the bytes, so braces in it are data;
+/// it ends at the first line that is exactly `}` (a dump line always
+/// starts with an offset or hex bytes).
+fn is_alloc_dump_header(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("alloc") else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && rest[digits..].starts_with(" (") && line.ends_with('{')
+}
+
 /// Parse an `--emit=mir` text dump into a [`Mir`].
 ///
 /// Phase 0 scope: function headers, `debug` annotations, `let`
@@ -707,16 +776,38 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
     // braces must be tracked so the matching close doesn't get
     // misread as the function's close.
     let mut scope_nest: u32 = 0;
+    // Brace depth inside a function-level `coroutine layout { ... }`
+    // block (async fns and blocks): the coroutine's saved-local
+    // layout, which carries no control flow. Skipped, braces counted.
+    let mut layout_depth: u32 = 0;
     let mut current_fn: Option<MirFunction> = None;
     let mut current_block: Option<MirBlock> = None;
     // Set by a `// MIR FOR CTFE` line; consumed by the next
     // top-level item, which is the CTFE body of a `const fn`.
     let mut next_is_ctfe = false;
+    // Inside an allocation dump (see `is_alloc_dump_header`): skip
+    // to its closing `}` without counting braces.
+    let mut in_alloc_dump = false;
+    // Header of the top-level item being parsed or skipped, for
+    // `Mir::unterminated_item`.
+    let mut open_item = String::new();
 
     for (i, raw) in input.lines().enumerate() {
         let line_no = i + 1;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+        if in_alloc_dump {
+            if trimmed == "}" {
+                in_alloc_dump = false;
+            }
+            continue;
+        }
+        if depth == 0 && skip_depth == 0 && is_alloc_dump_header(trimmed) {
+            next_is_ctfe = false;
+            in_alloc_dump = true;
+            open_item = trimmed.to_string();
             continue;
         }
         // Lines that are *entirely* comments (preamble warnings, etc.)
@@ -751,6 +842,20 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
         if code.ends_with('{') && depth == 0 && !code.starts_with("fn ") {
             next_is_ctfe = false;
             skip_depth = 1;
+            open_item = code.to_string();
+            continue;
+        }
+
+        if layout_depth > 0 {
+            if code.ends_with('{') {
+                layout_depth += 1;
+            } else if code == "}" {
+                layout_depth -= 1;
+            }
+            continue;
+        }
+        if depth == 1 && code == "coroutine layout {" {
+            layout_depth = 1;
             continue;
         }
 
@@ -766,6 +871,7 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
         // Open a brace: either a function or a basic block header.
         if code.ends_with('{') {
             if depth == 0 {
+                open_item = code.to_string();
                 let is_ctfe = std::mem::take(&mut next_is_ctfe);
                 match parse_fn_header(code) {
                     Some(f) => {
@@ -897,7 +1003,28 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
         }
     }
 
+    if in_alloc_dump || skip_depth > 0 || depth > 0 || layout_depth > 0 {
+        mir.unterminated_item = Some(UnterminatedItem {
+            functions_lost: count_fn_headers_from(input, &open_item),
+            header: open_item,
+        });
+    }
+
     Ok(mir)
+}
+
+/// Number of top-level function headers from the last line equal
+/// to `header` to the end of `input`.
+fn count_fn_headers_from(input: &str, header: &str) -> usize {
+    let lines: Vec<&str> = input.lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|l| l.trim() == header)
+        .unwrap_or(lines.len());
+    lines[start..]
+        .iter()
+        .filter(|l| is_fn_header_line(l.trim()))
+        .count()
 }
 
 // ---------------------------------------------------------------------------
@@ -2751,5 +2878,151 @@ fn decide(_1: i32, _2: i32) -> bool {
             }
             other => panic!("expected AssignCopy{{dst:0,src:2,span:Some}}, got {other:?}"),
         }
+    }
+
+    /// Two functions separated by the allocation dump rustc prints
+    /// for a `&str` constant. The dump's ASCII column ends in `\u{`
+    /// (regex's `src/regex/bytes.rs` test `test_debug_output_ascii_escape`
+    /// produces exactly this), so the line ends with `{`.
+    const ALLOC_DUMP_BETWEEN_FNS_MIR: &str = r#"
+fn bytes::f(_1: bool) -> bool {
+    let mut _0: bool;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        _0 = const false;
+        return;
+    }
+
+    bb2: {
+        _0 = const true;
+        return;
+    }
+}
+
+alloc146 (size: 88, align: 1) {
+    0x00 │ 4d 61 74 63 68 20 7b 20 73 74 61 72 74 3a 20 30 │ Match { start: 0
+    0x30 │ 21 5c 6e 54 68 69 73 20 69 73 20 61 20 5c 75 7b │ !\nThis is a \u{
+    0x40 │ 31 62 7d 5b 33 31 6d 74 65 73 74 5c 75 7b 31 62 │ 1b}[31mtest\u{1b
+    0x50 │ 7d 5b 30 6d 2e 22 20 7d                         │ }[0m." }
+}
+
+fn string::f(_1: bool) -> bool {
+    let mut _0: bool;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        _0 = const false;
+        return;
+    }
+
+    bb2: {
+        _0 = const true;
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn braces_in_an_alloc_dump_do_not_swallow_the_rest_of_the_file() {
+        let mir = parse_text(ALLOC_DUMP_BETWEEN_FNS_MIR).expect("parse ok");
+        let names: Vec<&str> = mir.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["bytes::f", "string::f"]);
+        assert_eq!(mir.functions[1].blocks.len(), 3);
+        assert!(mir.unterminated_item.is_none());
+        assert!(mir.parse_problems().is_empty());
+    }
+
+    #[test]
+    fn decisionless_fn_after_an_alloc_dump_is_still_stripped() {
+        let mut body = String::from("fn g() -> () {\n    let mut _0: ();\n\n    bb0: {\n");
+        for _ in 0..60 {
+            body.push_str("        nop;\n");
+        }
+        body.push_str("        return;\n    }\n}\n");
+        let input = format!("{ALLOC_DUMP_BETWEEN_FNS_MIR}\n{body}");
+        let mir = parse_text(&input).expect("parse ok");
+        assert_eq!(mir.functions.len(), 3);
+        assert_eq!(mir.decisionless_functions, 1);
+    }
+
+    #[test]
+    fn alloc_dump_header_shapes() {
+        assert!(is_alloc_dump_header("alloc196 (size: 16, align: 8) {"));
+        assert!(is_alloc_dump_header(
+            "alloc7 (static: FOO, size: 4, align: 4) {"
+        ));
+        assert!(!is_alloc_dump_header("alloc (size: 16, align: 8) {"));
+        assert!(!is_alloc_dump_header("allocate::f() -> () {"));
+        assert!(!is_alloc_dump_header("alloc196 (size: 16, align: 8)"));
+    }
+
+    /// An async block's MIR opens with its coroutine layout, a
+    /// brace block that is neither a scope nor a basic block.
+    const ASYNC_BLOCK_WITH_COROUTINE_LAYOUT_MIR: &str = r#"
+fn t::{closure#0}(_1: Pin<&mut {async block@t.rs:1:1: 1:9}>, _2: &mut std::task::Context<'_>) -> Poll<i32> {
+    coroutine layout {
+        variant_fields = {
+            Unresumed(0): [],            // in scope 0 at t.rs:1:1: 1:1
+            Returned (1): [],            // in scope 0 at t.rs:1:9: 1:9
+        }
+        storage_conflicts = BitMatrix(0x0) {}
+    }
+    debug _task_context => _5;
+    let mut _0: std::task::Poll<i32>;
+    let mut _3: u32;
+
+    bb0: {
+        switchInt(move _3) -> [0: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        return;
+    }
+
+    bb2: {
+        unreachable;
+    }
+}
+
+fn after() -> () {
+    bb0: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn coroutine_layout_block_is_skipped() {
+        let mir = parse_text(ASYNC_BLOCK_WITH_COROUTINE_LAYOUT_MIR).expect("parse ok");
+        let names: Vec<&str> = mir.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["t::{closure#0}", "after"]);
+        assert_eq!(mir.functions[0].blocks.len(), 3);
+        assert!(mir.parse_problems().is_empty());
+    }
+
+    #[test]
+    fn unterminated_item_is_reported_not_silently_dropped() {
+        let input = "fn a(_1: bool) -> bool {\n    bb0: {\n        return;\n    }\n}\n\
+                     const X::promoted[0]: &str = {\n    bb0: {\n        return;\n    }\n\n\
+                     fn b(_1: bool) -> bool {\n    bb0: {\n        return;\n    }\n}\n";
+        let mir = parse_text(input).expect("parse ok");
+        assert_eq!(mir.functions.len(), 1);
+        assert_eq!(
+            mir.unterminated_item,
+            Some(UnterminatedItem {
+                header: "const X::promoted[0]: &str = {".to_string(),
+                functions_lost: 1,
+            })
+        );
+        let problems = mir.parse_problems();
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("no closing brace"), "{problems:?}");
     }
 }
