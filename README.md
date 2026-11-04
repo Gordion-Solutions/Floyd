@@ -35,6 +35,12 @@ exercised or unexercised. When any condition is unknown, Floyd
 prints no percentage. See
 [Tests that evaluate a decision more than once](#tests-that-evaluate-a-decision-more-than-once).
 
+For an end-to-end walkthrough, see
+[`demo/restraint-controller`](demo/restraint-controller/): an airbag
+arming decision at 100% MC/DC, then a planted wiring bug that the
+remaining tests and 100% line coverage miss, and the two unexercised
+conditions Floyd reports for it.
+
 ## Install
 
 ```sh

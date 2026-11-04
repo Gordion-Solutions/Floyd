@@ -1,0 +1,9 @@
+[package]
+name = "restraint-controller"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Floyd demo: airbag arming decision with a planted wiring bug exposed by MC/DC."
+
+[workspace]
