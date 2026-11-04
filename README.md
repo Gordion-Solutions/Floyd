@@ -11,19 +11,32 @@ engine for Rust, focused on automotive safety-critical code
 Project page: <https://gordionsolutions.co.uk/software/#floyd>
 
 ```
-$ cargo floyd test
-floyd  runtime MC/DC analysis of Cargo.toml
+$ cd demo/restraint-controller && cargo floyd test
+floyd  runtime MC/DC analysis of /path/to/floyd/demo/restraint-controller/Cargo.toml
 
-Tests discovered: 4
-Observations:     4 (4 used, 0 ambiguous)
-Conditions:       channel_a_ok, channel_b_ok, master_enable
+Test targets: 3
+Tests discovered: 5
+Observations:     5 (5 used, 0 ambiguous)
+Conditions:       !seatbelt_fastened, crash_detected, occupant_present, speed_above_threshold
+
+Per-test observations:
+  arms_at_high_speed_when_occupant_unbelted_and_no_crash  !seatbelt_fastened=T  crash_detected=F  occupant_present=T  speed_above_threshold=T  result=T
+  no_arm_at_high_speed_when_occupant_belted_and_no_crash  !seatbelt_fastened=F  crash_detected=F  occupant_present=T  speed_above_threshold=T  result=F
+  arms_when_crash_detected_with_occupant  !seatbelt_fastened=-  crash_detected=T  occupant_present=T  speed_above_threshold=-  result=T
+  no_arm_at_low_speed_without_crash  !seatbelt_fastened=-  crash_detected=F  occupant_present=T  speed_above_threshold=F  result=F
+  no_arm_without_occupant         !seatbelt_fastened=-  crash_detected=-  occupant_present=F  speed_above_threshold=-  result=F
 
 Per-condition MC/DC status:
-  ✓ master_enable: EXERCISED  via (channel_a_ok=T, channel_b_ok=T, master_enable=F) -> F   vs   (channel_a_ok=T, channel_b_ok=T, master_enable=T) -> T
-  ✓ channel_a_ok:  EXERCISED  via (channel_a_ok=F, channel_b_ok=T, master_enable=T) -> F   vs   (channel_a_ok=T, channel_b_ok=T, master_enable=T) -> T
-  ✓ channel_b_ok:  EXERCISED  via (channel_a_ok=T, channel_b_ok=F, master_enable=T) -> F   vs   (channel_a_ok=T, channel_b_ok=T, master_enable=T) -> T
+  ✓ !seatbelt_fastened: EXERCISED  via (!seatbelt_fastened=F, crash_detected=F, occupant_present=T, speed_above_threshold=T) -> F   vs   (!seatbelt_fastened=T, crash_detected=F, occupant_present=T, speed_above_threshold=T) -> T
+  ✓ crash_detected: EXERCISED  via (!seatbelt_fastened=F, crash_detected=F, occupant_present=T, speed_above_threshold=F) -> F   vs   (!seatbelt_fastened=F, crash_detected=T, occupant_present=T, speed_above_threshold=F) -> T
+  ✓ occupant_present: EXERCISED  via (!seatbelt_fastened=F, crash_detected=F, occupant_present=F, speed_above_threshold=F) -> F   vs   (!seatbelt_fastened=T, crash_detected=T, occupant_present=T, speed_above_threshold=T) -> T
+  ✓ speed_above_threshold: EXERCISED  via (!seatbelt_fastened=T, crash_detected=F, occupant_present=T, speed_above_threshold=F) -> F   vs   (!seatbelt_fastened=T, crash_detected=F, occupant_present=T, speed_above_threshold=T) -> T
 
-MC/DC coverage: 3 of 3 conditions exercised (100%)
+MC/DC coverage: 4 of 4 conditions exercised (100%)
+
+Out of scope: 5 function(s) have a decision in a shape the engine's current patterns do not recognise. The engine declined them rather than report a wrong verdict. See --format=json's `out_of_scope` for the full list.
+$ echo $?
+0
 ```
 
 Each test contributes one observation per decision it evaluates.
@@ -32,8 +45,18 @@ An observation is *used* when the test evaluated the decision once
 that evaluated it several times with differing values is reported
 as *ambiguous* and can leave a condition `UNKNOWN` rather than
 exercised or unexercised. When any condition is unknown, Floyd
-prints no percentage. See
+prints no percentage; the summary line then reads
+`MC/DC coverage: N exercised, N not exercised, N unknown of N
+conditions ...`. See
 [Tests that evaluate a decision more than once](#tests-that-evaluate-a-decision-more-than-once).
+The "Out of scope" line lists functions (here the `#[test]` functions'
+own `assert!` expansions) whose decisions Floyd declines rather than
+analyse; it does not affect the verdict.
+
+The exit code is 0 when every condition is exercised, 2 when a
+decision was analysed but MC/DC was not demonstrated (a condition is
+unexercised or unknown), and 1 on an error or when no decision was
+analysed (see [Exit codes](#exit-codes)).
 
 For an end-to-end walkthrough, see
 [`demo/restraint-controller`](demo/restraint-controller/): an airbag

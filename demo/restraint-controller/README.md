@@ -34,17 +34,11 @@ The demo is its own workspace (it has an empty `[workspace]` table),
 so its build does not touch the Floyd workspace. Paths in the outputs
 below are shortened to `/path/to/floyd`.
 
-**Known issue.** Run plain `cargo test` with your default toolchain.
-If `cargo +nightly test` (or `cargo test` with nightly as the default
-toolchain) built `target/` first, `cargo floyd test` reuses those
-uninstrumented test binaries and stops with exit 1:
-
-```
-cargo-floyd: instrument error (cargo build --tests):
-no test artifacts produced; does the project have any #[test] functions?
-```
-
-Run `cargo clean` and then `cargo floyd test` again.
+`cargo test` and `cargo floyd test` can be run in any order, with
+any toolchain: Floyd builds its instrumented test binaries in
+`target/floyd`, separate from the ones `cargo test` builds in
+`target/debug`. (Earlier versions shared `target/debug` and stopped
+with exit 1 after a `cargo +nightly test`; that is fixed.)
 
 ## Step 0: the clean state, 100% MC/DC
 
@@ -162,8 +156,8 @@ Per-test observations:
 Per-condition MC/DC status:
   ✓ crash_detected: EXERCISED  via (crash_detected=F, occupant_present=T, seatbelt_fastened=F, speed_above_threshold=F) -> F   vs   (crash_detected=T, occupant_present=T, seatbelt_fastened=F, speed_above_threshold=F) -> T
   ✓ occupant_present: EXERCISED  via (crash_detected=F, occupant_present=F, seatbelt_fastened=F, speed_above_threshold=F) -> F   vs   (crash_detected=T, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T) -> T
-  ✗ seatbelt_fastened: UNEXERCISED — needs a test exercising (crash_detected=F, occupant_present=T, seatbelt_fastened=F, speed_above_threshold=T) or (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T)
-  ✗ speed_above_threshold: UNEXERCISED — needs a test exercising (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=F) or (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T)
+  ✗ seatbelt_fastened: UNEXERCISED — needs tests for both (crash_detected=F, occupant_present=T, seatbelt_fastened=F, speed_above_threshold=T) -> F and (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T) -> T
+  ✗ speed_above_threshold: UNEXERCISED — needs a test where (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T) -> T [the matching row (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=F) -> F is already covered]
 
 MC/DC coverage: 2 of 4 conditions exercised (50%)
 
@@ -179,10 +173,13 @@ was never evaluated (every test short-circuits before it), and
 
 For each unexercised condition Floyd names an independence pair from
 the truth table of the code as written: two rows that differ only in
-that condition. Tests covering both rows close the gap (a row may
-already be covered by an existing test that short-circuits the
-remaining conditions; here `no_arm_at_low_speed_without_crash` stands
-in for the `speed_above_threshold=F` row).
+that condition, with the outcome each gives. It then says which of
+the two rows still need a test. A row counts as covered when an
+existing test matches it on every condition the test evaluated: for
+`speed_above_threshold`, `no_arm_at_low_speed_without_crash`
+short-circuits `seatbelt_fastened` and so already covers the
+`speed_above_threshold=F` row, leaving one row to test. Neither
+`seatbelt_fastened` row is covered, so both need a test.
 
 Read the pair for `speed_above_threshold` against the spec: Floyd
 says the speed condition only matters when `seatbelt_fastened=T`.
@@ -193,7 +190,9 @@ written.
 `--format=json` (exit 2) reports
 `"seatbelt_fastened": "Unexercised"` and
 `"speed_above_threshold": "Unexercised"` in
-`analysis.condition_status`, with
+`analysis.condition_status`, the rows still needed in
+`analysis.missing_rows` (two for `seatbelt_fastened`, one for
+`speed_above_threshold`), and
 
 ```json
 "summary": {
@@ -207,14 +206,14 @@ written.
 ```
 
 `--format=junit` (exit 2) fails one testcase per unexercised
-condition; its message also gives each row's outcome:
+condition, with the same message as the text report:
 
 ```xml
     <testcase name="seatbelt_fastened" classname="floyd.mcdc">
-      <failure message="needs a test exercising (crash_detected=F, occupant_present=T, seatbelt_fastened=F, speed_above_threshold=T) -&gt; F or (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T) -&gt; T" type="UnexercisedCondition"/>
+      <failure message="needs tests for both (crash_detected=F, occupant_present=T, seatbelt_fastened=F, speed_above_threshold=T) -&gt; F and (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T) -&gt; T" type="UnexercisedCondition"/>
     </testcase>
     <testcase name="speed_above_threshold" classname="floyd.mcdc">
-      <failure message="needs a test exercising (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=F) -&gt; F or (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T) -&gt; T" type="UnexercisedCondition"/>
+      <failure message="needs a test where (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T) -&gt; T [the matching row (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=F) -&gt; F is already covered]" type="UnexercisedCondition"/>
     </testcase>
 ```
 
@@ -235,8 +234,8 @@ Both new tests fail against the buggy code: that is the bug caught.
 ```
 test arms_at_high_speed_when_occupant_unbelted_and_no_crash ... FAILED
 test no_arm_at_high_speed_when_occupant_belted_and_no_crash ... FAILED
-thread 'arms_at_high_speed_when_occupant_unbelted_and_no_crash' panicked at tests/mcdc.rs:31:5:
-thread 'no_arm_at_high_speed_when_occupant_belted_and_no_crash' panicked at tests/mcdc.rs:39:5:
+thread 'arms_at_high_speed_when_occupant_unbelted_and_no_crash' (<id>) panicked at tests/mcdc.rs:31:5:
+thread 'no_arm_at_high_speed_when_occupant_belted_and_no_crash' (<id>) panicked at tests/mcdc.rs:39:5:
 test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
