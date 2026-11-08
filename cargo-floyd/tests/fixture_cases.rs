@@ -4,14 +4,14 @@
 //! The fixture has one module per engine bug class (observation
 //! collapse, name-based correlation, spurious candidates, assert
 //! terminators, not-measurable decisions, the value-arm lift,
-//! `harness = false` targets). Each function there documents the
-//! outcome Floyd must report for it; [`EXPECTED`] restates those
-//! outcomes and the tests below check them against the JSON report,
-//! per function: candidate or `out_of_scope` (with its `reason`),
-//! `invoked`, observation count, `not_measurable.reason`, `lift`,
-//! the harness-free `note`; and, per `--only=<fn>` run, observation
-//! and ambiguous counts, the analysed conditions,
-//! `summary.percentage` and the exit code.
+//! `harness = false` targets, processes the build or a test spawns).
+//! Each function there documents the outcome Floyd must report for
+//! it; [`EXPECTED`] restates those outcomes and the tests below
+//! check them against the JSON report, per function: candidate or
+//! `out_of_scope` (with its `reason`), `invoked`, observation count,
+//! `not_measurable.reason`, `lift`, the harness-free `note`; and,
+//! per `--only=<fn>` run, observation and ambiguous counts, the
+//! analysed conditions, `summary.percentage` and the exit code.
 //!
 //! Tagged `#[ignore]` because it needs the nightly toolchain with
 //! `llvm-tools-preview` (cargo-floyd builds with `cargo +nightly`).
@@ -49,20 +49,32 @@ fn target_dir() -> PathBuf {
 ///
 /// Every run checks that the `harness = false` target `no_harness`
 /// was not executed: the fixture's `main` writes the marker file when
-/// it runs, including under `--list`.
+/// it runs, including under `--list`. It also checks that no test saw
+/// Floyd's build environment (`child_process::tests::
+/// floyd_build_environment_is_not_inherited` writes the leak marker)
+/// and that no process, the build script or a child a test spawned,
+/// left a `*.profraw` in the fixture directory.
 fn floyd(format: &str, extra: &[&str]) -> Run {
     let tag = extra.join("_").replace(['=', '-', ':'], "");
-    let marker = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let marker = tmp.join(format!(
         "no-harness-ran-{format}-{tag}-{}",
         std::process::id()
     ));
+    let leak = tmp.join(format!(
+        "build-env-leaked-{format}-{tag}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&leak);
+    let profiles_before = stray_profiles();
     let out = Command::new(env!("CARGO_BIN_EXE_cargo-floyd"))
         .args(["floyd", "test", &format!("--format={format}")])
         .args(extra)
         .arg(fixture_dir())
         .env("CARGO_TARGET_DIR", target_dir())
         .env("MCDC_CASES_NO_HARNESS_MARKER", &marker)
+        .env("MCDC_CASES_LEAK_MARKER", &leak)
         .output()
         .expect("run cargo-floyd");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -70,6 +82,19 @@ fn floyd(format: &str, extra: &[&str]) -> Run {
     assert!(
         !marker.exists(),
         "the harness = false target `no_harness` was executed ({format} {extra:?})"
+    );
+    assert!(
+        !leak.exists(),
+        "a test saw Floyd's build environment ({format} {extra:?}): {}",
+        std::fs::read_to_string(&leak).unwrap_or_default()
+    );
+    let new_profiles: Vec<PathBuf> = stray_profiles()
+        .difference(&profiles_before)
+        .cloned()
+        .collect();
+    assert!(
+        new_profiles.is_empty(),
+        "profiles written into the fixture directory ({format} {extra:?}): {new_profiles:?}"
     );
     let json = if format == "json" {
         serde_json::from_str(&stdout).unwrap_or_else(|e| {
@@ -84,6 +109,31 @@ fn floyd(format: &str, extra: &[&str]) -> Run {
         stderr,
         code: out.status.code().expect("exit code"),
     }
+}
+
+/// The `*.profraw` files in the fixture directory, outside `target`.
+/// An instrumented program run without `LLVM_PROFILE_FILE` writes
+/// `default_*.profraw` into its working directory: for a build script
+/// that is the package directory.
+fn stray_profiles() -> BTreeSet<PathBuf> {
+    fn walk(dir: &Path, found: &mut BTreeSet<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "target") {
+                    walk(&path, found);
+                }
+            } else if path.extension().is_some_and(|e| e == "profraw") {
+                found.insert(path);
+            }
+        }
+    }
+    let mut found = BTreeSet::new();
+    walk(&fixture_dir(), &mut found);
+    found
 }
 
 /// The whole-crate run, shared by the per-function checks.
@@ -201,6 +251,8 @@ const EXPECTED: &[(&str, Expect)] = &[
         "decline_split_locals",
         Expect::OutOfScope(&["unsupported_shape"]),
     ),
+    // 7. Processes other than the test.
+    ("spawned_and", measured(2, None)),
 ];
 
 /// Does MIR function name `name` denote fixture function `key`?
@@ -846,4 +898,45 @@ fn all_candidates_analyses_every_measurable_decision() {
             "{name}"
         );
     }
+}
+
+#[test]
+#[ignore = "requires nightly Rust + llvm-tools-preview component"]
+fn a_child_process_is_not_attributed_to_the_test_that_spawned_it() {
+    // `spawned_and_spawner` evaluates (T,T) and reruns the test binary
+    // as a child that evaluates (F,-). The child's counters must not
+    // reach the spawner's profile: had they, the tree rule would give
+    // the spawner both vectors. `floyd` checks that neither the child
+    // nor the build script wrote a profile into the fixture directory.
+    let run = floyd("json", &["--only=spawned_and"]);
+    assert_report_shape(&run, "spawned_and");
+    assert_eq!(conditions(&run), vec!["a", "b"]);
+    let vectors: Vec<(&str, &Value)> = observations(&run)
+        .iter()
+        .map(|o| {
+            assert_eq!(o["ambiguous"].as_bool(), Some(false), "{o}");
+            assert_eq!(o["evaluations"].as_u64(), Some(1), "{o}");
+            (str_field(o, "test_name").unwrap_or_default(), &o["inputs"])
+        })
+        .collect();
+    assert_eq!(
+        vectors,
+        [
+            (
+                "child_process::tests::spawned_and_child",
+                &serde_json::json!({"a": false})
+            ),
+            (
+                "child_process::tests::spawned_and_spawner",
+                &serde_json::json!({"a": true, "b": true})
+            ),
+        ]
+    );
+    assert_eq!(
+        percentage(&run),
+        Some(50.0),
+        "summary: {}",
+        run.json["summary"]
+    );
+    assert_eq!(run.code, 2);
 }

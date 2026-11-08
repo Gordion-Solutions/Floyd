@@ -122,6 +122,11 @@ pub struct CargoBuildResult {
 /// Floyd's instrumented builds use: `<target>/floyd`.
 pub const FLOYD_TARGET_SUBDIR: &str = "floyd";
 
+/// Subdirectory of [`floyd_target_dir`] that `LLVM_PROFILE_FILE`
+/// points into during the instrumented build (see
+/// [`compile_cargo_project_wrapped`]); removed after the build.
+pub const BUILD_PROFILE_SUBDIR: &str = "build-profraw";
+
 /// Instrumentation flags passed to every crate through cargo's
 /// rustflags, so cargo fingerprints them: a build with different
 /// values is never reused. Both are inert on crates that are not
@@ -201,6 +206,32 @@ pub fn compile_cargo_project_in(
     manifest_path: &Path,
     cargo_args: &[String],
     target_dir: Option<&Path>,
+) -> Result<CargoBuildResult, InstrumentError> {
+    compile_cargo_project_wrapped(manifest_path, cargo_args, target_dir, None)
+}
+
+/// [`compile_cargo_project_in`] with `RUSTC_WRAPPER` set to
+/// `rustc_wrapper` (the `floyd-rustc-shim`) for the `cargo build`
+/// only. With `None` the build inherits the caller's environment.
+///
+/// The wrapper is passed to the one `cargo` process rather than set
+/// in the caller's environment, which the tests Floyd later runs
+/// inherit: a test that spawns `cargo` or `rustc` (a `trybuild` ui
+/// test) would otherwise build its programs through the shim,
+/// instrumented.
+///
+/// The build also runs with `LLVM_PROFILE_FILE` naming a directory
+/// under `<target>/floyd` (removed afterwards), so that an
+/// instrumented program run during the build, such as the primary
+/// package's proc-macro loaded into `rustc`, writes its profile there
+/// instead of `default_*.profraw` in its working directory (the
+/// project directory). Build scripts are not instrumented (see the
+/// shim).
+pub fn compile_cargo_project_wrapped(
+    manifest_path: &Path,
+    cargo_args: &[String],
+    target_dir: Option<&Path>,
+    rustc_wrapper: Option<&Path>,
 ) -> Result<CargoBuildResult, InstrumentError> {
     let manifest = if manifest_path.is_dir() {
         manifest_path.join("Cargo.toml")
@@ -302,6 +333,11 @@ pub fn compile_cargo_project_in(
         .arg(&manifest)
         .arg("--target-dir")
         .arg(&floyd_target);
+    if let Some(wrapper) = rustc_wrapper {
+        build.env("RUSTC_WRAPPER", wrapper);
+    }
+    let build_profiles = floyd_target.join(BUILD_PROFILE_SUBDIR);
+    build.env("LLVM_PROFILE_FILE", build_profiles.join("%p-%m.profraw"));
     match rustflags_route(
         std::env::var_os("CARGO_ENCODED_RUSTFLAGS"),
         std::env::var_os("RUSTFLAGS"),
@@ -313,7 +349,9 @@ pub fn compile_cargo_project_in(
             build.arg("--config").arg(arg);
         }
     }
-    let build_out = build.args(cargo_args).output().map_err(|e| {
+    let build_out = build.args(cargo_args).output();
+    let _ = std::fs::remove_dir_all(&build_profiles);
+    let build_out = build_out.map_err(|e| {
         InstrumentError::new("cargo build --tests", format!("could not exec cargo: {e}"))
     })?;
     if !build_out.status.success() {

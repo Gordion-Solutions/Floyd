@@ -7,7 +7,8 @@
 //!   the `llvm-tools-preview` rustup component.
 //! - Runs an instrumented binary with a unique `LLVM_PROFILE_FILE`
 //!   per invocation, so each invocation produces a separate
-//!   `.profraw` containing only that run's counter values.
+//!   `.profraw` containing only that run's counter values (not
+//!   those of processes it spawns).
 //! - Merges and exports each `.profraw` to JSON via subprocess and
 //!   parses the result through [`crate::profile::parse`].
 //!
@@ -19,7 +20,7 @@
 use crate::profile;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 
 /// Error from any runner operation.
@@ -162,6 +163,41 @@ fn test_binary_command(binary: &Path) -> Command {
     cmd
 }
 
+/// Run `cmd` to completion, capturing its output, with its coverage
+/// profile written to `profraw` and to nowhere else.
+///
+/// The process is not given `LLVM_PROFILE_FILE=<profraw>`: processes
+/// it spawns inherit the variable, and an instrumented child (a test
+/// that reruns its own binary, a build of a `trybuild` case) would
+/// add its counters to `profraw` (the profile runtime appends to the
+/// file named without `%p`/`%m`), attributing the child's evaluations
+/// to the test. Instead the variable is `<profraw>.procs/%p.profraw`:
+/// every process writes a profile of its own into that directory, the
+/// spawned process's (`%p` is its pid) is moved to `profraw`, and the
+/// directory, with any child's profile, is removed. Children never
+/// fall back to `default_*.profraw` in their working directory, since
+/// they inherit the variable.
+fn output_with_profile(mut cmd: Command, profraw: &Path) -> std::io::Result<Output> {
+    let mut procs = profraw.as_os_str().to_owned();
+    procs.push(".procs");
+    let procs = PathBuf::from(procs);
+    let _ = std::fs::remove_dir_all(&procs);
+    let _ = std::fs::remove_file(profraw);
+    let child = cmd
+        .env("LLVM_PROFILE_FILE", procs.join("%p.profraw"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let own = procs.join(format!("{}.profraw", child.id()));
+    let out = child.wait_with_output();
+    if own.exists() {
+        std::fs::rename(&own, profraw)?;
+    }
+    let _ = std::fs::remove_dir_all(&procs);
+    out
+}
+
 /// Enumerate the `#[test]` functions in an instrumented test binary
 /// produced by [`crate::instrument::compile_test_target`].
 ///
@@ -179,10 +215,9 @@ pub fn list_tests(binary: &Path) -> Result<Vec<String>, RunnerError> {
         std::process::id(),
         LISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let out = test_binary_command(binary)
-        .args(["--list", "--format=terse"])
-        .env("LLVM_PROFILE_FILE", &profraw)
-        .output();
+    let mut cmd = test_binary_command(binary);
+    cmd.args(["--list", "--format=terse"]);
+    let out = output_with_profile(cmd, &profraw);
     let _ = std::fs::remove_file(&profraw);
     let out = out.map_err(|e| RunnerError {
         stage: "list_tests",
@@ -210,7 +245,10 @@ pub fn list_tests(binary: &Path) -> Result<Vec<String>, RunnerError> {
 
 /// Run a single test from an instrumented test binary, capturing its
 /// coverage to `profraw`. Equivalent to
-/// `<binary> --exact <test_name>` with `LLVM_PROFILE_FILE` set.
+/// `<binary> --exact <test_name>` with `LLVM_PROFILE_FILE` set; the
+/// profiles of processes the test spawns are written to a scratch
+/// directory next to `profraw` and discarded, never added to
+/// `profraw` or written to the working directory.
 ///
 /// Like [`run`], does not check the test's exit status — a failing
 /// `#[test]` still produces a valid `profraw`.
@@ -219,14 +257,12 @@ pub fn run_test_isolated(
     test_name: &str,
     profraw: &Path,
 ) -> Result<(), RunnerError> {
-    let out = test_binary_command(binary)
-        .args(["--exact", test_name])
-        .env("LLVM_PROFILE_FILE", profraw)
-        .output()
-        .map_err(|e| RunnerError {
-            stage: "run_test_isolated",
-            message: format!("could not exec {}: {e}", binary.display()),
-        })?;
+    let mut cmd = test_binary_command(binary);
+    cmd.args(["--exact", test_name]);
+    let out = output_with_profile(cmd, profraw).map_err(|e| RunnerError {
+        stage: "run_test_isolated",
+        message: format!("could not exec {}: {e}", binary.display()),
+    })?;
     if !profraw.exists() {
         return Err(RunnerError {
             stage: "run_test_isolated",
@@ -248,14 +284,12 @@ pub fn run_test_isolated(
 /// producing a valid `profraw`. Errors out only if `profraw` is not
 /// created.
 pub fn run(binary: &Path, argv: &[&str], profraw: &Path) -> Result<(), RunnerError> {
-    let out = test_binary_command(binary)
-        .args(argv)
-        .env("LLVM_PROFILE_FILE", profraw)
-        .output()
-        .map_err(|e| RunnerError {
-            stage: "run binary",
-            message: format!("could not exec {}: {e}", binary.display()),
-        })?;
+    let mut cmd = test_binary_command(binary);
+    cmd.args(argv);
+    let out = output_with_profile(cmd, profraw).map_err(|e| RunnerError {
+        stage: "run binary",
+        message: format!("could not exec {}: {e}", binary.display()),
+    })?;
     if !profraw.exists() {
         return Err(RunnerError {
             stage: "run binary",

@@ -7,9 +7,10 @@
 //! - `FLOYD_FIXTURE_FAIL_LIST` set: the lib test binary exits with
 //!   status 3 before `main`, so `--list` fails (test discovery).
 //! - `FLOYD_FIXTURE_NO_PROFILE` set: the test `both` deletes its
-//!   `LLVM_PROFILE_FILE` and aborts, so the run leaves no coverage
-//!   profile (test run). (Aborting alone is not enough: the profile
-//!   runtime creates the file, empty, at startup.)
+//!   profile (`LLVM_PROFILE_FILE`, `%p` expanded) and aborts, so
+//!   the run leaves no coverage profile (test run). (Aborting alone
+//!   is not enough: the profile runtime creates the file, empty, at
+//!   startup.)
 
 #[cfg(not(feature = "builds"))]
 compile_error!("failure-paths fixture: build with --features builds");
@@ -40,8 +41,12 @@ mod tests {
     #[test]
     fn both() {
         if std::env::var_os("FLOYD_FIXTURE_NO_PROFILE").is_some() {
-            if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
-                let _ = std::fs::remove_file(profile);
+            if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
+                // Floyd names the file with `%p` (the runtime's pid
+                // placeholder) so that processes a test spawns write
+                // profiles of their own.
+                let own = profile.replace("%p", &std::process::id().to_string());
+                let _ = std::fs::remove_file(own);
             }
             std::process::abort();
         }

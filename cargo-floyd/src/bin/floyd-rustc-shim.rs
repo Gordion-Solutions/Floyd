@@ -15,7 +15,8 @@
 //! compiling the package named in `Cargo.toml`. We inspect that
 //! env var, append the instrumentation flags for the primary
 //! package only, and exec the real rustc with the resulting
-//! args. Dep packages pass through unchanged.
+//! args. Dep packages, and the primary package's build script, pass
+//! through unchanged.
 //!
 //! The shim must be fast and side-effect-free: cargo invokes it
 //! once per compilation unit, including internal probe builds.
@@ -41,7 +42,7 @@ fn main() {
     // package being built. Dep crates do NOT get this env var.
     let is_primary = env::var_os("CARGO_PRIMARY_PACKAGE").is_some();
 
-    if is_primary {
+    if is_primary && !is_build_script(&rustc_args) {
         // Floyd's MIR-text + coverage-branch instrumentation. Only
         // added for the primary package so dep crates (serde,
         // critical-section, hash32, …) do not also dump MIR and
@@ -86,4 +87,54 @@ fn main() {
             exit(2);
         });
     exit(status.code().unwrap_or(1));
+}
+
+/// Is this the compilation of a build script? Cargo sets
+/// `CARGO_PRIMARY_PACKAGE` for the primary package's build script
+/// too, and names its crate `build_script_<file stem>`
+/// (`build_script_build` for `build.rs`).
+///
+/// A build script is not instrumented: it holds none of the code
+/// Floyd analyses, and cargo runs it in the package directory without
+/// `LLVM_PROFILE_FILE`, so an instrumented one leaves a
+/// `default_*.profraw` in the user's project.
+fn is_build_script(rustc_args: &[OsString]) -> bool {
+    rustc_args
+        .windows(2)
+        .find(|w| w[0] == "--crate-name")
+        .and_then(|w| w[1].to_str())
+        .is_some_and(|name| name.starts_with("build_script_"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn build_scripts_are_recognised_by_crate_name() {
+        assert!(is_build_script(&args(&[
+            "--crate-name",
+            "build_script_build",
+            "--edition=2021",
+            "build.rs",
+            "--crate-type",
+            "bin",
+        ])));
+        assert!(is_build_script(&args(&[
+            "--crate-name",
+            "build_script_gen"
+        ])));
+        assert!(!is_build_script(&args(&[
+            "--crate-name",
+            "anyhow",
+            "src/lib.rs",
+            "--crate-type",
+            "lib",
+        ])));
+        assert!(!is_build_script(&args(&["-vV"])));
+    }
 }

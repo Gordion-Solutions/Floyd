@@ -832,17 +832,15 @@ fn run_test_mode_cargo(
     // checks CARGO_PRIMARY_PACKAGE. Without this, every dep crate
     // also dumps MIR and gets instrumented — a heapless build
     // produced 336 GB virtual memory before rustc OOM'd on a
-    // 30 GB-RAM runner. Finding and setting the shim here (early)
-    // means the cargo build invoked inside `floyd::instrument`
-    // inherits the env var and routes rustc through our shim.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let shim = parent.join("floyd-rustc-shim");
-            if shim.exists() {
-                std::env::set_var("RUSTC_WRAPPER", &shim);
-            }
-        }
-    }
+    // 30 GB-RAM runner. The shim, next to this executable, is
+    // passed to the `cargo build` alone, as its RUSTC_WRAPPER: set
+    // in this process's environment, it would reach the tests run
+    // later, and a test that spawns cargo (trybuild) would build
+    // through the shim.
+    let shim = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.join("floyd-rustc-shim")))
+        .filter(|shim| shim.exists());
 
     let max_mir_mb = max_mir_mb.unwrap_or(DEFAULT_MAX_MIR_MB);
     let partial = |workspace_root| Partial {
@@ -859,7 +857,12 @@ fn run_test_mode_cargo(
 
     // Build all test artifacts in the cargo project.
     let build_started = std::time::SystemTime::now();
-    let build = match instrument::compile_cargo_project_in(manifest, cargo_args, target_dir) {
+    let build = match instrument::compile_cargo_project_wrapped(
+        manifest,
+        cargo_args,
+        target_dir,
+        shim.as_deref(),
+    ) {
         Ok(b) => b,
         Err(e) => {
             let error = build_error(manifest, &e, build_started);
