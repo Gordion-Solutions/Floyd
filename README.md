@@ -64,6 +64,49 @@ arming decision at 100% MC/DC, then a planted wiring bug that the
 remaining tests and 100% line coverage miss, and the two unexercised
 conditions Floyd reports for it.
 
+## Found in the wild
+
+Two decisions in published library code whose own tests leave a
+condition unexercised. These are test gaps, not bugs. Both runs exit
+2 (run 2026-11-08); output trimmed to the decision's lines.
+
+**anyhow 1.0.104**, `Buf::write_str` (`src/ensure.rs:60`),
+`b == b' ' || b == b'\n'`. When `ensure!` renders an operand's `Debug`
+output into its error message, it falls back to the bare message if
+that output contains a space or a newline. The tests cover the space,
+never the newline; an `ensure!` test whose operand's `Debug` output has
+a newline before any space would close the gap.
+
+```text
+Conditions:       b == 10, b == 32
+  ✗ b == 10: UNEXERCISED — needs a test where (b == 10=T, b == 32=F) -> T [the matching row (b == 10=F, b == 32=F) -> F is already covered]
+  ✓ b == 32: EXERCISED  via (b == 10=F, b == 32=F) -> F   vs   (b == 10=F, b == 32=T) -> T
+MC/DC coverage: 1 of 2 conditions exercised (50%)
+```
+
+```sh
+git clone https://github.com/dtolnay/anyhow && cd anyhow && git checkout bb1b0f9af0f645d5fdf1ac63a1fcbf3975ee452c
+cargo floyd test
+```
+
+**ipnet 2.12.2**, `Ipv4Net::new` (`src/ipnet.rs:625`),
+`prefix_len > 32`. The error path for a prefix length over 32 is
+covered only by a doc example; Floyd builds with `cargo build --tests`,
+so doc tests are not part of the run, and no unit test reaches it. A
+unit test asserting `Ipv4Net::new(addr, 33) == Err(PrefixLenError)`
+would close the gap.
+
+```text
+Conditions:       prefix_len > 32
+  ✗ prefix_len > 32: UNEXERCISED — needs a test where (prefix_len > 32=T) -> T [the matching row (prefix_len > 32=F) -> F is already covered]
+MC/DC coverage: 0 of 1 conditions exercised (0%)
+```
+
+```sh
+git clone https://github.com/krisprice/ipnet && cd ipnet && git checkout 13c5c5873c02127679b1e8e64b538e4e36942640
+cargo floyd test
+```
+
 ## Install
 
 ```sh
@@ -373,6 +416,7 @@ upload floyd-mcdc.xml`).
 | `--features=<list>`, `-F <list>` | Enable cargo features for the instrumented `cargo build --tests` (repeatable; comma- or space-separated, as for cargo). |
 | `--all-features`, `--no-default-features` | Passed to the instrumented build, as for `cargo test`. Crates whose test suite expects `cargo test --all-features` (such as `time`) need it. |
 | `--target-dir=<dir>` | The project's target directory, as for cargo (default: `CARGO_TARGET_DIR`, `build.target-dir`, else `target/`). The instrumented build goes into `<dir>/floyd`. |
+| `--all-candidates` | With `--format=json`, also analyse every measurable candidate, not only the selected one, and add them as `analyses`; the selected decision's report and the exit code are unchanged. Cargo projects only. |
 
 ### Build directory
 
