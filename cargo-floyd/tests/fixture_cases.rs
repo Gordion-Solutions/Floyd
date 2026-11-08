@@ -733,3 +733,117 @@ fn whole_crate_exit_code_follows_the_summary() {
         && summary["conditions_total"].as_u64() > Some(0);
     assert_eq!(run.code, if demonstrated { 0 } else { 2 }, "{summary}");
 }
+
+#[test]
+#[ignore = "requires nightly Rust + llvm-tools-preview component"]
+fn all_candidates_analyses_every_measurable_decision() {
+    let run = floyd("json", &["--all-candidates"]);
+    let base = full();
+    // The selected decision's report is unchanged by the flag.
+    for key in [
+        "verdict",
+        "analysis",
+        "observations",
+        "summary",
+        "candidates",
+    ] {
+        assert_eq!(run.json[key], base.json[key], "`{key}` changed");
+    }
+    assert_eq!(run.code, base.code);
+    assert!(
+        base.json.get("analyses").is_none(),
+        "analyses without the flag"
+    );
+
+    let analyses = run.json["analyses"].as_array().expect("analyses array");
+    let cands = candidates(&run);
+    // One entry per measurable candidate, in `candidates` order.
+    let want: Vec<u64> = cands
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.get("not_measurable").is_none())
+        .map(|(i, _)| i as u64)
+        .collect();
+    let got: Vec<u64> = analyses
+        .iter()
+        .map(|a| a["candidate"].as_u64().expect("candidate index"))
+        .collect();
+    assert_eq!(got, want);
+    // Every measured fixture function has its entry, with the
+    // observing tests the candidate list reports.
+    let mut measured = 0;
+    for (key, expect) in EXPECTED {
+        let Expect::Candidate {
+            not_measurable: None,
+            observations,
+            ..
+        } = expect
+        else {
+            continue;
+        };
+        measured += 1;
+        let a: Vec<&Value> = analyses
+            .iter()
+            .filter(|a| {
+                names(
+                    str_field(&a["provenance"], "function_name").unwrap_or_default(),
+                    key,
+                )
+            })
+            .collect();
+        assert_eq!(a.len(), 1, "`{key}`: expected one analysis");
+        let a = a[0];
+        let tests: BTreeSet<&str> = a["observations"]
+            .as_array()
+            .expect("observations")
+            .iter()
+            .filter_map(|o| str_field(o, "test_name"))
+            .collect();
+        assert_eq!(tests.len() as u64, *observations, "`{key}` observing tests");
+        for field in ["matrix", "condition_status", "summary", "decision"] {
+            assert!(a.get(field).is_some(), "`{key}` has no `{field}`: {a}");
+        }
+        assert_eq!(
+            a["summary"]["conditions_total"].as_u64(),
+            Some(
+                a["matrix"]["conditions"]
+                    .as_array()
+                    .expect("conditions")
+                    .len() as u64
+            ),
+            "`{key}`"
+        );
+    }
+    assert_eq!(analyses.len(), measured, "an analysis outside the table");
+    // Exactly one is the selected decision, identical to `analysis`.
+    let sel: Vec<&Value> = analyses
+        .iter()
+        .filter(|a| a["selected"].as_bool() == Some(true))
+        .collect();
+    assert_eq!(sel.len(), 1);
+    for key in ["matrix", "condition_status", "provenance"] {
+        assert_eq!(sel[0][key], run.json["analysis"][key], "selected `{key}`");
+    }
+    assert_eq!(sel[0]["observations"], run.json["observations"]);
+    // Each entry equals the decision's own `--only` analysis.
+    for name in ["dag_or_and", "single_and", "struct_leaf"] {
+        let only = floyd("json", &[&format!("--only={name}")]);
+        let a = analyses
+            .iter()
+            .find(|a| {
+                names(
+                    str_field(&a["provenance"], "function_name").unwrap_or_default(),
+                    name,
+                )
+            })
+            .expect("analysis");
+        for key in ["matrix", "condition_status", "missing_rows", "ruled_out"] {
+            assert_eq!(a.get(key), only.json["analysis"].get(key), "{name} `{key}`");
+        }
+        assert_eq!(a["observations"], only.json["observations"], "{name}");
+        assert_eq!(
+            a["summary"]["percentage"], only.json["summary"]["percentage"],
+            "{name}"
+        );
+    }
+}

@@ -397,3 +397,26 @@ fn floyd_in_target(name: &str, args: &[&str], target: &Path) -> Run {
         code: out.status.code().expect("exit code"),
     }
 }
+
+#[test]
+fn all_candidates_is_rejected_outside_cargo_test_mode() {
+    // Checked before anything is built, so no toolchain is needed.
+    let src = fixture("mcdc-cases").join("src/lib.rs");
+    for args in [
+        vec!["floyd", "test", "--all-candidates"],
+        vec!["floyd", "--all-candidates"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_cargo-floyd"))
+            .args(&args)
+            .arg(&src)
+            .output()
+            .expect("run cargo-floyd");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr
+                .contains("--all-candidates applies to `cargo floyd test` on cargo projects only"),
+            "{args:?}: {stderr}"
+        );
+    }
+}

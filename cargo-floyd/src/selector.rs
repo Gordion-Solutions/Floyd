@@ -154,7 +154,8 @@ fn tier(provenance: &DecisionProvenance) -> u8 {
     2
 }
 
-fn count_conditions(tree: &DecisionTree) -> usize {
+/// Number of distinct condition names in `tree`.
+pub fn count_conditions(tree: &DecisionTree) -> usize {
     let mut set: BTreeSet<String> = BTreeSet::new();
     for node in &tree.decisions {
         walk_conditions(node, &mut set);

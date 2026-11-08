@@ -395,6 +395,10 @@ struct CargoRuntimeReport<'a> {
     summary: CoverageSummary,
     /// Every decomposable candidate considered, before selection.
     candidates: &'a [CandidateSummary],
+    /// `--all-candidates` only: the full analysis of every
+    /// measurable candidate, in `candidates` order. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    analyses: Option<&'a [CandidateAnalysis]>,
     /// Functions with a `switchInt`-shaped decision that the
     /// engine's current patterns did not match. The engine declined
     /// them rather than report a wrong verdict — honest-scope
@@ -409,6 +413,30 @@ struct CargoRuntimeReport<'a> {
     /// Test targets with `harness = false` that were not listed or
     /// run, and so contribute no tests or candidates.
     skipped_no_harness: &'a [NoHarnessTarget],
+}
+
+/// One entry of the `--all-candidates` `analyses` array: a
+/// candidate's observations and analysis, in the shape of the
+/// top-level `observations` + `analysis` + `summary` of the selected
+/// decision.
+#[derive(serde::Serialize)]
+struct CandidateAnalysis {
+    /// `display_name (file:line)` of the decision.
+    decision: String,
+    /// Index of the decision in `candidates`.
+    candidate: usize,
+    /// True for the decision the selector picked, whose analysis is
+    /// also the top-level `analysis`.
+    selected: std::cell::Cell<bool>,
+    /// Every test's observation of this decision.
+    observations: Vec<ConditionObservation>,
+    /// Matrix, condition status, provenance, missing rows, as in
+    /// `analysis`.
+    #[serde(flatten)]
+    analysis: RuntimeAnalysis,
+    /// Condition counts of this decision (`not_measurable` is 0:
+    /// it counts candidates, not conditions).
+    summary: CoverageSummary,
 }
 
 /// JSON document for `cargo floyd test --format=json <file.rs>`.
@@ -472,8 +500,16 @@ fn main() -> ExitCode {
     // `--target-dir <dir>`: the project's target directory, as for
     // cargo; the instrumented build goes into `<dir>/floyd`.
     let mut target_dir: Option<std::path::PathBuf> = None;
+    // `--all-candidates`: analyse every measurable candidate, not
+    // only the selected one (JSON `analyses`).
+    let mut all_candidates = false;
     let mut i = 0;
     while i < args.len() {
+        if args[i] == "--all-candidates" {
+            all_candidates = true;
+            args.remove(i);
+            continue;
+        }
         if let Some(val) = args[i].strip_prefix("--target-dir=") {
             target_dir = Some(std::path::PathBuf::from(val));
             args.remove(i);
@@ -640,6 +676,12 @@ fn main() -> ExitCode {
         eprintln!("cargo-floyd: --target-dir applies to cargo projects only");
         return ExitCode::from(2);
     }
+    if all_candidates && !(is_test_mode && matches!(source, Source::Cargo(_))) {
+        eprintln!(
+            "cargo-floyd: --all-candidates applies to `cargo floyd test` on cargo projects only"
+        );
+        return ExitCode::from(2);
+    }
     // Relative to the directory cargo-floyd runs in, as for cargo.
     let target_dir = target_dir.map(|t| match std::env::current_dir() {
         Ok(cwd) => cwd.join(t),
@@ -651,7 +693,10 @@ fn main() -> ExitCode {
             &p,
             &workdir,
             format,
-            &only_patterns,
+            &Selection {
+                only_patterns,
+                all_candidates,
+            },
             max_mir_mb,
             &cargo_args,
             target_dir.as_deref(),
@@ -759,15 +804,28 @@ fn run_static_mode(source: &Path, workdir: &Path, format: Format) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Which candidates a cargo runtime run analyses.
+struct Selection {
+    /// `--only=<pat>`: only functions whose name contains a pattern.
+    only_patterns: Vec<String>,
+    /// `--all-candidates`: every measurable candidate, as well as the
+    /// selected one.
+    all_candidates: bool,
+}
+
 fn run_test_mode_cargo(
     manifest: &Path,
     workdir: &Path,
     format: Format,
-    only_patterns: &[String],
+    selection: &Selection,
     max_mir_mb: Option<u64>,
     cargo_args: &[String],
     target_dir: Option<&Path>,
 ) -> ExitCode {
+    let Selection {
+        only_patterns,
+        all_candidates,
+    } = selection;
     // Scope Floyd's `--emit=mir,link -Cinstrument-coverage
     // -Zcoverage-options=branch,condition -Zmir-include-spans` to
     // the primary package only, via a RUSTC_WRAPPER shim that
@@ -1293,6 +1351,31 @@ fn run_test_mode_cargo(
             }
         })
         .collect();
+    // `--all-candidates`: analyse every measurable candidate with a
+    // condition, exactly as the selected one is analysed below.
+    let analyses: Option<Vec<CandidateAnalysis>> = all_candidates.then(|| {
+        candidates
+            .iter()
+            .zip(&candidate_summaries)
+            .enumerate()
+            .filter(|(_, (c, s))| {
+                s.not_measurable.is_none() && selector::count_conditions(&c.tree) > 0
+            })
+            .map(|(idx, (c, s))| {
+                let mut analysis =
+                    masking::analyze_with_runtime(&c.tree, &c.observations, Variant::Masking);
+                analysis.provenance = Some(c.provenance.clone());
+                CandidateAnalysis {
+                    decision: s.label(),
+                    candidate: idx,
+                    selected: std::cell::Cell::new(false),
+                    observations: c.observations.clone(),
+                    summary: CoverageSummary::new(Some(&analysis), 0),
+                    analysis,
+                }
+            })
+            .collect()
+    });
     let not_measurable: Vec<&correlate::NotMeasurable> = candidate_summaries
         .iter()
         .filter_map(|c| c.not_measurable.as_ref())
@@ -1302,7 +1385,7 @@ fn run_test_mode_cargo(
     let manifest_str = manifest.display().to_string();
     let workspace_root_str = build.workspace_root.display().to_string();
     let test_targets = build.test_artifacts.len();
-    let report = |verdict, observations, analysis| CargoRuntimeReport {
+    let report = |verdict, observations, analysis, analyses| CargoRuntimeReport {
         manifest: manifest_str.clone(),
         workspace_root: Some(workspace_root_str.clone()),
         test_targets,
@@ -1313,6 +1396,7 @@ fn run_test_mode_cargo(
         analysis,
         summary: CoverageSummary::new(analysis, not_measurable_count),
         candidates: &candidate_summaries,
+        analyses,
         out_of_scope: &declined,
         skipped_oversize_mirs: &skipped_mirs,
         max_mir_size_mb: max_mir_mb,
@@ -1332,7 +1416,7 @@ fn run_test_mode_cargo(
                 &skipped_no_harness,
             ),
             Format::Json => {
-                if let Err(code) = print_json(&report(verdict, &[], None)) {
+                if let Err(code) = print_json(&report(verdict, &[], None, analyses.as_deref())) {
                     return code;
                 }
             }
@@ -1372,6 +1456,12 @@ fn run_test_mode_cargo(
     let mut analysis =
         masking::analyze_with_runtime(&chosen.tree, &all_observations, Variant::Masking);
     analysis.provenance = Some(chosen.provenance);
+    for a in analyses.iter().flatten() {
+        a.selected.set(
+            a.analysis.provenance == analysis.provenance
+                && a.analysis.matrix.conditions == analysis.matrix.conditions,
+        );
+    }
 
     match format {
         Format::Text => {
@@ -1393,6 +1483,7 @@ fn run_test_mode_cargo(
                 RuntimeVerdict::Analysed,
                 &all_observations,
                 Some(&analysis),
+                analyses.as_deref(),
             )) {
                 return code;
             }
@@ -1477,6 +1568,7 @@ fn error_report<'a>(
         analysis: None,
         summary: CoverageSummary::new(None, 0),
         candidates: &[],
+        analyses: None,
         out_of_scope: partial.out_of_scope,
         skipped_oversize_mirs: skipped,
         max_mir_size_mb: partial.max_mir_mb,
@@ -1874,7 +1966,7 @@ fn print_usage() {
     eprintln!("    cargo floyd test [--format=text|json|junit] [--only=<pat>]...");
     eprintln!("                     [--max-mir-size=<MB>] [--features=<list>]");
     eprintln!("                     [--all-features] [--no-default-features]");
-    eprintln!("                     [--target-dir=<dir>] [<path>]");
+    eprintln!("                     [--target-dir=<dir>] [--all-candidates] [<path>]");
     eprintln!("        Runtime MC/DC analysis: builds the project as a test");
     eprintln!("        crate with coverage instrumentation, runs each #[test]");
     eprintln!("        function individually, and reports which conditions the");
@@ -1895,6 +1987,14 @@ fn print_usage() {
     eprintln!("        --max-mir-size=<MB> (default 50) skips test-target MIR");
     eprintln!("        files larger than <MB> megabytes; skipped files are");
     eprintln!("        listed on stderr and in the JSON `skipped_oversize_mirs`.");
+    eprintln!();
+    eprintln!("        --all-candidates (cargo projects, JSON) also analyses every");
+    eprintln!("        measurable candidate, not only the selected one, and adds");
+    eprintln!("        them to the JSON as `analyses`: per decision its");
+    eprintln!("        `observations`, `matrix`, `condition_status`,");
+    eprintln!("        `missing_rows` and `summary`, as for `analysis`. The");
+    eprintln!("        selected decision (`analysis`, `summary`, exit code) is");
+    eprintln!("        unchanged; text and JUnit output ignore it.");
     eprintln!();
     eprintln!("        --features=<list> (or -F <list>), --all-features and");
     eprintln!("        --no-default-features are passed to the instrumented");
@@ -2534,6 +2634,7 @@ mod tests {
             analysis: None,
             summary: CoverageSummary::new(None, 1),
             candidates: &candidates,
+            analyses: None,
             out_of_scope: &declined,
             skipped_oversize_mirs: &skipped,
             max_mir_size_mb: 50,
