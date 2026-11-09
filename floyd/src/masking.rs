@@ -76,13 +76,25 @@ pub fn analyze(tree: &DecisionTree) -> IndependenceMatrix {
     analyze_with_variant(tree, Variant::Masking)
 }
 
-/// One condition assignment observed in a single test execution.
+/// One condition assignment observed in a single test execution,
+/// or the record that a test's evidence could not be reduced to one.
 ///
 /// Built by upstream stages (the `runner` per ADR-0002 produces one
 /// per test invocation). Floyd treats observations as opaque inputs
 /// to [`analyze_with_runtime`]; how they are obtained — per-test
 /// `profraw` parsing, instrumented harness, manually constructed for
 /// integration tests — is the caller's responsibility.
+///
+/// An observation is either a **condition vector** (`ambiguous ==
+/// false`: `inputs` and `result` describe evaluations that really
+/// occurred) or **ambiguous** (`ambiguous == true`: the test
+/// evaluated the decision several times with differing condition
+/// values, so per-condition aggregate counters cannot say which
+/// vectors occurred). Ambiguous observations carry no `inputs` and
+/// no `result`, only the raw [`Self::counts`]; [`analyze_with_runtime`]
+/// never uses them to demonstrate an independence pair. See
+/// [`crate::correlate::observations_from_counts`] for the rule that
+/// decides between the two.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConditionObservation {
     /// Optional test identifier, preserved for diagnostic output.
@@ -92,10 +104,104 @@ pub struct ConditionObservation {
     /// Short-circuited conditions are *omitted* — only conditions
     /// actually evaluated in this test appear. Callers that wish to
     /// represent unevaluated conditions explicitly should leave them
-    /// out of this map rather than inventing a value.
+    /// out of this map rather than inventing a value. Empty for an
+    /// ambiguous observation.
     pub inputs: BTreeMap<String, bool>,
-    /// The decision outcome under these inputs.
-    pub result: bool,
+    /// The decision outcome under these inputs. `None` for an
+    /// ambiguous observation, whose outcome is not attributable to
+    /// any one condition vector.
+    pub result: Option<bool>,
+    /// True when the test's coverage counters could not be reduced
+    /// to condition vectors known to have occurred. Excluded from
+    /// pair finding.
+    #[serde(default)]
+    pub ambiguous: bool,
+    /// How many times the test evaluated the decision, when known
+    /// (runtime-derived observations always set it; hand-built ones
+    /// may leave it `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluations: Option<u64>,
+    /// Raw per-condition counters of an ambiguous observation, keyed
+    /// by condition name. Empty for a condition vector.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub counts: BTreeMap<String, BranchCounts>,
+    /// The rule that split a multi-evaluation test's counters into
+    /// this vector, when it was not a single evaluation or a uniform
+    /// repetition of one vector (see
+    /// [`crate::correlate::observations_from_counts`]). Omitted from
+    /// JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<Resolution>,
+}
+
+/// Which rule of [`crate::correlate::observations_from_counts`]
+/// resolved a multi-evaluation test's aggregate counters into
+/// several condition vectors. Serialised in snake case
+/// (`"single_two_sided"`, `"tree_counters"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Resolution {
+    /// Rule 5: exactly one condition took both values, so every
+    /// evaluation followed one of two walks (used when the decision
+    /// is not a tree of distinct counters). Each vector's
+    /// `evaluations` is the test's total evaluation count.
+    SingleTwoSided,
+    /// Rule 4: the decision is a tree with one counter per node, so
+    /// the counters are edge flows and each leaf's inflow is the
+    /// number of evaluations that took its vector. Each vector's
+    /// `evaluations` is that leaf flow.
+    TreeCounters,
+}
+
+impl ConditionObservation {
+    /// A condition vector that occurred: `inputs` evaluated to
+    /// `result`.
+    pub fn vector(test_name: Option<String>, inputs: BTreeMap<String, bool>, result: bool) -> Self {
+        Self {
+            test_name,
+            inputs,
+            result: Some(result),
+            ambiguous: false,
+            evaluations: None,
+            counts: BTreeMap::new(),
+            resolved_by: None,
+        }
+    }
+
+    /// A test whose aggregate counters do not identify the condition
+    /// vectors it evaluated. Keeps the raw counters for reporting.
+    pub fn ambiguous(
+        test_name: Option<String>,
+        evaluations: u64,
+        counts: BTreeMap<String, BranchCounts>,
+    ) -> Self {
+        Self {
+            test_name,
+            inputs: BTreeMap::new(),
+            result: None,
+            ambiguous: true,
+            evaluations: Some(evaluations),
+            counts,
+            resolved_by: None,
+        }
+    }
+}
+
+/// Aggregate runtime counters for one condition within one test:
+/// how many of its evaluations were true and how many false.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BranchCounts {
+    /// Evaluations of the condition that were true.
+    pub true_count: u64,
+    /// Evaluations of the condition that were false.
+    pub false_count: u64,
+}
+
+impl BranchCounts {
+    /// Total number of evaluations of the condition.
+    pub fn total(&self) -> u64 {
+        self.true_count.saturating_add(self.false_count)
+    }
 }
 
 /// Whether the test suite as observed demonstrates MC/DC independence
@@ -111,6 +217,23 @@ pub enum ConditionStatus {
     /// from one of the unexercised pairs in
     /// [`IndependenceMatrix::independence_pairs`].
     Unexercised,
+    /// Not demonstrated by any condition-vector observation, but
+    /// some independence pair could have been completed by ambiguous
+    /// observations (tests that evaluated the decision more than once
+    /// with differing values): every row of the pair that no vector
+    /// covers is *possible* in some ambiguous test, i.e. that test's
+    /// counters took every outcome the row's evaluation path needs.
+    /// Whether the test really evaluated that row is unknown from
+    /// aggregate counters, so the condition is neither credited nor
+    /// reported as unexercised. A row whose path needs an outcome
+    /// that a test's counter shows was never taken cannot have
+    /// occurred in that test; if that rules out every ambiguous test
+    /// for every pair, the condition is [`Self::Unexercised`].
+    Ambiguous {
+        /// Names of the ambiguous tests that could hold a missing row
+        /// of a completable pair.
+        tests: Vec<String>,
+    },
 }
 
 /// Where a decision came from in source.
@@ -129,12 +252,25 @@ pub struct DecisionProvenance {
     /// the crate root).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_file: Option<String>,
-    /// Rust-level function name the decision lives in.
+    /// Rust-level function name the decision lives in, as rustc
+    /// prints it in the MIR header (impl methods read
+    /// `<impl at FILE:L:C: L:C>::name`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub function_name: Option<String>,
+    /// Report name taken from the coverage symbol the decision's
+    /// source spans joined to: demangled without crate hashes, with
+    /// generic arguments removed (for example
+    /// `<chrono::offset::fixed::FixedOffset>::east_opt`). `None`
+    /// when no coverage record joined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// 1-based line number where the decision starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
+    /// The lift that turned the decision's non-Boolean arms into its
+    /// outcome ([`crate::decision::Lift`]), when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lift: Option<crate::decision::Lift>,
 }
 
 /// Static MC/DC analysis combined with runtime evidence: which
@@ -155,6 +291,57 @@ pub struct RuntimeAnalysis {
     /// `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<DecisionProvenance>,
+    /// Number of ambiguous observations excluded from pair finding
+    /// (see [`ConditionObservation::ambiguous`]).
+    #[serde(default)]
+    pub ambiguous_observations: usize,
+    /// For each [`ConditionStatus::Unexercised`] condition that some
+    /// ambiguous observation evaluated: why each such test cannot
+    /// hold a row the condition's suggested independence pair (the
+    /// one [`Self::missing_rows`] is taken from) is missing
+    /// (the counter of an outcome that row needs is zero in that
+    /// test). Lets reports say the condition is unexercised *with
+    /// the counts*, rather than leave the reader to wonder why an
+    /// evaluated condition is not unknown. Absent for conditions no
+    /// ambiguous test evaluated.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ruled_out: BTreeMap<String, Vec<RuledOut>>,
+    /// For each [`ConditionStatus::Unexercised`] condition with an
+    /// independence pair whose two rows both evaluate it: the rows of
+    /// that pair no condition vector covers, i.e. the tests still to
+    /// write. The pair is the one with the fewest uncovered rows
+    /// (the first such pair on a tie), so a condition whose pair is
+    /// half covered names the one row it still needs. Absent for
+    /// conditions with no such pair.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub missing_rows: BTreeMap<String, Vec<TruthTableRow>>,
+    /// The independence pair [`Self::missing_rows`] was taken from,
+    /// per condition, so a report can name the row that is already
+    /// covered alongside the missing one. Not serialized: the JSON
+    /// report carries `missing_rows` only.
+    #[serde(skip)]
+    pub suggested_pairs: BTreeMap<String, IndependencePair>,
+}
+
+/// Why one ambiguous observation cannot hold one missing row of an
+/// independence pair: the row's evaluation path needs `condition` to
+/// take `value`, and the test's counter for `condition` shows it
+/// never did. See [`RuntimeAnalysis::ruled_out`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuledOut {
+    /// The ambiguous test.
+    pub test: String,
+    /// How many times it evaluated the decision, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluations: Option<u64>,
+    /// The pair row no observation covers.
+    pub row: TruthTableRow,
+    /// A condition on the row's evaluation path.
+    pub condition: String,
+    /// The value the row needs `condition` to take.
+    pub value: bool,
+    /// The test's counters for `condition`; the one for `value` is 0.
+    pub counts: BranchCounts,
 }
 
 /// Combine static MC/DC analysis with observed test runs.
@@ -171,39 +358,253 @@ pub struct RuntimeAnalysis {
 /// participate in a pair match — which is the correct MC/DC
 /// behaviour: a condition that was never actually evaluated cannot
 /// be said to have its independence demonstrated.
+///
+/// Ambiguous observations ([`ConditionObservation::ambiguous`]) are
+/// excluded from pair finding under every [`Variant`]. They only
+/// decide between [`ConditionStatus::Ambiguous`] and
+/// [`ConditionStatus::Unexercised`] for a condition no pair
+/// demonstrates; see [`ConditionStatus::Ambiguous`] for the rule.
 pub fn analyze_with_runtime(
     tree: &DecisionTree,
     observations: &[ConditionObservation],
     variant: Variant,
 ) -> RuntimeAnalysis {
     let matrix = analyze_with_variant(tree, variant);
+    let (ambiguous, vectors): (Vec<&ConditionObservation>, Vec<&ConditionObservation>) =
+        observations.iter().partition(|o| o.ambiguous);
     let mut condition_status = BTreeMap::new();
-    for (cond, pairs) in &matrix.independence_pairs {
-        condition_status.insert(cond.clone(), classify_condition(pairs, observations));
+    let mut ruled_out = BTreeMap::new();
+    let mut missing_rows = BTreeMap::new();
+    let mut suggested_pairs = BTreeMap::new();
+    if let Some(decision) = tree.decisions.first() {
+        for (cond, pairs) in &matrix.independence_pairs {
+            let c = classify_condition(cond, pairs, decision, &vectors, &ambiguous);
+            if !c.ruled_out.is_empty() {
+                ruled_out.insert(cond.clone(), c.ruled_out);
+            }
+            if let Some((pair, missing)) = c.missing {
+                missing_rows.insert(cond.clone(), missing);
+                suggested_pairs.insert(cond.clone(), pair);
+            }
+            condition_status.insert(cond.clone(), c.status);
+        }
     }
     RuntimeAnalysis {
         matrix,
         condition_status,
         provenance: None,
+        ambiguous_observations: ambiguous.len(),
+        ruled_out,
+        missing_rows,
+        suggested_pairs,
     }
 }
 
+/// What [`classify_condition`] found for one condition.
+struct Classified {
+    status: ConditionStatus,
+    /// See [`RuntimeAnalysis::ruled_out`].
+    ruled_out: Vec<RuledOut>,
+    /// For an unexercised condition, the suggested pair and its
+    /// uncovered rows; see [`RuntimeAnalysis::missing_rows`].
+    missing: Option<(IndependencePair, Vec<TruthTableRow>)>,
+}
+
+/// Classify one condition, and for an unexercised one that an
+/// ambiguous test evaluated, say why each such test is ruled out.
+///
+/// Only condition-vector observations (`observations`) can
+/// demonstrate a pair. Otherwise the condition is
+/// [`ConditionStatus::Ambiguous`] iff some pair is *completable*:
+/// each of its rows is covered by a vector or possible in an
+/// ambiguous observation ([`row_possible_in`]). The tests listed are
+/// the ambiguous ones that could hold a missing row of a completable
+/// pair. If no pair is completable, the condition is
+/// [`ConditionStatus::Unexercised`]: for every pair, some row no
+/// vector covers needs an outcome that no ambiguous test took, so no
+/// test can have demonstrated it.
+///
+/// This is the decision-level check too: a row's outcome is fixed by
+/// its path, so a row that is possible in a test is one whose path,
+/// and therefore outcome, the test's counters allow.
+///
+/// Only pairs whose two rows both *evaluate* `cond` (it is on both
+/// rows' evaluation paths) are considered, and a vector covers a row
+/// only if it evaluated `cond`. Under masking, the truth table also
+/// admits pairs where `cond` is short-circuited in one row (the
+/// outcome flips because of other, masked conditions); no test can
+/// show `cond`'s effect through a row that never evaluates it.
 fn classify_condition(
+    cond: &str,
     pairs: &[IndependencePair],
-    observations: &[ConditionObservation],
-) -> ConditionStatus {
-    for pair in pairs {
-        let t1 = observations
+    decision: &Node,
+    observations: &[&ConditionObservation],
+    ambiguous: &[&ConditionObservation],
+) -> Classified {
+    let evaluates = |row: &TruthTableRow| {
+        evaluation_path(decision, &row.inputs)
+            .is_some_and(|path| path.iter().any(|(c, _)| c == cond))
+    };
+    let pairs: Vec<&IndependencePair> = pairs
+        .iter()
+        .filter(|p| evaluates(&p.test_1) && evaluates(&p.test_2))
+        .collect();
+    let covered = |row: &TruthTableRow| {
+        observations
             .iter()
-            .any(|o| observation_covers_row(o, &pair.test_1));
-        let t2 = observations
-            .iter()
-            .any(|o| observation_covers_row(o, &pair.test_2));
-        if t1 && t2 {
-            return ConditionStatus::Exercised(pair.clone());
+            .any(|o| o.inputs.contains_key(cond) && observation_covers_row(o, row))
+    };
+    for pair in &pairs {
+        if covered(&pair.test_1) && covered(&pair.test_2) {
+            return Classified {
+                status: ConditionStatus::Exercised((*pair).clone()),
+                ruled_out: Vec::new(),
+                missing: None,
+            };
         }
     }
-    ConditionStatus::Unexercised
+    let mut takers: BTreeSet<usize> = BTreeSet::new();
+    for pair in &pairs {
+        let mut pair_takers = Vec::new();
+        let completable = [&pair.test_1, &pair.test_2]
+            .into_iter()
+            .filter(|row| !covered(row))
+            .all(|row| {
+                let before = pair_takers.len();
+                pair_takers.extend(
+                    (0..ambiguous.len()).filter(|&i| row_possible_in(ambiguous[i], row, decision)),
+                );
+                pair_takers.len() > before
+            });
+        if completable {
+            takers.extend(pair_takers);
+        }
+    }
+    if !takers.is_empty() {
+        let tests = takers
+            .into_iter()
+            .map(|i| test_label(ambiguous[i]))
+            .collect();
+        return Classified {
+            status: ConditionStatus::Ambiguous { tests },
+            ruled_out: Vec::new(),
+            missing: None,
+        };
+    }
+    // The pair to ask for: the one with the fewest rows still to
+    // cover, the first such pair on a tie.
+    let suggested = pairs
+        .iter()
+        .min_by_key(|p| usize::from(!covered(&p.test_1)) + usize::from(!covered(&p.test_2)));
+    let why = suggested
+        .map(|pair| {
+            [&pair.test_1, &pair.test_2]
+                .into_iter()
+                .filter(|row| !covered(row))
+                .flat_map(|row| {
+                    ambiguous
+                        .iter()
+                        .filter(|o| o.counts.get(cond).is_some_and(|c| c.total() > 0))
+                        .filter_map(move |o| rule_out(o, row, decision))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let missing = suggested.map(|pair| {
+        let rows = [&pair.test_1, &pair.test_2]
+            .into_iter()
+            .filter(|row| !covered(row))
+            .cloned()
+            .collect();
+        ((*pair).clone(), rows)
+    });
+    Classified {
+        status: ConditionStatus::Unexercised,
+        ruled_out: why,
+        missing,
+    }
+}
+
+fn test_label(o: &ConditionObservation) -> String {
+    o.test_name.clone().unwrap_or_else(|| "?".to_string())
+}
+
+/// True iff the ambiguous observation `o` could have evaluated `row`:
+/// every condition on the row's evaluation path (the conditions the
+/// decision tests under `row`, short-circuited ones excluded) has a
+/// non-zero counter in `o` for the value the row gives it.
+///
+/// Sound: if `o` evaluated `row` (or any vector covering it, which
+/// follows the same path), each condition on that path was tested
+/// with that value at least once, so its counter for the value is
+/// non-zero. A zero counter therefore proves `o` never evaluated the
+/// row. A condition with no counter at all in `o` (its span did not
+/// join) is no evidence either way and does not rule the row out.
+fn row_possible_in(o: &ConditionObservation, row: &TruthTableRow, decision: &Node) -> bool {
+    rule_out(o, row, decision).is_none() && evaluation_path(decision, &row.inputs).is_some()
+}
+
+/// The first condition on `row`'s evaluation path whose counter in
+/// `o` is zero for the value the row needs, as a [`RuledOut`].
+fn rule_out(o: &ConditionObservation, row: &TruthTableRow, decision: &Node) -> Option<RuledOut> {
+    let path = evaluation_path(decision, &row.inputs)?;
+    path.into_iter().find_map(|(name, value)| {
+        let counts = *o.counts.get(&name)?;
+        let taken = if value {
+            counts.true_count
+        } else {
+            counts.false_count
+        };
+        (taken == 0).then(|| RuledOut {
+            test: test_label(o),
+            evaluations: o.evaluations,
+            row: row.clone(),
+            condition: name,
+            value,
+            counts,
+        })
+    })
+}
+
+/// The conditions `decision` tests, in order, when its conditions
+/// take the values `value_of` gives them, with the value each takes,
+/// and the outcome. Conditions short-circuited under those values are
+/// not on the path. `None` if the walk reaches a condition `value_of`
+/// has no value for.
+pub(crate) fn evaluation_path(
+    decision: &Node,
+    values: &BTreeMap<String, bool>,
+) -> Option<Vec<(String, bool)>> {
+    evaluation_walk(decision, |c| values.get(c).copied()).map(|(path, _)| path)
+}
+
+/// [`evaluation_path`] with the values supplied by a function, and the
+/// decision outcome alongside the path.
+pub(crate) fn evaluation_walk(
+    decision: &Node,
+    value_of: impl Fn(&str) -> Option<bool>,
+) -> Option<(Vec<(String, bool)>, bool)> {
+    let mut path = Vec::new();
+    let mut node = decision;
+    loop {
+        match node {
+            Node::Const { value } => return Some((path, *value)),
+            Node::Condition { name } => {
+                let v = value_of(name)?;
+                path.push((name.clone(), v));
+                return Some((path, v));
+            }
+            Node::Ite {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let v = value_of(cond)?;
+                path.push((cond.clone(), v));
+                node = if v { then_branch } else { else_branch };
+            }
+        }
+    }
 }
 
 /// True iff `observation` is compatible with `row` — every condition
@@ -217,7 +618,7 @@ fn classify_condition(
 /// row's input class, regardless of what the missing condition's
 /// source value happened to be.
 fn observation_covers_row(observation: &ConditionObservation, row: &TruthTableRow) -> bool {
-    if observation.result != row.result {
+    if observation.ambiguous || observation.result != Some(row.result) {
         return false;
     }
     observation
@@ -258,7 +659,7 @@ pub fn analyze_with_variant(tree: &DecisionTree, variant: Variant) -> Independen
 
 /// Collect the set of atomic condition names referenced in a [`Node`],
 /// returned in deterministic sorted order.
-fn collect_conditions(node: &Node) -> Vec<String> {
+pub(crate) fn collect_conditions(node: &Node) -> Vec<String> {
     let mut set = BTreeSet::new();
     walk_conditions(node, &mut set);
     set.into_iter().collect()
@@ -617,11 +1018,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn obs(name: &str, inputs: &[(&str, bool)], result: bool) -> ConditionObservation {
-        ConditionObservation {
-            test_name: Some(name.to_string()),
-            inputs: inputs.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+        ConditionObservation::vector(
+            Some(name.to_string()),
+            inputs.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             result,
-        }
+        )
     }
 
     #[test]
@@ -744,6 +1145,387 @@ mod tests {
         }
     }
 
+    fn ambiguous_obs(
+        name: &str,
+        evaluations: u64,
+        raw: &[(&str, u64, u64)],
+    ) -> ConditionObservation {
+        ConditionObservation::ambiguous(
+            Some(name.to_string()),
+            evaluations,
+            raw.iter()
+                .map(|(k, t, f)| {
+                    (
+                        k.to_string(),
+                        BranchCounts {
+                            true_count: *t,
+                            false_count: *f,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn ambiguous_observations_never_demonstrate_a_pair_in_either_variant() {
+        // Even an ambiguous record whose fields were filled with a
+        // full vector must be ignored: the flag, not the contents,
+        // excludes it.
+        let mut forged = ambiguous_obs("loop", 3, &[("a", 2, 1), ("b", 1, 1)]);
+        forged.inputs = [("a".to_string(), false), ("b".to_string(), true)]
+            .into_iter()
+            .collect();
+        forged.result = Some(false);
+        let obs_list = [forged, obs("tt", &[("a", true), ("b", true)], true)];
+        for variant in [Variant::Masking, Variant::UniqueCause] {
+            let r = analyze_with_runtime(&and_tree(), &obs_list, variant);
+            assert_eq!(r.ambiguous_observations, 1);
+            for c in ["a", "b"] {
+                match &r.condition_status[c] {
+                    ConditionStatus::Ambiguous { tests } => {
+                        assert_eq!(tests, &vec!["loop".to_string()], "{variant:?} {c}")
+                    }
+                    other => panic!("{variant:?} {c}: expected Ambiguous, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_status_only_for_conditions_the_ambiguous_test_evaluated() {
+        // The ambiguous test never evaluated b (b = [0, 0]): b's gap
+        // is a genuine Unexercised, not an ambiguity.
+        let obs_list = [
+            ambiguous_obs("loop", 2, &[("a", 1, 1), ("b", 0, 0)]),
+            obs("tt", &[("a", true), ("b", true)], true),
+        ];
+        let r = analyze_with_runtime(&and_tree(), &obs_list, Variant::Masking);
+        assert!(matches!(
+            r.condition_status["a"],
+            ConditionStatus::Ambiguous { .. }
+        ));
+        assert!(matches!(
+            r.condition_status["b"],
+            ConditionStatus::Unexercised
+        ));
+    }
+
+    #[test]
+    fn vector_evidence_wins_over_ambiguous_evidence() {
+        let obs_list = [
+            ambiguous_obs("loop", 3, &[("a", 2, 1), ("b", 1, 1)]),
+            obs("ff", &[("a", false)], false),
+            obs("tt", &[("a", true), ("b", true)], true),
+        ];
+        let r = analyze_with_runtime(&and_tree(), &obs_list, Variant::Masking);
+        assert!(matches!(
+            r.condition_status["a"],
+            ConditionStatus::Exercised(_)
+        ));
+        assert!(matches!(
+            r.condition_status["b"],
+            ConditionStatus::Ambiguous { .. }
+        ));
+    }
+
+    /// `b == 32 || b == 10` as decomposed from anyhow's
+    /// `src/ensure.rs:60` closure `|b| b == b' ' || b == b'\n'`.
+    fn anyhow_whitespace_tree() -> DecisionTree {
+        DecisionTree {
+            decisions: vec![ite("b == 32", const_(true), cond("b == 10"))],
+        }
+    }
+
+    #[test]
+    fn missing_outcome_never_taken_anywhere_is_unexercised() {
+        // anyhow `test_whitespace` (cut from its llvm-cov export): 9
+        // evaluations, `b == 32` = [1 T, 8 F], `b == 10` = [0 T, 8 F],
+        // kept ambiguous here (as before `observations_from_counts`
+        // resolved it), plus a single-pass test that
+        // saw (F,F) -> F. `b == 10`'s only pair needs
+        // (b == 32 = F, b == 10 = T) -> T; no test ever took
+        // `b == 10` = T, so it is unexercised, not unknown.
+        let obs_list = [
+            ambiguous_obs(
+                "test_whitespace",
+                9,
+                &[("b == 32", 1, 8), ("b == 10", 0, 8)],
+            ),
+            obs("test_as", &[("b == 32", false), ("b == 10", false)], false),
+        ];
+        for variant in [Variant::Masking, Variant::UniqueCause] {
+            let r = analyze_with_runtime(&anyhow_whitespace_tree(), &obs_list, variant);
+            assert!(
+                matches!(r.condition_status["b == 10"], ConditionStatus::Unexercised),
+                "{variant:?}: {:?}",
+                r.condition_status["b == 10"]
+            );
+            let why = &r.ruled_out["b == 10"];
+            assert_eq!(why.len(), 1, "{why:?}");
+            assert_eq!(why[0].test, "test_whitespace");
+            assert_eq!(why[0].evaluations, Some(9));
+            assert_eq!(why[0].condition, "b == 10");
+            assert!(why[0].value);
+            assert_eq!(
+                why[0].counts,
+                BranchCounts {
+                    true_count: 0,
+                    false_count: 8
+                }
+            );
+            assert_eq!(
+                why[0].row,
+                row(&[("b == 32", false), ("b == 10", true)], true)
+            );
+            // `b == 32`'s missing row (T) -> T is possible in the
+            // ambiguous test (it took `b == 32` = T once).
+            match &r.condition_status["b == 32"] {
+                ConditionStatus::Ambiguous { tests } => {
+                    assert_eq!(tests, &vec!["test_whitespace".to_string()])
+                }
+                other => panic!("{variant:?}: b == 32: {other:?}"),
+            }
+            assert!(!r.ruled_out.contains_key("b == 32"));
+        }
+    }
+
+    #[test]
+    fn missing_outcome_taken_only_in_multi_evaluation_tests_is_ambiguous() {
+        // chrono `from_hms_nano_opt` (src/naive/time/mod.rs:429),
+        // `h || m || s || (n1 && s59) || n2`, with the counts of
+        // `offset::local::tests::test_leap_second` (2 evaluations)
+        // kept ambiguous, and single-evaluation vectors that never
+        // had `sec != 59` = T while `nano >= 1e9` = T.
+        let tree = chrono_tree();
+        let f = false;
+        let obs_list = [
+            ambiguous_obs(
+                "test_leap_second",
+                2,
+                &[
+                    ("hour >= 24", 0, 2),
+                    ("min >= 60", 0, 2),
+                    ("sec >= 60", 0, 2),
+                    ("nano >= 1000000000", 2, 0),
+                    ("sec != 59", 1, 1),
+                    ("nano >= 2000000000", 0, 1),
+                ],
+            ),
+            obs("plain", &chrono_row(f, f, f, Some(f), None, Some(f)), false),
+            obs(
+                "leap",
+                &chrono_row(f, f, f, Some(true), Some(false), Some(false)),
+                false,
+            ),
+        ];
+        let r = analyze_with_runtime(&tree, &obs_list, Variant::Masking);
+        for c in ["nano >= 1000000000", "sec != 59"] {
+            match &r.condition_status[c] {
+                ConditionStatus::Ambiguous { tests } => {
+                    assert_eq!(tests, &vec!["test_leap_second".to_string()], "{c}")
+                }
+                other => panic!("{c}: {other:?}"),
+            }
+        }
+        // `hour >= 24` = T was never taken by the ambiguous test.
+        assert!(matches!(
+            r.condition_status["hour >= 24"],
+            ConditionStatus::Unexercised
+        ));
+        assert_eq!(r.ruled_out["hour >= 24"][0].condition, "hour >= 24");
+    }
+
+    #[test]
+    fn missing_outcome_taken_in_a_single_evaluation_test_is_exercised() {
+        // The anyhow case plus a single-evaluation test that took
+        // `b == 10` = T: the pair is found from vectors.
+        let obs_list = [
+            ambiguous_obs(
+                "test_whitespace",
+                9,
+                &[("b == 32", 1, 8), ("b == 10", 0, 8)],
+            ),
+            obs("test_as", &[("b == 32", false), ("b == 10", false)], false),
+            obs("newline", &[("b == 32", false), ("b == 10", true)], true),
+        ];
+        let r = analyze_with_runtime(&anyhow_whitespace_tree(), &obs_list, Variant::Masking);
+        assert!(matches!(
+            r.condition_status["b == 10"],
+            ConditionStatus::Exercised(_)
+        ));
+        assert!(r.ruled_out.is_empty());
+    }
+
+    #[test]
+    fn row_needing_two_outcomes_from_one_test_needs_both_counters() {
+        // a && b: b's missing row (T,F) -> F needs a = T AND b = F in
+        // the same test. "loop_a" took a = T but never evaluated b
+        // false; "loop_b" has no a = T. Neither can hold the row.
+        let obs_list = [
+            ambiguous_obs("loop_a", 2, &[("a", 1, 1), ("b", 1, 0)]),
+            ambiguous_obs("loop_b", 2, &[("a", 0, 2), ("b", 0, 0)]),
+            obs("tt", &[("a", true), ("b", true)], true),
+        ];
+        let r = analyze_with_runtime(&and_tree(), &obs_list, Variant::Masking);
+        assert!(matches!(
+            r.condition_status["b"],
+            ConditionStatus::Unexercised
+        ));
+        // Only loop_a evaluated b, so only it is listed.
+        let why = &r.ruled_out["b"];
+        assert_eq!(why.len(), 1);
+        assert_eq!(
+            (
+                why[0].test.as_str(),
+                why[0].condition.as_str(),
+                why[0].value
+            ),
+            ("loop_a", "b", false)
+        );
+        // a's missing row (F,-) -> F is possible in both.
+        match &r.condition_status["a"] {
+            ConditionStatus::Ambiguous { tests } => {
+                assert_eq!(tests, &vec!["loop_a".to_string(), "loop_b".to_string()])
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_row_that_short_circuits_the_condition_never_demonstrates_it() {
+        // chrono: the masking truth table pairs `nano >= 2000000000`
+        // via (n1 F, s59 F, n2 F) -> F vs (n1 T, s59 T, n2 T) -> T,
+        // where n2 is masked by n1 and s59 differing too. A test that
+        // evaluated (n1 T, s59 T) -> T never evaluated n2, so it
+        // cannot show n2's effect. With the multi-evaluation tests
+        // that did take n2 = T kept ambiguous, n2 is unknown, not
+        // exercised.
+        let tree = chrono_tree();
+        let f = false;
+        let t = true;
+        let obs_list = [
+            obs("plain", &chrono_row(f, f, f, Some(f), None, Some(f)), false),
+            obs("leap_t", &chrono_row(f, f, f, Some(t), Some(t), None), true),
+            obs(
+                "leap_f",
+                &chrono_row(f, f, f, Some(t), Some(f), Some(f)),
+                false,
+            ),
+            ambiguous_obs(
+                "naive::time::tests::test_time_from_hms_milli",
+                7,
+                &[
+                    ("hour >= 24", 0, 7),
+                    ("min >= 60", 0, 7),
+                    ("sec >= 60", 0, 7),
+                    ("nano >= 1000000000", 3, 4),
+                    ("sec != 59", 0, 3),
+                    ("nano >= 2000000000", 1, 6),
+                ],
+            ),
+        ];
+        let matrix = analyze_with_variant(&tree, Variant::Masking);
+        assert!(
+            matrix.independence_pairs["nano >= 2000000000"]
+                .iter()
+                .any(|p| p.test_2.inputs["sec != 59"] && p.test_2.inputs["nano >= 1000000000"]),
+            "the truth table admits the short-circuited pair"
+        );
+        let r = analyze_with_runtime(&tree, &obs_list, Variant::Masking);
+        match &r.condition_status["nano >= 2000000000"] {
+            ConditionStatus::Ambiguous { tests } => assert_eq!(
+                tests,
+                &vec!["naive::time::tests::test_time_from_hms_milli".to_string()]
+            ),
+            other => panic!("{other:?}"),
+        }
+        // Without the ambiguous test, nothing ever took n2 = T.
+        let r = analyze_with_runtime(&tree, &obs_list[..3], Variant::Masking);
+        assert!(matches!(
+            r.condition_status["nano >= 2000000000"],
+            ConditionStatus::Unexercised
+        ));
+        // The rows asked for come from a pair that evaluates n2 in
+        // both rows, never from the short-circuited one.
+        let n2 = "nano >= 2000000000";
+        let pair = &r.suggested_pairs[n2];
+        for row in [&pair.test_1, &pair.test_2] {
+            let path = evaluation_path(&tree.decisions[0], &row.inputs).unwrap();
+            assert!(path.iter().any(|(c, _)| c == n2), "{row:?}");
+        }
+        assert!(!r.missing_rows[n2].is_empty());
+        for row in &r.missing_rows[n2] {
+            assert!(row == &pair.test_1 || row == &pair.test_2);
+        }
+        // The pairs that do evaluate n1 and s59 are still found.
+        for c in ["nano >= 1000000000", "sec != 59"] {
+            assert!(
+                matches!(r.condition_status[c], ConditionStatus::Exercised(_)),
+                "{c}"
+            );
+        }
+    }
+
+    /// chrono `NaiveTime::from_hms_nano_opt`'s decision
+    /// `hour >= 24 || min >= 60 || sec >= 60
+    ///  || (nano >= 1_000_000_000 && sec != 59) || nano >= 2_000_000_000`.
+    fn chrono_tree() -> DecisionTree {
+        let n2 = || cond("nano >= 2000000000");
+        DecisionTree {
+            decisions: vec![ite(
+                "hour >= 24",
+                const_(true),
+                ite(
+                    "min >= 60",
+                    const_(true),
+                    ite(
+                        "sec >= 60",
+                        const_(true),
+                        ite(
+                            "nano >= 1000000000",
+                            ite("sec != 59", const_(true), n2()),
+                            n2(),
+                        ),
+                    ),
+                ),
+            )],
+        }
+    }
+
+    fn chrono_row(
+        h: bool,
+        m: bool,
+        s: bool,
+        n1: Option<bool>,
+        s59: Option<bool>,
+        n2: Option<bool>,
+    ) -> Vec<(&'static str, bool)> {
+        let mut v = vec![("hour >= 24", h), ("min >= 60", m), ("sec >= 60", s)];
+        for (k, x) in [
+            ("nano >= 1000000000", n1),
+            ("sec != 59", s59),
+            ("nano >= 2000000000", n2),
+        ] {
+            if let Some(x) = x {
+                v.push((k, x));
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn old_observation_json_still_deserializes() {
+        // Pre-ambiguity observation shape: `result` is a bare bool,
+        // no `ambiguous` / `evaluations` / `counts`.
+        let old = r#"{"test_name": "t", "inputs": {"a": true}, "result": true}"#;
+        let o: ConditionObservation = serde_json::from_str(old).expect("parse old shape");
+        assert!(!o.ambiguous);
+        assert_eq!(o.result, Some(true));
+        assert_eq!(o.evaluations, None);
+        assert!(o.counts.is_empty());
+    }
+
     // -----------------------------------------------------------------------
     // Variant semantics
     // -----------------------------------------------------------------------
@@ -766,6 +1548,55 @@ mod tests {
     }
 
     #[test]
+    fn missing_rows_name_only_the_rows_no_test_covers() {
+        // `a && b` with only (T,T) -> T observed: each condition's
+        // pair is half covered, so one row is missing for each, and
+        // the pair chosen is one that contains the covered row.
+        let tree = and_tree();
+        let r = analyze_with_runtime(
+            &tree,
+            &[obs("t_tt", &[("a", true), ("b", true)], true)],
+            Variant::Masking,
+        );
+        let row = |a: bool, b: bool, result: bool| TruthTableRow {
+            inputs: [("a".to_string(), a), ("b".to_string(), b)]
+                .into_iter()
+                .collect(),
+            result,
+        };
+        assert_eq!(r.missing_rows["b"], vec![row(true, false, false)]);
+        assert_eq!(r.missing_rows["a"].len(), 1);
+        assert!(!r.missing_rows["a"][0].inputs["a"]);
+        for c in ["a", "b"] {
+            let p = &r.suggested_pairs[c];
+            assert!(p.test_1 == row(true, true, true) || p.test_2 == row(true, true, true));
+        }
+
+        // Nothing observed: both rows of the first pair are missing.
+        let r = analyze_with_runtime(&tree, &[], Variant::Masking);
+        assert_eq!(
+            r.missing_rows["b"],
+            vec![row(true, false, false), row(true, true, true)]
+        );
+
+        // Exercised conditions have no missing rows; the JSON carries
+        // `missing_rows` but not the suggested pairs.
+        let r = analyze_with_runtime(
+            &tree,
+            &[
+                obs("t_tt", &[("a", true), ("b", true)], true),
+                obs("t_tf", &[("a", true), ("b", false)], false),
+            ],
+            Variant::Masking,
+        );
+        assert!(!r.missing_rows.contains_key("b"));
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["missing_rows"]["a"][0]["inputs"]["a"], false);
+        assert_eq!(v["missing_rows"]["a"][0]["result"], false);
+        assert!(v.get("suggested_pairs").is_none());
+    }
+
+    #[test]
     fn runtime_analysis_json_round_trip() {
         // The public types derive Deserialize alongside Serialize so
         // downstream tools (reporters, dashboards, qualification kits)
@@ -774,25 +1605,9 @@ mod tests {
         // and check the recovered value equals the original.
         let tree = and_tree();
         let obs = vec![
-            ConditionObservation {
-                test_name: Some("t_ff".to_string()),
-                inputs: [("a".to_string(), false)].into_iter().collect(),
-                result: false,
-            },
-            ConditionObservation {
-                test_name: Some("t_tf".to_string()),
-                inputs: [("a".to_string(), true), ("b".to_string(), false)]
-                    .into_iter()
-                    .collect(),
-                result: false,
-            },
-            ConditionObservation {
-                test_name: Some("t_tt".to_string()),
-                inputs: [("a".to_string(), true), ("b".to_string(), true)]
-                    .into_iter()
-                    .collect(),
-                result: true,
-            },
+            obs("t_ff", &[("a", false)], false),
+            obs("t_tf", &[("a", true), ("b", false)], false),
+            obs("t_tt", &[("a", true), ("b", true)], true),
         ];
 
         let analysis = analyze_with_runtime(&tree, &obs, Variant::Masking);
@@ -826,7 +1641,13 @@ mod tests {
                 function_name: Some("allow_actuation".to_string()),
                 source_file: Some("src/lib.rs".to_string()),
                 line: Some(42),
+                display_name: Some("<brakes::Controller>::allow_actuation".to_string()),
+                lift: None,
             }),
+            ambiguous_observations: 0,
+            ruled_out: BTreeMap::new(),
+            missing_rows: BTreeMap::new(),
+            suggested_pairs: BTreeMap::new(),
         };
         let json = serde_json::to_string(&analysis).expect("serialize");
         assert!(json.contains("\"provenance\""));
@@ -838,6 +1659,10 @@ mod tests {
         assert_eq!(p.function_name.as_deref(), Some("allow_actuation"));
         assert_eq!(p.source_file.as_deref(), Some("src/lib.rs"));
         assert_eq!(p.line, Some(42));
+        assert_eq!(
+            p.display_name.as_deref(),
+            Some("<brakes::Controller>::allow_actuation")
+        );
     }
 
     #[test]
@@ -846,6 +1671,10 @@ mod tests {
             matrix: IndependenceMatrix::default(),
             condition_status: BTreeMap::new(),
             provenance: None,
+            ambiguous_observations: 0,
+            ruled_out: BTreeMap::new(),
+            missing_rows: BTreeMap::new(),
+            suggested_pairs: BTreeMap::new(),
         };
         let json = serde_json::to_string(&analysis).expect("serialize");
         assert!(

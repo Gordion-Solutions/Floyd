@@ -7,7 +7,8 @@
 //!   the `llvm-tools-preview` rustup component.
 //! - Runs an instrumented binary with a unique `LLVM_PROFILE_FILE`
 //!   per invocation, so each invocation produces a separate
-//!   `.profraw` containing only that run's counter values.
+//!   `.profraw` containing only that run's counter values (not
+//!   those of processes it spawns).
 //! - Merges and exports each `.profraw` to JSON via subprocess and
 //!   parses the result through [`crate::profile::parse`].
 //!
@@ -17,8 +18,10 @@
 //! follow-up.
 
 use crate::profile;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 
 /// Error from any runner operation.
 #[derive(Debug, Clone)]
@@ -79,20 +82,147 @@ pub fn llvm_tool(name: &str) -> Result<PathBuf, RunnerError> {
     })
 }
 
+/// The environment variable the platform's dynamic loader searches
+/// for shared libraries: `DYLD_LIBRARY_PATH` on macOS, `PATH` on
+/// Windows, `LD_LIBRARY_PATH` elsewhere.
+pub fn dylib_path_var() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "DYLD_LIBRARY_PATH"
+    } else if cfg!(windows) {
+        "PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    }
+}
+
+/// The nightly toolchain's shared-library directories: the host
+/// target libdir (`rustc +nightly --print target-libdir`, which holds
+/// `libstd-*.dylib`/`.so`) and `<sysroot>/lib` (which holds
+/// `librustc_driver-*`). Computed once; empty when `rustc` cannot be
+/// queried, in which case binaries are spawned with the inherited
+/// environment.
+fn toolchain_lib_dirs() -> &'static [PathBuf] {
+    static DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    DIRS.get_or_init(|| {
+        let print = |what: &str| -> Option<PathBuf> {
+            let out = Command::new("rustc")
+                .args(["+nightly", "--print", what])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (!s.is_empty()).then(|| PathBuf::from(s))
+        };
+        let mut dirs = Vec::new();
+        if let Some(libdir) = print("target-libdir") {
+            dirs.push(libdir);
+        }
+        if let Some(sysroot) = print("sysroot") {
+            dirs.push(sysroot.join("lib"));
+        }
+        dirs.retain(|d| d.is_dir());
+        dirs
+    })
+}
+
+/// `prepend` followed by the entries of `existing` (an inherited
+/// search-path value), joined with the platform separator. Entries
+/// of `prepend` already in `existing` are not repeated.
+fn join_dylib_path(prepend: &[PathBuf], existing: Option<&std::ffi::OsStr>) -> OsString {
+    let inherited: Vec<PathBuf> = existing
+        .map(|v| std::env::split_paths(v).collect())
+        .unwrap_or_default();
+    let mut all: Vec<PathBuf> = Vec::new();
+    for d in prepend.iter().chain(&inherited) {
+        if !d.as_os_str().is_empty() && !all.contains(d) {
+            all.push(d.clone());
+        }
+    }
+    std::env::join_paths(all).unwrap_or_else(|_| existing.map(OsString::from).unwrap_or_default())
+}
+
+/// A [`Command`] for an instrumented test binary with the toolchain's
+/// shared-library directories and the binary's own directory
+/// prepended to the dynamic-loader search path, as `cargo test`
+/// does. Test binaries of proc-macro crates (and anything else built
+/// with `-C prefer-dynamic`) link `libstd` dynamically and do not
+/// start without it.
+fn test_binary_command(binary: &Path) -> Command {
+    let var = dylib_path_var();
+    let mut dirs: Vec<PathBuf> = toolchain_lib_dirs().to_vec();
+    if let Some(parent) = binary.parent() {
+        dirs.push(parent.to_path_buf());
+    }
+    let mut cmd = Command::new(binary);
+    cmd.env(
+        var,
+        join_dylib_path(&dirs, std::env::var_os(var).as_deref()),
+    );
+    cmd
+}
+
+/// Run `cmd` to completion, capturing its output, with its coverage
+/// profile written to `profraw` and to nowhere else.
+///
+/// The process is not given `LLVM_PROFILE_FILE=<profraw>`: processes
+/// it spawns inherit the variable, and an instrumented child (a test
+/// that reruns its own binary, a build of a `trybuild` case) would
+/// add its counters to `profraw` (the profile runtime appends to the
+/// file named without `%p`/`%m`), attributing the child's evaluations
+/// to the test. Instead the variable is `<profraw>.procs/%p.profraw`:
+/// every process writes a profile of its own into that directory, the
+/// spawned process's (`%p` is its pid) is moved to `profraw`, and the
+/// directory, with any child's profile, is removed. Children never
+/// fall back to `default_*.profraw` in their working directory, since
+/// they inherit the variable.
+fn output_with_profile(mut cmd: Command, profraw: &Path) -> std::io::Result<Output> {
+    let mut procs = profraw.as_os_str().to_owned();
+    procs.push(".procs");
+    let procs = PathBuf::from(procs);
+    let _ = std::fs::remove_dir_all(&procs);
+    let _ = std::fs::remove_file(profraw);
+    let child = cmd
+        .env("LLVM_PROFILE_FILE", procs.join("%p.profraw"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let own = procs.join(format!("{}.profraw", child.id()));
+    let out = child.wait_with_output();
+    if own.exists() {
+        std::fs::rename(&own, profraw)?;
+    }
+    let _ = std::fs::remove_dir_all(&procs);
+    out
+}
+
 /// Enumerate the `#[test]` functions in an instrumented test binary
 /// produced by [`crate::instrument::compile_test_target`].
 ///
 /// Invokes the binary with `--list --format=terse` and parses the
 /// libtest output (one `<name>: test` line per test). Filters out
 /// the summary line and any benchmark entries.
+///
+/// The instrumented binary writes a coverage profile even for
+/// `--list`; it goes to a temporary file that is removed afterwards,
+/// not to `default_*.profraw` in the current directory.
 pub fn list_tests(binary: &Path) -> Result<Vec<String>, RunnerError> {
-    let out = Command::new(binary)
-        .args(["--list", "--format=terse"])
-        .output()
-        .map_err(|e| RunnerError {
-            stage: "list_tests",
-            message: format!("could not exec {}: {e}", binary.display()),
-        })?;
+    static LISTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let profraw = std::env::temp_dir().join(format!(
+        "floyd-list-{}-{}.profraw",
+        std::process::id(),
+        LISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut cmd = test_binary_command(binary);
+    cmd.args(["--list", "--format=terse"]);
+    let out = output_with_profile(cmd, &profraw);
+    let _ = std::fs::remove_file(&profraw);
+    let out = out.map_err(|e| RunnerError {
+        stage: "list_tests",
+        message: format!("could not exec {}: {e}", binary.display()),
+    })?;
     if !out.status.success() {
         return Err(RunnerError {
             stage: "list_tests",
@@ -115,7 +245,10 @@ pub fn list_tests(binary: &Path) -> Result<Vec<String>, RunnerError> {
 
 /// Run a single test from an instrumented test binary, capturing its
 /// coverage to `profraw`. Equivalent to
-/// `<binary> --exact <test_name>` with `LLVM_PROFILE_FILE` set.
+/// `<binary> --exact <test_name>` with `LLVM_PROFILE_FILE` set; the
+/// profiles of processes the test spawns are written to a scratch
+/// directory next to `profraw` and discarded, never added to
+/// `profraw` or written to the working directory.
 ///
 /// Like [`run`], does not check the test's exit status — a failing
 /// `#[test]` still produces a valid `profraw`.
@@ -124,14 +257,12 @@ pub fn run_test_isolated(
     test_name: &str,
     profraw: &Path,
 ) -> Result<(), RunnerError> {
-    let out = Command::new(binary)
-        .args(["--exact", test_name])
-        .env("LLVM_PROFILE_FILE", profraw)
-        .output()
-        .map_err(|e| RunnerError {
-            stage: "run_test_isolated",
-            message: format!("could not exec {}: {e}", binary.display()),
-        })?;
+    let mut cmd = test_binary_command(binary);
+    cmd.args(["--exact", test_name]);
+    let out = output_with_profile(cmd, profraw).map_err(|e| RunnerError {
+        stage: "run_test_isolated",
+        message: format!("could not exec {}: {e}", binary.display()),
+    })?;
     if !profraw.exists() {
         return Err(RunnerError {
             stage: "run_test_isolated",
@@ -153,14 +284,12 @@ pub fn run_test_isolated(
 /// producing a valid `profraw`. Errors out only if `profraw` is not
 /// created.
 pub fn run(binary: &Path, argv: &[&str], profraw: &Path) -> Result<(), RunnerError> {
-    let out = Command::new(binary)
-        .args(argv)
-        .env("LLVM_PROFILE_FILE", profraw)
-        .output()
-        .map_err(|e| RunnerError {
-            stage: "run binary",
-            message: format!("could not exec {}: {e}", binary.display()),
-        })?;
+    let mut cmd = test_binary_command(binary);
+    cmd.args(argv);
+    let out = output_with_profile(cmd, profraw).map_err(|e| RunnerError {
+        stage: "run binary",
+        message: format!("could not exec {}: {e}", binary.display()),
+    })?;
     if !profraw.exists() {
         return Err(RunnerError {
             stage: "run binary",
@@ -284,6 +413,37 @@ mod tests {
         assert!(wrapped.contains("Floyd itself did not crash"));
         // The original raw stack is preserved for bug reports.
         assert!(wrapped.contains("PrintStackTrace"));
+    }
+
+    /// The toolchain dirs go first, inherited entries follow, and an
+    /// entry already present is not repeated.
+    #[test]
+    fn dylib_path_prepends_without_duplicates() {
+        let a = PathBuf::from("/tc/lib");
+        let b = PathBuf::from("/bin/dir");
+        let existing = std::env::join_paths([Path::new("/usr/lib"), Path::new("/tc/lib")]).unwrap();
+        let joined = join_dylib_path(&[a.clone(), b.clone()], Some(&existing));
+        let parts: Vec<PathBuf> = std::env::split_paths(&joined).collect();
+        assert_eq!(parts, vec![a, b, PathBuf::from("/usr/lib")]);
+        let fresh = join_dylib_path(&[PathBuf::from("/x")], None);
+        assert_eq!(fresh, OsString::from("/x"));
+    }
+
+    /// A spawned test binary sees the toolchain's libdir (where
+    /// `libstd-*` lives) on the loader search path.
+    #[test]
+    fn test_binary_command_sets_the_loader_path() {
+        let cmd = test_binary_command(Path::new("/some/dir/bin"));
+        let value = cmd
+            .get_envs()
+            .find(|(k, _)| *k == dylib_path_var())
+            .and_then(|(_, v)| v)
+            .expect("loader path set");
+        let parts: Vec<PathBuf> = std::env::split_paths(value).collect();
+        assert!(parts.contains(&PathBuf::from("/some/dir")));
+        for d in toolchain_lib_dirs() {
+            assert!(parts.contains(d), "{} missing", d.display());
+        }
     }
 
     /// Non-LLVM-crash stderr (ordinary errors, file-not-found, etc.)

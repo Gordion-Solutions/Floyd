@@ -50,7 +50,10 @@ fn assert_runtime_consistent(
     coverage: &profile::CoverageReport,
     expected_evaluated: &BTreeMap<String, bool>,
 ) {
-    let map = correlate::correlate(mir, coverage);
+    // The fixture is compiled from an absolute path, so MIR and
+    // llvm-cov both print absolute paths.
+    let paths = floyd::coverage_index::PathNormaliser::new(None);
+    let map = correlate::correlate(mir, coverage, &paths);
     for f in &map.functions {
         for (name, runtime) in &f.conditions {
             match expected_evaluated.get(name) {
@@ -174,11 +177,11 @@ fn pipeline_on_001_simple_and() {
         let mut inputs = BTreeMap::new();
         inputs.insert("a".to_string(), a_val);
         inputs.insert("b".to_string(), b_val);
-        observations.push(ConditionObservation {
-            test_name: Some(format!("a={a_str},b={b_str}")),
+        observations.push(ConditionObservation::vector(
+            Some(format!("a={a_str},b={b_str}")),
             inputs,
             result,
-        });
+        ));
     }
 
     let tree = decision::decompose(&mir);
@@ -258,11 +261,11 @@ fn pipeline_detects_partial_coverage_on_001() {
         let mut inputs = BTreeMap::new();
         inputs.insert("a".to_string(), a_val);
         inputs.insert("b".to_string(), b_val);
-        observations.push(ConditionObservation {
-            test_name: Some(format!("a={a_str},b={b_str}")),
+        observations.push(ConditionObservation::vector(
+            Some(format!("a={a_str},b={b_str}")),
             inputs,
             result,
-        });
+        ));
     }
 
     let tree = decision::decompose(&mir);

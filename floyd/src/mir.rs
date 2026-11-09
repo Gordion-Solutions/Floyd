@@ -40,7 +40,7 @@ pub type BlockId = u32;
 /// `llvm-cov export` branches array. The cross-format compatibility
 /// is what lets `floyd::correlate` join MIR decisions to runtime
 /// coverage data without resolving counter IDs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceSpan {
     /// Source file path as rustc reports it.
     pub file: String,
@@ -59,6 +59,64 @@ pub struct SourceSpan {
 pub struct Mir {
     /// Top-level functions in source order.
     pub functions: Vec<MirFunction>,
+    /// Count of function definitions in the input text whose fn
+    /// header the parser could not recognise. The function body is
+    /// skipped (brace-balanced); the count surfaces that something
+    /// was elided so the honest-scope report can tell a reader
+    /// "Floyd parsed M of M+N functions in this MIR, N were in
+    /// shapes the engine's grammar does not yet model (HRTB
+    /// signatures, complex trait objects, ...)".
+    pub unparseable_functions: usize,
+    /// Count of function definitions whose body contained no
+    /// `switchInt` terminator at all and were therefore
+    /// brace-skipped before the parser ever walked them. These are
+    /// straight-line / pure-call-delegation / constant-returning
+    /// functions — the engine cannot analyse a decision in them
+    /// because there is no decision. Dropping them before the main
+    /// parse walk is a scalability win on real crates (heapless'
+    /// const-generic monomorphisation produces hundreds of such
+    /// bodies, each thousands of lines of MIR).
+    pub decisionless_functions: usize,
+    /// A top-level item whose closing brace the parser never found:
+    /// everything from that item to the end of the input was not
+    /// parsed, so functions after it are missing from
+    /// [`Mir::functions`]. `None` for a well-formed dump.
+    pub unterminated_item: Option<UnterminatedItem>,
+}
+
+/// A top-level MIR item that runs to end of input without its
+/// closing `}`. See [`Mir::unterminated_item`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnterminatedItem {
+    /// The item's header line, e.g. `fn f(_1: bool) -> bool {`.
+    pub header: String,
+    /// Function headers in the unparsed tail (the item itself, if it
+    /// is a function, included).
+    pub functions_lost: usize,
+}
+
+impl Mir {
+    /// One sentence per problem that made the parse incomplete:
+    /// unrecognised function headers and an unterminated item. Empty
+    /// when every function in the input was parsed.
+    pub fn parse_problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.unparseable_functions > 0 {
+            out.push(format!(
+                "{} function header(s) not recognised by Floyd's MIR grammar; \
+                 those functions were not analysed",
+                self.unparseable_functions
+            ));
+        }
+        if let Some(u) = &self.unterminated_item {
+            out.push(format!(
+                "no closing brace for the top-level item `{}`; the rest of the \
+                 file ({} function(s)) was not parsed or analysed",
+                u.header, u.functions_lost
+            ));
+        }
+        out
+    }
 }
 
 /// One function's MIR.
@@ -88,6 +146,30 @@ pub struct MirFunction {
     pub captures: Vec<MirCapture>,
     /// Basic blocks in source order.
     pub blocks: Vec<MirBlock>,
+    /// Number of coverage mapping statements in the body preamble
+    /// (`coverage Code { .. } => <span>;`, `coverage Branch { .. }
+    /// => <span>;`, ...). rustc prints these when the MIR is emitted
+    /// by the same `-Cinstrument-coverage` compilation that produces
+    /// the test binary; they are the regions `llvm-cov` will report
+    /// for this function. Zero in an instrumented MIR means rustc
+    /// did not instrument the body (it skips
+    /// `#[automatically_derived]` impls, `#[coverage(off)]` items and
+    /// bodies whose code has no usable source span), so the function
+    /// has no coverage record. Lower-case `coverage branch { .. }`
+    /// lines are branch markers, not mappings, and are not counted.
+    pub coverage_mappings: usize,
+    /// The source spans of those mappings, as printed. They are the
+    /// spans of the code and branch regions `llvm-cov` reports for
+    /// this body, so they locate its coverage record even when a
+    /// decomposed condition's own span carries no region.
+    pub coverage_spans: Vec<SourceSpan>,
+    /// `true` for the body rustc prints under a `// MIR FOR CTFE`
+    /// line: the compile-time-evaluation rendering of a `const fn`,
+    /// which follows its runtime body under the same name. CTFE MIR
+    /// keeps shapes that the runtime body optimises away (operand
+    /// copies, `StorageLive`), and it never runs at runtime; the
+    /// runtime body carries the decision and its coverage.
+    pub is_ctfe: bool,
 }
 
 /// A captured variable from a closure's environment.
@@ -142,12 +224,16 @@ pub struct MirBlock {
 /// A non-terminating statement inside a block.
 #[derive(Debug, Clone)]
 pub enum MirStatement {
-    /// `_<dst> = copy _<src>;`
+    /// `_<dst> = copy _<src>;` or `_<dst> = copy (*_<src>);`
     AssignCopy {
         /// Destination local.
         dst: LocalId,
         /// Source local.
         src: LocalId,
+        /// `true` for the dereference form `copy (*_<src>)`: `dst`
+        /// receives the pointee of `src`, not `src`'s own value.
+        /// `false` for a plain `copy _<src>` value alias.
+        deref: bool,
         /// Source span, if present in the MIR.
         span: Option<SourceSpan>,
     },
@@ -235,6 +321,22 @@ pub enum MirStatement {
         lhs: Operand,
         /// Right-hand operand.
         rhs: Operand,
+        /// Source span, if present in the MIR.
+        span: Option<SourceSpan>,
+    },
+    /// `_<dst> = Not(copy _<src>);` (or `move _<src>`).
+    ///
+    /// Boolean unary negation. Emitted by rustc when
+    /// `-Cinstrument-coverage` runs with
+    /// `-Zcoverage-options=branch,condition` — the Not operation's
+    /// two outcomes need their own branch counter, so rustc
+    /// materialises it as a distinct statement instead of folding
+    /// the `!` into a switchInt arm swap (the fallback shape).
+    AssignUnaryNot {
+        /// Destination local (bool-typed).
+        dst: LocalId,
+        /// Source local being negated.
+        src: LocalId,
         /// Source span, if present in the MIR.
         span: Option<SourceSpan>,
     },
@@ -394,6 +496,51 @@ pub enum MirTerminator {
         /// Source span, if present in the MIR.
         span: Option<SourceSpan>,
     },
+    /// `_<dst> = <func-expr>(<args>) -> unwind <action>;` or
+    /// `_<dst> = <func-expr>(<args>) -> bb<cleanup>;`
+    ///
+    /// A call with no `return` edge: the callee returns `!`
+    /// (`core::panicking::panic`, `std::rt::panic_fmt`,
+    /// `std::rt::begin_panic`, `core::panicking::assert_failed`,
+    /// `std::process::exit`, ..). Control never continues past it, so
+    /// a path that reaches one diverges. This is how rustc lowers the
+    /// failure arm of `assert!`, `assert_eq!`, `panic!`, `unwrap()`
+    /// and friends.
+    NoReturnCall {
+        /// Local named as the (never-written) destination.
+        dst: LocalId,
+        /// Verbatim text of the function expression, as for
+        /// [`MirTerminator::Call::func_text`].
+        func_text: String,
+        /// Source span, if present in the MIR.
+        span: Option<SourceSpan>,
+    },
+    /// `assert(<cond>, "<msg>", <args>..) -> [success: bb<target>, unwind ..];`
+    ///
+    /// rustc's checked-operation terminator: overflow checks on
+    /// arithmetic (`a + b` under `-C overflow-checks`), division by
+    /// zero, array bounds checks, alignment checks. When `<cond>`
+    /// holds, control continues at `success`; otherwise the runtime
+    /// panics with `msg`. The `success` edge is the function's
+    /// normal control flow, so successor-following code treats an
+    /// `Assert` like a non-panicking [`MirTerminator::Call`] or a
+    /// [`MirTerminator::Goto`]. The assert itself is never a user
+    /// decision: it has no source-level `if`, and its failure edge
+    /// is a panic.
+    Assert {
+        /// Successor block reached when the asserted condition holds.
+        success: BlockId,
+        /// Cleanup block named by `unwind: bb<N>`, if any. `None` for
+        /// `unwind continue`, `unwind unreachable` and
+        /// `unwind terminate(..)`.
+        unwind: Option<BlockId>,
+        /// The panic message template (the string literal's contents,
+        /// escapes left as rustc printed them), e.g.
+        /// ``attempt to compute `{} + {}`, which would overflow``.
+        msg: String,
+        /// Source span, if present in the MIR.
+        span: Option<SourceSpan>,
+    },
     /// A terminator shape Phase 0 doesn't yet parse. Preserved verbatim.
     Other {
         /// Original text of the terminator.
@@ -420,20 +567,201 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// First-pass filter that brace-strips function bodies with no
+/// `switchInt` terminator.
+///
+/// Walks the input line by line, tracking brace depth. At depth 0,
+/// when a line that looks like a function header (`fn ... {`) is
+/// seen, scan ahead to the matching close brace and check whether
+/// the body contains the string `switchInt`. If not, emit the fn
+/// header followed by a minimal `bb0: { return; }` stub body and
+/// skip the real body. If yes, emit the function verbatim. Any
+/// non-function top-level item (static, const, impl block, scope,
+/// etc.) is emitted verbatim.
+///
+/// Returns the filtered input and the count of stripped functions.
+fn strip_switchintless_fn_bodies(input: &str) -> (String, usize) {
+    let lines: Vec<&str> = input.lines().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut skipped: usize = 0;
+    let mut top_depth: u32 = 0;
+    let mut i: usize = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        // At depth 0: detect function headers. These start with
+        // `fn ` after trimming leading whitespace and end with
+        // `{`. Non-fn top-level items (static X = {, const FOO =
+        // {, scope ... {) are left untouched; the main parser's
+        // own skip_depth / scope_nest machinery handles them.
+        // An allocation hex dump is data: its ASCII column can end
+        // in `{` (e.g. the bytes `\u{`), which must not count as a
+        // brace. Copy it through to its closing `}` uncounted.
+        if top_depth == 0 && is_alloc_dump_header(trimmed) {
+            loop {
+                out.push_str(lines[i]);
+                out.push('\n');
+                i += 1;
+                if i >= lines.len() || lines[i - 1].trim() == "}" {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if top_depth == 0 && is_fn_header_line(trimmed) {
+            // Scan ahead for the matching close brace, tracking
+            // local depth. We only consider `switchInt` occurrences
+            // within THIS function's body (so a nested fn in a
+            // scope would still have its own switchInt check if
+            // we ever hit one, though in practice MIR dumps do
+            // not nest fns inside bodies).
+            let mut local_depth: u32 = 1;
+            let mut j = i + 1;
+            let mut has_decision_marker = false;
+            while j < lines.len() && local_depth > 0 {
+                let tl = lines[j].trim();
+                if !has_decision_marker && line_has_decision_marker(tl) {
+                    has_decision_marker = true;
+                }
+                if tl.ends_with('{') {
+                    local_depth += 1;
+                } else if tl == "}" {
+                    local_depth -= 1;
+                }
+                j += 1;
+            }
+            // j now points one past the function's closing brace.
+            //
+            // Size threshold: the strip pass is a scalability
+            // optimisation for crates whose per-function MIR is
+            // thousands of lines each (heapless' const-generic
+            // monomorphisation). For small bodies (hand-written
+            // test fixtures, tiny real functions) the parser's
+            // own walk is already cheap and stripping would elide
+            // legitimate `debug` / `let` metadata the parser-level
+            // tests depend on. Keep anything under the threshold
+            // verbatim; apply the strip only when it actually
+            // moves the needle.
+            let body_lines = j.saturating_sub(i);
+            let worth_stripping = body_lines >= 50;
+            if has_decision_marker || !worth_stripping {
+                for body_line in &lines[i..j] {
+                    out.push_str(body_line);
+                    out.push('\n');
+                }
+            } else {
+                // Keep the fn header (first line) + stub body.
+                out.push_str(lines[i]);
+                out.push('\n');
+                out.push_str("    bb0: {\n");
+                out.push_str("        return;\n");
+                out.push_str("    }\n");
+                out.push_str("}\n");
+                skipped += 1;
+            }
+            i = j;
+            continue;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+        if trimmed.ends_with('{') {
+            top_depth = top_depth.saturating_add(1);
+        } else if trimmed == "}" {
+            top_depth = top_depth.saturating_sub(1);
+        }
+        i += 1;
+    }
+    (out, skipped)
+}
+
+/// Does this body line contain a MIR syntactic marker that could
+/// let Floyd's decomposer produce a candidate decision?
+///
+/// Keeps the strip pass's positive-list conservative: any `switchInt`
+/// terminator (branching); any inline-compare rvalue (`= Eq(`,
+/// `= Ne(`, `= Lt(`, `= Le(`, `= Gt(`, `= Ge(`); any unary negation
+/// (`= Not(`); or a constant assignment to the return place
+/// (`_0 = const `) which `extract_terminal_value` recovers as
+/// `Node::Const`. Bodies with none of these markers cannot
+/// produce a candidate, so they are safe to drop.
+fn line_has_decision_marker(line: &str) -> bool {
+    line.contains("switchInt")
+        || line.contains(" = Eq(")
+        || line.contains(" = Ne(")
+        || line.contains(" = Lt(")
+        || line.contains(" = Le(")
+        || line.contains(" = Gt(")
+        || line.contains(" = Ge(")
+        || line.contains(" = Not(")
+        || line.contains("_0 = const ")
+}
+
+/// Does this line look like a top-level MIR function header? E.g.
+/// `fn make_input(_1: &[u8]) -> bool {`. Matched conservatively —
+/// we only strip bodies when we are confident the line is a fn
+/// header and not something else (nested fns inside bodies,
+/// closures, scope declarations).
+fn is_fn_header_line(line: &str) -> bool {
+    line.starts_with("fn ") && line.ends_with('{')
+}
+
+/// Is this line the header of an allocation dump, e.g.
+/// `alloc196 (size: 16, align: 8) {`? rustc prints one after the
+/// functions that use a constant allocation. Its body is a hex dump
+/// with an ASCII rendering of the bytes, so braces in it are data;
+/// it ends at the first line that is exactly `}` (a dump line always
+/// starts with an offset or hex bytes).
+fn is_alloc_dump_header(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("alloc") else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && rest[digits..].starts_with(" (") && line.ends_with('{')
+}
+
 /// Parse an `--emit=mir` text dump into a [`Mir`].
 ///
-/// Phase 0 scope: function headers, `debug` annotations, `let` locals,
-/// blocks with `copy`/`const bool` assignments, and `return` / `goto` /
-/// `switchInt` terminators. Other shapes pass through as
-/// [`MirStatement::Other`] / [`MirTerminator::Other`].
+/// Phase 0 scope: function headers, `debug` annotations, `let`
+/// locals, blocks with `copy`/`const bool` assignments, and
+/// `return` / `goto` / `switchInt` / `unreachable` / call / `assert`
+/// terminators. Other shapes pass
+/// through as [`MirStatement::Other`] / [`MirTerminator::Other`].
 ///
 /// When the MIR was emitted with `-Zmir-include-spans`, the parser
 /// also captures inline source-span comments of the form
 /// `// scope <N> at <file>:<line>:<col>: <line>:<col>` and attaches
-/// them to the corresponding statement / terminator. Span-less MIR is
-/// also accepted; the `span` fields are then `None`.
+/// them to the corresponding statement / terminator. Span-less MIR
+/// is also accepted; the `span` fields are then `None`.
+///
+/// Runs `strip_switchintless_fn_bodies` first, so functions whose
+/// bodies carry no `switchInt` terminator are brace-stripped before
+/// the main parse walk. The stripped count is surfaced via
+/// [`Mir::decisionless_functions`].
 pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
-    let mut mir = Mir::default();
+    // Lazy skip pass: brace-strip any function body that contains
+    // no `switchInt` terminator. These functions carry no decision
+    // Floyd can analyse (straight-line code, pure-call delegation,
+    // constant returns) so there is no analytical cost to dropping
+    // them before the main parse walk. The win is scalability:
+    // heapless' const-generic monomorphisation produces hundreds
+    // of such bodies, each thousands of lines of MIR text; parsing
+    // them in full was the single biggest contributor to Pass 1
+    // wall-clock on real embedded crates. The brace-stripped body
+    // is replaced with a minimal `bb0: { return; }` stub so the
+    // existing parser still sees a well-formed function header
+    // and records it for the per-crate function count (both the
+    // function and its emptiness are user-visible in the report
+    // via `decisionless_functions`).
+    let (input, decisionless) = strip_switchintless_fn_bodies(input);
+    let mut mir = Mir {
+        decisionless_functions: decisionless,
+        ..Mir::default()
+    };
+    let input = input.as_str();
     let mut depth: u8 = 0;
     // Counter for "skip this block" regions outside any function —
     // top-level non-`fn` items like
@@ -448,8 +776,21 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
     // braces must be tracked so the matching close doesn't get
     // misread as the function's close.
     let mut scope_nest: u32 = 0;
+    // Brace depth inside a function-level `coroutine layout { ... }`
+    // block (async fns and blocks): the coroutine's saved-local
+    // layout, which carries no control flow. Skipped, braces counted.
+    let mut layout_depth: u32 = 0;
     let mut current_fn: Option<MirFunction> = None;
     let mut current_block: Option<MirBlock> = None;
+    // Set by a `// MIR FOR CTFE` line; consumed by the next
+    // top-level item, which is the CTFE body of a `const fn`.
+    let mut next_is_ctfe = false;
+    // Inside an allocation dump (see `is_alloc_dump_header`): skip
+    // to its closing `}` without counting braces.
+    let mut in_alloc_dump = false;
+    // Header of the top-level item being parsed or skipped, for
+    // `Mir::unterminated_item`.
+    let mut open_item = String::new();
 
     for (i, raw) in input.lines().enumerate() {
         let line_no = i + 1;
@@ -457,9 +798,24 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
         if trimmed.is_empty() {
             continue;
         }
+        if in_alloc_dump {
+            if trimmed == "}" {
+                in_alloc_dump = false;
+            }
+            continue;
+        }
+        if depth == 0 && skip_depth == 0 && is_alloc_dump_header(trimmed) {
+            next_is_ctfe = false;
+            in_alloc_dump = true;
+            open_item = trimmed.to_string();
+            continue;
+        }
         // Lines that are *entirely* comments (preamble warnings, etc.)
         // are skipped. Lines with a trailing comment are split below.
         if trimmed.starts_with("//") {
+            if depth == 0 && trimmed == "// MIR FOR CTFE" {
+                next_is_ctfe = true;
+            }
             continue;
         }
 
@@ -484,7 +840,22 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
         // bodies, which carry `debug` and `let` declarations, are
         // captured.
         if code.ends_with('{') && depth == 0 && !code.starts_with("fn ") {
+            next_is_ctfe = false;
             skip_depth = 1;
+            open_item = code.to_string();
+            continue;
+        }
+
+        if layout_depth > 0 {
+            if code.ends_with('{') {
+                layout_depth += 1;
+            } else if code == "}" {
+                layout_depth -= 1;
+            }
+            continue;
+        }
+        if depth == 1 && code == "coroutine layout {" {
+            layout_depth = 1;
             continue;
         }
 
@@ -500,13 +871,32 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
         // Open a brace: either a function or a basic block header.
         if code.ends_with('{') {
             if depth == 0 {
-                let f = parse_fn_header(code).ok_or_else(|| ParseError {
-                    line: line_no,
-                    message: format!("expected fn header, got: {code}"),
-                })?;
-                current_fn = Some(f);
-                depth = 1;
-                continue;
+                open_item = code.to_string();
+                let is_ctfe = std::mem::take(&mut next_is_ctfe);
+                match parse_fn_header(code) {
+                    Some(f) => {
+                        current_fn = Some(MirFunction { is_ctfe, ..f });
+                        depth = 1;
+                        continue;
+                    }
+                    None => {
+                        // Error-tolerant: an unparseable fn header
+                        // (complex HRTB generics, trait object
+                        // return types the current grammar does
+                        // not model) skips the whole function body
+                        // via the `skip_depth` mechanism. One
+                        // unparseable function must not kill the
+                        // whole MIR parse — a 2.9MB MIR with 360
+                        // functions should surface the 359 that
+                        // DO parse. The count is tracked so the
+                        // honest-scope reporter can say "N
+                        // functions could not be parsed by this
+                        // engine's MIR grammar".
+                        mir.unparseable_functions += 1;
+                        skip_depth = 1;
+                        continue;
+                    }
+                }
             } else if depth == 1 {
                 let id = parse_bb_header(code).ok_or_else(|| ParseError {
                     line: line_no,
@@ -584,6 +974,11 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
                         loc.span = span.clone();
                         f.locals.push(loc);
                     }
+                } else if is_coverage_mapping(code) {
+                    f.coverage_mappings += 1;
+                    if let Some(span) = coverage_mapping_span(code) {
+                        f.coverage_spans.push(span);
+                    }
                 }
                 // Other fn-level lines (e.g. scope annotations) ignored.
             }
@@ -608,7 +1003,28 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
         }
     }
 
+    if in_alloc_dump || skip_depth > 0 || depth > 0 || layout_depth > 0 {
+        mir.unterminated_item = Some(UnterminatedItem {
+            functions_lost: count_fn_headers_from(input, &open_item),
+            header: open_item,
+        });
+    }
+
     Ok(mir)
+}
+
+/// Number of top-level function headers from the last line equal
+/// to `header` to the end of `input`.
+fn count_fn_headers_from(input: &str, header: &str) -> usize {
+    let lines: Vec<&str> = input.lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|l| l.trim() == header)
+        .unwrap_or(lines.len());
+    lines[start..]
+        .iter()
+        .filter(|l| is_fn_header_line(l.trim()))
+        .count()
 }
 
 // ---------------------------------------------------------------------------
@@ -712,13 +1128,25 @@ fn parse_fn_header(line: &str) -> Option<MirFunction> {
     })
 }
 
+/// Is the `>` at byte `i` of `s` the head of a `->` arrow (the return
+/// type of a fn pointer, `impl Fn..`, `dyn Fn..` or `for<'a> fn..`
+/// type) rather than a closing angle bracket? `>>`, `>=`, `<<` and
+/// `<=` need no such care: in a type, `>>` is two closing brackets
+/// (`Vec<Vec<u8>>`) and `<<` two opening ones (`<<T as A>::B as C>`),
+/// and comparisons never appear in a type.
+fn is_arrow_head(s: &str, i: usize) -> bool {
+    s[..i].ends_with('-')
+}
+
 /// Find the matching closing bracket for an open bracket that is
 /// considered to sit just before `s`. Returns the index inside `s` of
-/// the matching close. Honours nested `()`, `<>`, `[]` and `{}`.
+/// the matching close. Honours nested `()`, `<>`, `[]` and `{}`; the
+/// `>` of a `->` arrow is not a bracket.
 fn find_matching_close(s: &str, open: char, close: char) -> Option<usize> {
     let mut depth: i32 = 1;
     for (i, c) in s.char_indices() {
         match c {
+            '>' if is_arrow_head(s, i) => {}
             c if c == open => depth += 1,
             c if c == close => {
                 depth -= 1;
@@ -735,13 +1163,15 @@ fn find_matching_close(s: &str, open: char, close: char) -> Option<usize> {
 }
 
 /// Split `s` on `sep` at top level — i.e. ignoring separators that
-/// appear inside balanced `()`, `<>`, `[]` or `{}`.
+/// appear inside balanced `()`, `<>`, `[]` or `{}`. The `>` of a `->`
+/// arrow is not a bracket.
 fn split_top_level(s: &str, sep: char) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth: i32 = 0;
     let mut start = 0;
     for (i, c) in s.char_indices() {
         match c {
+            '>' if is_arrow_head(s, i) => {}
             '(' | '<' | '[' | '{' => depth += 1,
             ')' | '>' | ']' | '}' => depth -= 1,
             x if x == sep && depth == 0 => {
@@ -753,6 +1183,25 @@ fn split_top_level(s: &str, sep: char) -> Vec<&str> {
     }
     out.push(&s[start..]);
     out
+}
+
+/// `coverage Code { bcb: bcb0 } => src/lib.rs:1:1: 1:9 (#0);` and the
+/// other capitalised mapping kinds (`Branch`, `MCDCBranch`, ...).
+/// The lower-case `coverage branch { true: .., false: .. } => ..`
+/// form is a branch marker recorded before mappings are built.
+fn is_coverage_mapping(code: &str) -> bool {
+    code.strip_prefix("coverage ")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// The span of a coverage mapping statement:
+/// `coverage Code { bcb: bcb0 } => src/lib.rs:1:1: 1:9 (#0);` gives
+/// `src/lib.rs:1:1: 1:9`.
+fn coverage_mapping_span(code: &str) -> Option<SourceSpan> {
+    let rest = code.rsplit_once(" => ")?.1.trim_end_matches(';');
+    let span = rest.rsplit_once(" (#").map_or(rest, |(span, _)| span);
+    parse_span_literal(span.trim())
 }
 
 fn parse_bb_header(line: &str) -> Option<BlockId> {
@@ -1002,7 +1451,12 @@ fn parse_statement(line: &str, span: Option<SourceSpan>) -> Option<MirStatement>
 
     if let Some(src_str) = rhs.strip_prefix("copy _") {
         if let Ok(src) = src_str.parse::<u32>() {
-            return Some(MirStatement::AssignCopy { dst, src, span });
+            return Some(MirStatement::AssignCopy {
+                dst,
+                src,
+                deref: false,
+                span,
+            });
         }
     }
     // `_X = copy (*_Y);` — dereference copy, common when reading
@@ -1013,7 +1467,12 @@ fn parse_statement(line: &str, span: Option<SourceSpan>) -> Option<MirStatement>
     if let Some(inner) = rhs.strip_prefix("copy (*_") {
         if let Some(close) = inner.find(')') {
             if let Ok(src) = inner[..close].parse::<u32>() {
-                return Some(MirStatement::AssignCopy { dst, src, span });
+                return Some(MirStatement::AssignCopy {
+                    dst,
+                    src,
+                    deref: true,
+                    span,
+                });
             }
         }
     }
@@ -1073,6 +1532,15 @@ fn parse_statement(line: &str, span: Option<SourceSpan>) -> Option<MirStatement>
             rhs: cmp.rhs,
             span,
         });
+    }
+    // `_X = Not(copy _Y);` / `_X = Not(move _Y);` — boolean unary
+    // negation. See `MirStatement::AssignUnaryNot` for context.
+    if let Some(inner) = rhs.strip_prefix("Not(") {
+        if let Some(arg) = inner.strip_suffix(')') {
+            if let Some(src) = parse_local_token(arg.trim()) {
+                return Some(MirStatement::AssignUnaryNot { dst, src, span });
+            }
+        }
     }
     None
 }
@@ -1145,15 +1613,7 @@ fn parse_call_terminator(s: &str) -> Option<CallTerminator> {
     let lhs = &s[..=arrow_idx]; // up to and including the `)`
     let arms_str = s[arrow_idx + 6..].strip_suffix(']')?;
 
-    let eq = lhs.find(" = ")?;
-    let dst = lhs[..eq].trim().strip_prefix('_')?.parse::<u32>().ok()?;
-    let call_expr = lhs[eq + 3..].trim();
-    // Capture the function expression text (everything up to the
-    // opening `(` of the argument list). Used by the `?` detector.
-    let func_text = match call_expr.find('(') {
-        Some(p) => call_expr[..p].trim().to_string(),
-        None => call_expr.to_string(),
-    };
+    let (dst, func_text) = parse_call_lhs(lhs)?;
 
     // Find the `return: bb<N>` arm. Other arms (unwind continue,
     // unwind: bb20, etc.) are ignored — Floyd does not follow
@@ -1172,6 +1632,96 @@ fn parse_call_terminator(s: &str) -> Option<CallTerminator> {
         func_text,
         target: target?,
     })
+}
+
+struct AssertTerminator {
+    success: BlockId,
+    unwind: Option<BlockId>,
+    msg: String,
+}
+
+/// Parse an assert terminator of the form
+/// `assert(<cond>, "<msg>", <args>..) -> [success: bb<N>, unwind <action>]`
+/// (the trailing `;` has already been stripped). `<action>` is one of
+/// `continue`, `unreachable`, `terminate(..)` or `: bb<M>`. Returns
+/// `None` if the shape doesn't match.
+fn parse_assert_terminator(s: &str) -> Option<AssertTerminator> {
+    let rest = s.strip_prefix("assert(")?;
+    // The arm list is the last `) -> [..]` on the line; the message
+    // literal sits before it, so `rfind` cannot land inside it.
+    let arrow_idx = rest.rfind(") -> [")?;
+    let args = &rest[..arrow_idx];
+    let arms_str = rest[arrow_idx + 6..].strip_suffix(']')?;
+
+    let msg = first_string_literal(args)?;
+
+    let mut success: Option<BlockId> = None;
+    let mut unwind: Option<BlockId> = None;
+    for arm in split_top_level(arms_str, ',') {
+        let arm = arm.trim();
+        if let Some(t) = arm.strip_prefix("success:") {
+            success = Some(t.trim().strip_prefix("bb")?.parse::<u32>().ok()?);
+        } else if let Some(t) = arm.strip_prefix("unwind:") {
+            unwind = Some(t.trim().strip_prefix("bb")?.parse::<u32>().ok()?);
+        }
+    }
+    Some(AssertTerminator {
+        success: success?,
+        unwind,
+        msg,
+    })
+}
+
+/// Return the contents of the first double-quoted string literal in
+/// `s`, honouring backslash escapes (which are kept verbatim). `None`
+/// if `s` has no complete literal.
+fn first_string_literal(s: &str) -> Option<String> {
+    let open = s.find('"')?;
+    let body = &s[open + 1..];
+    let mut escaped = false;
+    for (i, c) in body.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return Some(body[..i].to_string()),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split `_<dst> = <func-expr>(<args>)` into the destination local
+/// and the function expression text (everything up to the opening
+/// `(` of the argument list; used by the `?` detector and the panic
+/// filter).
+fn parse_call_lhs(lhs: &str) -> Option<(LocalId, String)> {
+    let eq = lhs.find(" = ")?;
+    let dst = lhs[..eq].trim().strip_prefix('_')?.parse::<u32>().ok()?;
+    let call_expr = lhs[eq + 3..].trim();
+    let func_text = match call_expr.find('(') {
+        Some(p) => call_expr[..p].trim().to_string(),
+        None => call_expr.to_string(),
+    };
+    Some((dst, func_text))
+}
+
+/// Parse a call terminator with no return edge,
+/// `_<dst> = <func-expr>(<args>) -> unwind <action>` or
+/// `_<dst> = <func-expr>(<args>) -> bb<cleanup>` (the trailing `;`
+/// has already been stripped). Returns `None` for any other shape,
+/// including calls that do return (`-> [return: ..]`).
+fn parse_noreturn_call_terminator(s: &str) -> Option<(LocalId, String)> {
+    let arrow_idx = s.rfind(") -> ")?;
+    let edge = &s[arrow_idx + 5..];
+    let is_unwind_only = edge.starts_with("unwind ")
+        || edge.starts_with("unwind:")
+        || edge
+            .strip_prefix("bb")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    if !is_unwind_only {
+        return None;
+    }
+    parse_call_lhs(&s[..=arrow_idx])
 }
 
 /// Parse a local token that may carry a `copy`/`move` prefix, returning
@@ -1242,12 +1792,31 @@ fn parse_terminator(line: &str, span: Option<SourceSpan>) -> Option<MirTerminato
             .map(|target| MirTerminator::Goto { target, span });
     }
 
+    // Before the Call parser: an assert's message text is free-form
+    // and must never be mistaken for a `_N = f(..)` call.
+    if let Some(assert) = parse_assert_terminator(s) {
+        return Some(MirTerminator::Assert {
+            success: assert.success,
+            unwind: assert.unwind,
+            msg: assert.msg,
+            span,
+        });
+    }
+
     if let Some(call) = parse_call_terminator(s) {
         let _ = span.as_ref(); // keep `span` lifetime explicit for readability
         return Some(MirTerminator::Call {
             dst: call.dst,
             func_text: call.func_text,
             target: call.target,
+            span,
+        });
+    }
+
+    if let Some((dst, func_text)) = parse_noreturn_call_terminator(s) {
+        return Some(MirTerminator::NoReturnCall {
+            dst,
+            func_text,
             span,
         });
     }
@@ -1828,6 +2397,233 @@ fn decide(_1: Option<bool>) -> Option<bool> {
 }
 "#;
 
+    /// `rustc +nightly --emit=mir -Zmir-include-spans -C overflow-checks=on
+    /// -C debug-assertions=on` output (nightly 1.101, 2026-10-28) for
+    ///
+    /// ```text
+    /// pub fn add_checked(a: u32, b: u32) -> u32 {
+    ///     debug_assert!(a < 1000);
+    ///     a + b
+    /// }
+    /// ```
+    ///
+    /// `bb2` ends in the overflow-check `assert` terminator; `bb1` is
+    /// the `debug_assert!` failure path (a diverging panic call).
+    const ASSERT_OVERFLOW_MIR: &str = r#"
+fn add_checked(_1: u32, _2: u32) -> u32 {
+    debug a => _1;                       // in scope 0 at ov.rs:1:20: 1:21
+    debug b => _2;                       // in scope 0 at ov.rs:1:28: 1:29
+    let mut _0: u32;                     // return place in scope 0 at ov.rs:1:39: 1:42
+    let mut _3: bool;                    // in scope 0 at ov.rs:2:19: 2:27
+    let mut _4: !;                       // in scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+    let mut _5: (u32, bool);             // in scope 0 at ov.rs:3:5: 3:10
+
+    bb0: {
+        _3 = Lt(copy _1, const 1000_u32); // scope 0 at ov.rs:2:19: 2:27
+        switchInt(move _3) -> [0: bb1, otherwise: bb2]; // scope 0 at ov.rs:2:19: 2:27
+    }
+
+    bb1: {
+        _4 = core::panicking::panic(const "assertion failed: a < 1000") -> unwind continue; // scope 0 at /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+                                         // mir::ConstOperand
+                                         // + span: /rustc/92ffebeceaa0a071066f233873c2438e73d70fe7/library/core/src/macros/mod.rs:293:13: 293:38
+                                         // + const_: Const { ty: fn(&'static str) -> ! {core::panicking::panic}, val: Value(core::panicking::panic) }
+                                         // mir::ConstOperand
+                                         // + span: no-location
+                                         // + const_: Const { ty: &str, val: Value("assertion failed: a < 1000") }
+    }
+
+    bb2: {
+        _5 = AddWithOverflow(copy _1, copy _2); // scope 0 at ov.rs:3:5: 3:10
+        assert(!move (_5.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _1, copy _2) -> [success: bb3, unwind continue]; // scope 0 at ov.rs:3:5: 3:10
+    }
+
+    bb3: {
+        _0 = move (_5.0: u32);           // scope 0 at ov.rs:3:5: 3:10
+        return;                          // scope 0 at ov.rs:4:2: 4:2
+    }
+}
+"#;
+
+    /// `rustc +nightly --emit=mir -C overflow-checks=on` output
+    /// (nightly 1.101, comment lines stripped) for
+    ///
+    /// ```text
+    /// pub fn idx(v: Vec<u32>, i: usize) -> u32 {
+    ///     let a = [1u32, 2, 3];
+    ///     a[i] + v.len() as u32
+    /// }
+    /// ```
+    ///
+    /// A bounds-check `assert` and an overflow-check `assert`, both
+    /// unwinding to the cleanup block `bb5` because `v` needs a drop.
+    const ASSERT_UNWIND_CLEANUP_MIR: &str = r#"
+fn idx(_1: Vec<u32>, _2: usize) -> u32 {
+    debug v => _1;
+    debug i => _2;
+    let mut _0: u32;
+    let _3: [u32; 3];
+    let mut _4: u32;
+    let mut _5: bool;
+    let mut _6: u32;
+    let mut _7: usize;
+    let mut _8: &std::vec::Vec<u32>;
+    let mut _9: (u32, bool);
+    scope 1 {
+        debug a => _3;
+    }
+
+    bb0: {
+        _3 = [const 1_u32, const 2_u32, const 3_u32];
+        _5 = Lt(copy _2, const 3_usize);
+        assert(move _5, "index out of bounds: the length is {} but the index is {}", const 3_usize, copy _2) -> [success: bb1, unwind: bb5];
+    }
+
+    bb1: {
+        _4 = copy _3[_2];
+        _8 = &_1;
+        _7 = Vec::<u32>::len(move _8) -> [return: bb2, unwind: bb5];
+    }
+
+    bb2: {
+        _6 = move _7 as u32 (IntToInt);
+        _9 = AddWithOverflow(copy _4, copy _6);
+        assert(!move (_9.1: bool), "attempt to compute `{} + {}`, which would overflow", move _4, move _6) -> [success: bb3, unwind: bb5];
+    }
+
+    bb3: {
+        _0 = move (_9.0: u32);
+        drop(_1) -> [return: bb4, unwind continue];
+    }
+
+    bb4: {
+        return;
+    }
+
+    bb5 (cleanup): {
+        drop(_1) -> [return: bb6, unwind terminate(cleanup)];
+    }
+
+    bb6 (cleanup): {
+        resume;
+    }
+}
+"#;
+
+    fn block(f: &MirFunction, id: BlockId) -> &MirBlock {
+        f.blocks.iter().find(|b| b.id == id).expect("block exists")
+    }
+
+    #[test]
+    fn parses_overflow_assert_terminator() {
+        let mir = parse_text(ASSERT_OVERFLOW_MIR).expect("parse ok");
+        let f = &mir.functions[0];
+        let bb2 = block(f, 2);
+        match &bb2.terminator {
+            MirTerminator::Assert {
+                success,
+                unwind,
+                msg,
+                span,
+            } => {
+                assert_eq!(*success, 3);
+                assert_eq!(*unwind, None, "`unwind continue` names no block");
+                assert_eq!(msg, "attempt to compute `{} + {}`, which would overflow");
+                let span = span.as_ref().expect("span recovered");
+                assert_eq!((span.start_line, span.start_col), (3, 5));
+            }
+            other => panic!("expected Assert, got {other:?}"),
+        }
+        // The terminator line must not also leak into the statements.
+        assert!(
+            bb2.statements.iter().all(
+                |s| !matches!(s, MirStatement::Other { text, .. } if text.contains("assert("))
+            ),
+            "assert line kept as a statement: {:?}",
+            bb2.statements
+        );
+    }
+
+    #[test]
+    fn parses_assert_terminator_with_cleanup_unwind() {
+        let mir = parse_text(ASSERT_UNWIND_CLEANUP_MIR).expect("parse ok");
+        let f = &mir.functions[0];
+        match &block(f, 0).terminator {
+            MirTerminator::Assert {
+                success,
+                unwind,
+                msg,
+                ..
+            } => {
+                assert_eq!(*success, 1);
+                assert_eq!(*unwind, Some(5));
+                assert_eq!(
+                    msg,
+                    "index out of bounds: the length is {} but the index is {}"
+                );
+            }
+            other => panic!("expected bounds-check Assert, got {other:?}"),
+        }
+        assert!(matches!(
+            block(f, 2).terminator,
+            MirTerminator::Assert {
+                success: 3,
+                unwind: Some(5),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn assert_parser_rejects_non_assert_shapes() {
+        assert!(parse_assert_terminator("goto -> bb1").is_none());
+        // No `success` arm.
+        assert!(parse_assert_terminator("assert(move _5, \"m\") -> [unwind continue]").is_none());
+        // Message literal with an escaped quote and a comma survives.
+        let a = parse_assert_terminator(
+            "assert(move _5, \"a \\\"b\\\", c\", copy _2) -> [success: bb7, unwind unreachable]",
+        )
+        .expect("parses");
+        assert_eq!(a.success, 7);
+        assert_eq!(a.unwind, None);
+        assert_eq!(a.msg, "a \\\"b\\\", c");
+    }
+
+    #[test]
+    fn parses_noreturn_call_terminators() {
+        // `-> unwind continue`: the `debug_assert!` failure call.
+        let mir = parse_text(ASSERT_OVERFLOW_MIR).expect("parse ok");
+        match &block(&mir.functions[0], 1).terminator {
+            MirTerminator::NoReturnCall { dst, func_text, .. } => {
+                assert_eq!(*dst, 4);
+                assert_eq!(func_text, "core::panicking::panic");
+            }
+            other => panic!("expected NoReturnCall, got {other:?}"),
+        }
+        // `-> bb<cleanup>`: `panic!("big")` in a fn holding a `String`
+        // (rustc nightly 1.101 output).
+        let t = parse_terminator(
+            "_4 = std::rt::begin_panic::<&str>(const \"big\") -> bb5;",
+            None,
+        );
+        assert!(
+            matches!(
+                &t,
+                Some(MirTerminator::NoReturnCall { dst: 4, func_text, .. })
+                    if func_text == "std::rt::begin_panic::<&str>"
+            ),
+            "got {t:?}"
+        );
+        // A returning call is still a `Call`, not a `NoReturnCall`.
+        assert!(matches!(
+            parse_terminator(
+                "_7 = Vec::<u32>::len(move _8) -> [return: bb2, unwind: bb5];",
+                None
+            ),
+            Some(MirTerminator::Call { target: 2, .. })
+        ));
+    }
+
     #[test]
     fn parses_call_terminator() {
         let mir = parse_text(TRY_OPTION_MIR).expect("parse ok");
@@ -2051,6 +2847,67 @@ fn decide(_1: i32, _2: i32) -> bool {
         assert_eq!(f.return_ty, "bool");
     }
 
+    /// Real headers from base64 (`decode_helper`, `encode_helper`,
+    /// `do_roundtrip_test`) whose argument types carry a `->` return
+    /// type: the `>` of the arrow was taken as a closing angle
+    /// bracket, so the args list never balanced and the function was
+    /// reported as unrecognised.
+    #[test]
+    fn fn_header_with_arrow_in_impl_fn_arg() {
+        let cases: &[(&str, &str, &[&str], &str)] = &[
+            (
+                "fn decode_helper(_1: &[u8], _7: DecodePaddingMode, _8: impl FnOnce(&[u8], usize, &mut [u8]) -> (usize, usize)) -> Result<DecodeMetadata, decode::DecodeSliceError> {",
+                "decode_helper",
+                &["&[u8]", "DecodePaddingMode", "impl FnOnce(&[u8], usize, &mut [u8]) -> (usize, usize)"],
+                "Result<DecodeMetadata, decode::DecodeSliceError>",
+            ),
+            (
+                "fn encode_helper(_1: &[u8; 64], _4: impl FnOnce(&[u8], &mut [u8]) -> (usize, usize)) -> usize {",
+                "encode_helper",
+                &["&[u8; 64]", "impl FnOnce(&[u8], &mut [u8]) -> (usize, usize)"],
+                "usize",
+            ),
+            (
+                "fn do_roundtrip_test(_1: impl Fn(&mut rngs::SmallRng) -> E::Engine) -> () {",
+                "do_roundtrip_test",
+                &["impl Fn(&mut rngs::SmallRng) -> E::Engine"],
+                "()",
+            ),
+        ];
+        for (header, name, arg_tys, ret) in cases {
+            let src = format!("{header}\n    bb0: {{ return; }}\n}}\n");
+            let mir = parse_text(&src).expect("parse ok");
+            assert!(mir.parse_problems().is_empty(), "{header}");
+            assert_eq!(mir.functions.len(), 1, "{header}");
+            let f = &mir.functions[0];
+            assert_eq!(f.name, *name);
+            let tys: Vec<&str> = f.args.iter().map(|a| a.ty.as_str()).collect();
+            assert_eq!(tys, *arg_tys);
+            assert_eq!(f.return_ty, *ret);
+        }
+    }
+
+    /// Fn pointer, `for<'a>` binder and `dyn Fn` argument types, and
+    /// an arrow inside generic args, next to nested `>>` closes.
+    #[test]
+    fn fn_header_with_fn_pointer_dyn_and_binder_arg_types() {
+        let src = "fn f(_1: for<'a> fn(&'a str) -> Result<&'a str, ()>, _2: &dyn Fn(u8) -> Option<Vec<u8>>, _3: Box<dyn FnMut(&mut [u8]) -> usize + Send>, _4: Option<fn() -> u8>) -> for<'b> fn(&'b u8) -> &'b u8 {\n    bb0: { return; }\n}\n";
+        let mir = parse_text(src).expect("parse ok");
+        assert!(mir.parse_problems().is_empty());
+        let f = &mir.functions[0];
+        let tys: Vec<&str> = f.args.iter().map(|a| a.ty.as_str()).collect();
+        assert_eq!(
+            tys,
+            [
+                "for<'a> fn(&'a str) -> Result<&'a str, ()>",
+                "&dyn Fn(u8) -> Option<Vec<u8>>",
+                "Box<dyn FnMut(&mut [u8]) -> usize + Send>",
+                "Option<fn() -> u8>",
+            ]
+        );
+        assert_eq!(f.return_ty, "for<'b> fn(&'b u8) -> &'b u8");
+    }
+
     #[test]
     fn parses_switchint_with_three_arms() {
         let mir = parse_text(IF_LET_SIMPLE_MIR).expect("parse ok");
@@ -2086,6 +2943,7 @@ fn decide(_1: i32, _2: i32) -> bool {
             MirStatement::AssignCopy {
                 dst: 0,
                 src: 2,
+                deref: false,
                 span: Some(s),
             } => {
                 // location of `b` in `a && b`
@@ -2095,5 +2953,151 @@ fn decide(_1: i32, _2: i32) -> bool {
             }
             other => panic!("expected AssignCopy{{dst:0,src:2,span:Some}}, got {other:?}"),
         }
+    }
+
+    /// Two functions separated by the allocation dump rustc prints
+    /// for a `&str` constant. The dump's ASCII column ends in `\u{`
+    /// (regex's `src/regex/bytes.rs` test `test_debug_output_ascii_escape`
+    /// produces exactly this), so the line ends with `{`.
+    const ALLOC_DUMP_BETWEEN_FNS_MIR: &str = r#"
+fn bytes::f(_1: bool) -> bool {
+    let mut _0: bool;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        _0 = const false;
+        return;
+    }
+
+    bb2: {
+        _0 = const true;
+        return;
+    }
+}
+
+alloc146 (size: 88, align: 1) {
+    0x00 │ 4d 61 74 63 68 20 7b 20 73 74 61 72 74 3a 20 30 │ Match { start: 0
+    0x30 │ 21 5c 6e 54 68 69 73 20 69 73 20 61 20 5c 75 7b │ !\nThis is a \u{
+    0x40 │ 31 62 7d 5b 33 31 6d 74 65 73 74 5c 75 7b 31 62 │ 1b}[31mtest\u{1b
+    0x50 │ 7d 5b 30 6d 2e 22 20 7d                         │ }[0m." }
+}
+
+fn string::f(_1: bool) -> bool {
+    let mut _0: bool;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        _0 = const false;
+        return;
+    }
+
+    bb2: {
+        _0 = const true;
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn braces_in_an_alloc_dump_do_not_swallow_the_rest_of_the_file() {
+        let mir = parse_text(ALLOC_DUMP_BETWEEN_FNS_MIR).expect("parse ok");
+        let names: Vec<&str> = mir.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["bytes::f", "string::f"]);
+        assert_eq!(mir.functions[1].blocks.len(), 3);
+        assert!(mir.unterminated_item.is_none());
+        assert!(mir.parse_problems().is_empty());
+    }
+
+    #[test]
+    fn decisionless_fn_after_an_alloc_dump_is_still_stripped() {
+        let mut body = String::from("fn g() -> () {\n    let mut _0: ();\n\n    bb0: {\n");
+        for _ in 0..60 {
+            body.push_str("        nop;\n");
+        }
+        body.push_str("        return;\n    }\n}\n");
+        let input = format!("{ALLOC_DUMP_BETWEEN_FNS_MIR}\n{body}");
+        let mir = parse_text(&input).expect("parse ok");
+        assert_eq!(mir.functions.len(), 3);
+        assert_eq!(mir.decisionless_functions, 1);
+    }
+
+    #[test]
+    fn alloc_dump_header_shapes() {
+        assert!(is_alloc_dump_header("alloc196 (size: 16, align: 8) {"));
+        assert!(is_alloc_dump_header(
+            "alloc7 (static: FOO, size: 4, align: 4) {"
+        ));
+        assert!(!is_alloc_dump_header("alloc (size: 16, align: 8) {"));
+        assert!(!is_alloc_dump_header("allocate::f() -> () {"));
+        assert!(!is_alloc_dump_header("alloc196 (size: 16, align: 8)"));
+    }
+
+    /// An async block's MIR opens with its coroutine layout, a
+    /// brace block that is neither a scope nor a basic block.
+    const ASYNC_BLOCK_WITH_COROUTINE_LAYOUT_MIR: &str = r#"
+fn t::{closure#0}(_1: Pin<&mut {async block@t.rs:1:1: 1:9}>, _2: &mut std::task::Context<'_>) -> Poll<i32> {
+    coroutine layout {
+        variant_fields = {
+            Unresumed(0): [],            // in scope 0 at t.rs:1:1: 1:1
+            Returned (1): [],            // in scope 0 at t.rs:1:9: 1:9
+        }
+        storage_conflicts = BitMatrix(0x0) {}
+    }
+    debug _task_context => _5;
+    let mut _0: std::task::Poll<i32>;
+    let mut _3: u32;
+
+    bb0: {
+        switchInt(move _3) -> [0: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        return;
+    }
+
+    bb2: {
+        unreachable;
+    }
+}
+
+fn after() -> () {
+    bb0: {
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn coroutine_layout_block_is_skipped() {
+        let mir = parse_text(ASYNC_BLOCK_WITH_COROUTINE_LAYOUT_MIR).expect("parse ok");
+        let names: Vec<&str> = mir.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["t::{closure#0}", "after"]);
+        assert_eq!(mir.functions[0].blocks.len(), 3);
+        assert!(mir.parse_problems().is_empty());
+    }
+
+    #[test]
+    fn unterminated_item_is_reported_not_silently_dropped() {
+        let input = "fn a(_1: bool) -> bool {\n    bb0: {\n        return;\n    }\n}\n\
+                     const X::promoted[0]: &str = {\n    bb0: {\n        return;\n    }\n\n\
+                     fn b(_1: bool) -> bool {\n    bb0: {\n        return;\n    }\n}\n";
+        let mir = parse_text(input).expect("parse ok");
+        assert_eq!(mir.functions.len(), 1);
+        assert_eq!(
+            mir.unterminated_item,
+            Some(UnterminatedItem {
+                header: "const X::promoted[0]: &str = {".to_string(),
+                functions_lost: 1,
+            })
+        );
+        let problems = mir.parse_problems();
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("no closing brace"), "{problems:?}");
     }
 }

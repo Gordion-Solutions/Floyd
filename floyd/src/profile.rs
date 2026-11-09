@@ -44,6 +44,18 @@
 //!   gaps) are filtered out of the parsed `branches` collection — see
 //!   [`Branch::KIND_BRANCH`].
 //!
+//! `functions[].regions` entries are positionally-encoded 8-tuples:
+//!
+//! ```text
+//! [start_line, start_col, end_line, end_col,
+//!  execution_count, file_id, expanded_file_id, kind]
+//! ```
+//!
+//! Only code regions (`kind` = `0`, [`Region::KIND_CODE`]) are kept.
+//! Together with the branch regions they are the source spans that
+//! identify which function a record belongs to (see
+//! [`crate::coverage_index`]).
+//!
 //! [ADR-0002]: ../../../architecture/decisions/0002-runtime-pipeline.md
 
 use crate::mir::SourceSpan;
@@ -69,6 +81,25 @@ pub struct FunctionCoverage {
     /// Branch regions (one per atomic boolean condition). Only
     /// [`Branch::KIND_BRANCH`] entries are retained.
     pub branches: Vec<Branch>,
+    /// Code regions. Only [`Region::KIND_CODE`] entries are retained.
+    pub regions: Vec<Region>,
+}
+
+/// One code region: a span of source the function's coverage
+/// mapping attributes to one counter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Region {
+    /// Source location of the region.
+    pub span: SourceSpan,
+    /// Number of times the region executed.
+    pub count: u64,
+    /// Region kind. Code regions are [`Self::KIND_CODE`] (`0`).
+    pub kind: u32,
+}
+
+impl Region {
+    /// `kind` value LLVM uses for code regions.
+    pub const KIND_CODE: u32 = 0;
 }
 
 /// One branch region — typically one atomic boolean condition.
@@ -140,11 +171,38 @@ fn convert_function(raw: RawFunction) -> Result<FunctionCoverage, ParseError> {
             }
         }
     }
+    let regions = raw
+        .regions
+        .iter()
+        .filter_map(|arr| convert_region(arr, &raw.filenames))
+        .filter(|r| r.kind == Region::KIND_CODE)
+        .collect();
     Ok(FunctionCoverage {
         name: raw.name,
         count: raw.count,
         filenames: raw.filenames,
         branches,
+        regions,
+    })
+}
+
+/// Decode one positional 8-tuple region array. Returns `None` if the
+/// array is malformed (too short, or `file_id` is out of range).
+fn convert_region(arr: &[i64], filenames: &[String]) -> Option<Region> {
+    if arr.len() < 8 {
+        return None;
+    }
+    let file_id = usize::try_from(arr[5]).ok()?;
+    Some(Region {
+        span: SourceSpan {
+            file: filenames.get(file_id).cloned()?,
+            start_line: u32::try_from(arr[0]).ok()?,
+            start_col: u32::try_from(arr[1]).ok()?,
+            end_line: u32::try_from(arr[2]).ok()?,
+            end_col: u32::try_from(arr[3]).ok()?,
+        },
+        count: u64::try_from(arr[4]).ok()?,
+        kind: u32::try_from(arr[7]).ok()?,
     })
 }
 
@@ -206,6 +264,8 @@ struct RawFunction {
     filenames: Vec<String>,
     #[serde(default)]
     branches: Vec<Vec<i64>>,
+    #[serde(default)]
+    regions: Vec<Vec<i64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +378,40 @@ mod tests {
         let r = parse(json).expect("parses");
         assert_eq!(r.functions[0].branches.len(), 1);
         assert_eq!(r.functions[0].branches[0].kind, Branch::KIND_BRANCH);
+    }
+
+    #[test]
+    fn parses_code_regions_and_drops_other_kinds() {
+        // Real `east_opt` record from chrono (one test), plus one
+        // gap region (kind 3) that must be dropped.
+        let json = r#"
+        {
+          "data": [{
+            "functions": [{
+              "name": "_RNvMNtNtCseI4Ere5mNTx_6chrono6offset5fixedNtB2_11FixedOffset8east_opt",
+              "count": 2,
+              "filenames": ["/home/ubuntu/work/chrono/src/offset/fixed.rs"],
+              "regions": [[62, 5, 62, 60, 2, 0, 0, 0], [63, 12, 63, 26, 2, 0, 0, 0],
+                          [66, 13, 66, 17, 0, 0, 0, 0], [67, 1, 67, 2, 0, 0, 0, 3]],
+              "branches": [[63, 12, 63, 26, 2, 0, 0, 0, 4]]
+            }]
+          }],
+          "type": "llvm.coverage.json.export",
+          "version": "2.0.1"
+        }
+        "#;
+        let r = parse(json).expect("parses");
+        let f = &r.functions[0];
+        assert_eq!(f.regions.len(), 3);
+        assert_eq!(f.regions[1].span.start_line, 63);
+        assert_eq!(f.regions[1].span.start_col, 12);
+        assert_eq!(f.regions[1].count, 2);
+        assert_eq!(f.regions[2].count, 0);
+        assert!(f.regions.iter().all(|r| r.kind == Region::KIND_CODE));
+        assert_eq!(
+            f.regions[0].span.file,
+            "/home/ubuntu/work/chrono/src/offset/fixed.rs"
+        );
     }
 
     #[test]
