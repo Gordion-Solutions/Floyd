@@ -129,6 +129,9 @@ Floyd builds the project's tests with `-Cinstrument-coverage
 ingests its `profraw` via `llvm-profdata` + `llvm-cov`, and reports
 which decisions the test suite exercises under masking MC/DC.
 
+Release notes, including breaking changes such as the 0.3.0 exit
+codes, are in [CHANGELOG.md](CHANGELOG.md).
+
 ## What works (and what doesn't)
 
 Floyd recovers logical decisions from rustc MIR and analyses them
@@ -187,11 +190,10 @@ independence pairs do not depend on which outcome is called true.
 
 ### What doesn't (yet)
 
-The current v0.1.0 line targets pure boolean-variable decisions.
 Several shapes that appear regularly in real safety code are
-declined; the v0.2.0 line (engine-correctness milestone — see
+still declined; the engine-correctness milestone (see
 [ADR-0004](architecture/decisions/0004-engine-correctness-oss-boundary.md))
-closes the biggest gaps. The current declines:
+closed the biggest gaps. The current declines:
 
 | Shape | Workaround / status |
 |-------|---------------------|
@@ -204,8 +206,8 @@ closes the biggest gaps. The current declines:
 Most bool-returning safety-critical Rust functions recover
 correctly. The remaining gaps in the "what doesn't" table are
 either explicit Phase 2 deliverables or items that sit in the
-commercial tier per ADR-0004 — the OSS engine's surface is the
-v0.2.x line as listed in "what works" above.
+commercial tier per ADR-0004 — the OSS engine's surface on the
+0.3.x line is as listed in "what works" above.
 
 ### Tests that evaluate a decision more than once
 
