@@ -67,6 +67,7 @@ use std::cell::Cell;
 
 use crate::mir::{
     BlockId, CompareOp, LocalId, MirBlock, MirFunction, MirStatement, MirTerminator, Operand,
+    SourceSpan,
 };
 use crate::Mir;
 
@@ -144,6 +145,63 @@ fn note_non_bool_leaf() {
 pub struct DecisionTree {
     /// One [`Node`] per logical decision recovered from the MIR.
     pub decisions: Vec<Node>,
+    /// Per decision, parallel to [`Self::decisions`]: the names of
+    /// its conditions whose source span is known, in source order
+    /// (start line, then start column). [`Self::conditions`] lists a
+    /// decision's conditions in this order; conditions missing from
+    /// it (or a decision with no entry) follow, sorted by name.
+    /// Empty for a tree built by hand, whose conditions are then
+    /// listed by name.
+    pub condition_order: Vec<Vec<String>>,
+}
+
+impl DecisionTree {
+    /// A tree holding the one decision `node`, recovered from `f`,
+    /// with its conditions put in source order from `f`'s spans
+    /// (see [`source_order`]).
+    pub fn from_function(f: &MirFunction, node: Node) -> Self {
+        let order = source_order(f, &node);
+        DecisionTree {
+            decisions: vec![node],
+            condition_order: vec![order],
+        }
+    }
+
+    /// The atomic conditions of decision `idx`, each once: those in
+    /// [`Self::condition_order`] first, in that (source) order, then
+    /// the rest sorted by name. This is the order every condition
+    /// index refers to (truth-table bit `i`, the report's columns,
+    /// `conditions` in JSON). Empty when `idx` is out of range.
+    pub fn conditions(&self, idx: usize) -> Vec<String> {
+        let Some(node) = self.decisions.get(idx) else {
+            return Vec::new();
+        };
+        let mut conditions = crate::masking::collect_conditions(node);
+        if let Some(order) = self.condition_order.get(idx) {
+            let rank = |c: &String| order.iter().position(|o| o == c).unwrap_or(usize::MAX);
+            // Stable: unranked conditions keep their sorted-by-name order.
+            conditions.sort_by_key(rank);
+        }
+        conditions
+    }
+}
+
+/// The conditions of `node` whose source span `f`'s MIR records, in
+/// source order: by start line, then start column (then file and
+/// name, so equal spans, such as a `match`'s arms sharing one
+/// `switchInt`, still order deterministically). Conditions with no
+/// known span are left out; [`DecisionTree::conditions`] lists them
+/// after these, by name.
+pub fn source_order(f: &MirFunction, node: &Node) -> Vec<String> {
+    let spans = crate::correlate::collect_condition_spans(f);
+    let mut known: Vec<(&SourceSpan, String)> = crate::masking::collect_conditions(node)
+        .into_iter()
+        .filter_map(|c| Some((spans.get(&c)?, c)))
+        .collect();
+    known.sort_by(|(a, an), (b, bn)| {
+        (a.start_line, a.start_col, &a.file, an).cmp(&(b.start_line, b.start_col, &b.file, bn))
+    });
+    known.into_iter().map(|(_, c)| c).collect()
 }
 
 /// A node in a [`DecisionTree`]. Represented in If-Then-Else form.
@@ -268,6 +326,7 @@ pub fn decompose(mir: &Mir) -> DecisionTree {
     let mut tree = DecisionTree::default();
     for f in &mir.functions {
         if let Some(node) = decompose_function(f) {
+            tree.condition_order.push(source_order(f, &node));
             tree.decisions.push(node);
         }
     }
@@ -6938,5 +6997,113 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::west_opt(_1: i32) -
                 Some(Lift::ValueArms)
             ))
         );
+    }
+
+    /// anyhow `src/ensure.rs:60`, `|b| b == b' ' || b == b'\n'`, as
+    /// rustc nightly-2026-11-03 prints it with `-Zmir-include-spans`
+    /// and `-Cinstrument-coverage`. The conditions' names sort the
+    /// other way round (`"b == 10" < "b == 32"`), which is the order
+    /// the report used to list them in.
+    const ANYHOW_WHITESPACE_MIR: &str = r#"
+fn ensure::<impl at src/ensure.rs:58:1: 58:19>::write_str::{closure#0}(_1: &mut {closure@src/ensure.rs:60:26: 60:29}, _2: u8) -> bool {
+    debug b => _2;                       // in scope 0 at src/ensure.rs:60:27: 60:28
+    let mut _0: bool;                    // return place in scope 0 at src/ensure.rs:60:29: 60:29
+    let mut _3: bool;                    // in scope 0 at src/ensure.rs:60:30: 60:39
+
+    coverage branch { true: BlockMarkerId(0), false: BlockMarkerId(1) } => src/ensure.rs:60:30: 60:39 (#0)
+    coverage branch { true: BlockMarkerId(2), false: BlockMarkerId(3) } => src/ensure.rs:60:43: 60:53 (#0)
+
+    coverage Code { bcb: bcb0 } => src/ensure.rs:60:30: 60:39 (#0);
+    coverage Code { bcb: bcb3 } => src/ensure.rs:60:43: 60:53 (#0);
+    coverage Branch { true_bcb: bcb1, false_bcb: bcb3 } => src/ensure.rs:60:30: 60:39 (#0);
+    coverage Branch { true_bcb: bcb4, false_bcb: bcb5 } => src/ensure.rs:60:43: 60:53 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 0 at src/ensure.rs:60:30: 60:39
+        _3 = Eq(copy _2, const 32_u8);   // scope 0 at src/ensure.rs:60:30: 60:39
+        switchInt(move _3) -> [0: bb2, otherwise: bb1]; // scope 0 at src/ensure.rs:60:30: 60:39
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 0 at src/ensure.rs:60:30: 60:53
+        _0 = const true;                 // scope 0 at src/ensure.rs:60:30: 60:53
+        goto -> bb5;                     // scope 0 at src/ensure.rs:60:30: 60:53
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at src/ensure.rs:60:43: 60:53
+        _0 = Eq(copy _2, const 10_u8);   // scope 0 at src/ensure.rs:60:43: 60:53
+        switchInt(copy _0) -> [0: bb4, otherwise: bb3]; // scope 0 at src/ensure.rs:60:43: 60:53
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb4);  // scope 0 at src/ensure.rs:60:43: 60:53
+        goto -> bb5;                     // scope 0 at src/ensure.rs:60:43: 60:53
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb5);  // scope 0 at src/ensure.rs:60:43: 60:53
+        goto -> bb5;                     // scope 0 at src/ensure.rs:60:43: 60:53
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at src/ensure.rs:60:53: 60:53
+        return;                          // scope 0 at src/ensure.rs:60:53: 60:53
+    }
+}
+"#;
+
+    #[test]
+    fn conditions_are_listed_in_source_order() {
+        let mir = crate::mir::parse_text(ANYHOW_WHITESPACE_MIR).expect("MIR parses");
+        let f = mir.functions.first().expect("one function");
+        let node = try_decompose_candidate(f).expect("decomposes");
+        let source = vec!["b == 32".to_string(), "b == 10".to_string()];
+        assert_eq!(source_order(f, &node), source);
+
+        let tree = DecisionTree::from_function(f, node);
+        assert_eq!(tree.conditions(0), source);
+        assert_eq!(decompose(&mir).conditions(0), source);
+
+        // The matrix, and so every condition index (truth-table bit
+        // `i`, report columns, JSON `conditions`), follows the same
+        // order: row 1 sets bit 0, `b == 32`.
+        let matrix = crate::masking::analyze(&tree);
+        assert_eq!(matrix.conditions, source);
+        let row1 = &matrix.truth_table[1].inputs;
+        assert_eq!((row1["b == 32"], row1["b == 10"]), (true, false));
+    }
+
+    #[test]
+    fn conditions_without_known_spans_are_listed_by_name() {
+        let ite = |c: &str, t: Node, e: Node| Node::Ite {
+            cond: c.to_string(),
+            then_branch: Box::new(t),
+            else_branch: Box::new(e),
+        };
+        let leaf = |c: &str| Node::Condition {
+            name: c.to_string(),
+        };
+        let node = ite(
+            "c",
+            Node::Const { value: true },
+            ite("b", leaf("a"), leaf("d")),
+        );
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // No order recorded (a hand-built tree): by name.
+        let tree = DecisionTree {
+            decisions: vec![node.clone()],
+            ..Default::default()
+        };
+        assert_eq!(tree.conditions(0), names(&["a", "b", "c", "d"]));
+
+        // A partial order: the ranked ones first, the rest by name.
+        let tree = DecisionTree {
+            decisions: vec![node],
+            condition_order: vec![names(&["d", "b"])],
+        };
+        assert_eq!(tree.conditions(0), names(&["d", "b", "a", "c"]));
+        assert!(tree.conditions(1).is_empty());
     }
 }

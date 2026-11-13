@@ -5,6 +5,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: a minor bump marks a breaking change).
 
+## Unreleased
+
+### Fixed
+
+- **Conditions are listed in source order.** A decision's conditions
+  were listed sorted by name, so anyhow's `b == b' ' || b == b'\n'`
+  printed `Conditions: b == 10, b == 32`. They now follow their
+  source spans (line, then column), everywhere a condition order
+  appears: the `Conditions:` line, per-test observations, pair and
+  missing rows, JSON `conditions` and truth table, and JUnit
+  testcases. Conditions without a known span follow, by name.
+  Verdicts and the rows a hint names are unchanged; only the order
+  differs. `floyd::DecisionTree` gains `condition_order`,
+  `from_function` and `conditions`.
+
 ## 0.3.0 - 2026-11-09
 
 ### Breaking

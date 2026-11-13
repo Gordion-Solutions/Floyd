@@ -1139,7 +1139,7 @@ pub fn provenance_for(f: &MirFunction) -> crate::masking::DecisionProvenance {
 /// Both `switchInt` discriminants (condition tests) and `AssignCopy`
 /// sources (condition reads) are considered. First occurrence wins.
 /// Spans are as rustc printed them; [`prepare_mir`] normalises them.
-fn collect_condition_spans(f: &MirFunction) -> BTreeMap<String, SourceSpan> {
+pub(crate) fn collect_condition_spans(f: &MirFunction) -> BTreeMap<String, SourceSpan> {
     let mut spans = BTreeMap::new();
     for block in &f.blocks {
         if let MirTerminator::SwitchInt {
@@ -1962,6 +1962,7 @@ fn decide(_1: bool, _2: bool) -> bool {
         }
         let tree = DecisionTree {
             decisions: vec![decision],
+            ..Default::default()
         };
         let r = crate::masking::analyze_with_runtime(&tree, &all, crate::masking::Variant::Masking);
         assert_eq!(r.ambiguous_observations, 0);
@@ -2013,6 +2014,7 @@ fn decide(_1: bool, _2: bool) -> bool {
         // exercised and b == 10 (never true anywhere) unexercised.
         let tree = DecisionTree {
             decisions: vec![anyhow_whitespace()],
+            ..Default::default()
         };
         let r = crate::masking::analyze_with_runtime(&tree, &obs, crate::masking::Variant::Masking);
         assert!(matches!(
@@ -2104,6 +2106,7 @@ fn decide(_1: bool, _2: bool) -> bool {
         ));
         let tree = DecisionTree {
             decisions: vec![decision],
+            ..Default::default()
         };
         let r = crate::masking::analyze_with_runtime(&tree, &all, crate::masking::Variant::Masking);
         for c in ["nano >= 1000000000", "sec != 59"] {
@@ -2155,6 +2158,7 @@ fn decide(_1: bool, _2: bool) -> bool {
         // And the pair is demonstrated by this one test.
         let tree = DecisionTree {
             decisions: vec![decision],
+            ..Default::default()
         };
         let r = crate::masking::analyze_with_runtime(&tree, &obs, crate::masking::Variant::Masking);
         assert!(matches!(
@@ -2525,6 +2529,7 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -
             idx,
             DecisionTree {
                 decisions: vec![node],
+                ..Default::default()
             },
         )
     }
@@ -2838,6 +2843,7 @@ fn parse_one_file::{closure#0}(_1: bool) -> bool {
         let node = decision::decompose_function(&mir.functions[0]).expect("decomposes");
         let tree = DecisionTree {
             decisions: vec![node],
+            ..Default::default()
         };
         let nm = mir_not_measurable(&prepared, 0, &tree, true, Some(&paths)).expect("classified");
         assert_eq!(nm.reason, NotMeasurableReason::ExternalMacro);
@@ -2969,6 +2975,7 @@ fn <impl at src/lib.rs:699:1: 699:22>::yes(_1: &IncrementCounter) -> bool {
         let node = decision::try_decompose_candidate(&mir.functions[0]).expect("a candidate");
         let tree = DecisionTree {
             decisions: vec![node],
+            ..Default::default()
         };
         let tests = vec![(
             "avx2::test::test_hash_many".to_string(),
@@ -3111,6 +3118,7 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -
         );
         let tree = DecisionTree {
             decisions: vec![node],
+            ..Default::default()
         };
         let paths = chrono_paths();
         let prepared = prepare_mir(&mir, &paths);

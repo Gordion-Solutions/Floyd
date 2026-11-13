@@ -61,7 +61,9 @@ pub struct IndependencePair {
 pub struct IndependenceMatrix {
     /// Which variant the analysis was computed under.
     pub variant: Variant,
-    /// Atomic conditions referenced in the decision, sorted by name.
+    /// Atomic conditions referenced in the decision, in source order
+    /// where their spans are known (see
+    /// [`DecisionTree::conditions`]), otherwise sorted by name.
     pub conditions: Vec<String>,
     /// Full truth table (`2^n` rows for `n` conditions).
     pub truth_table: Vec<TruthTableRow>,
@@ -642,7 +644,7 @@ pub fn analyze_with_variant(tree: &DecisionTree, variant: Variant) -> Independen
         return matrix;
     };
 
-    let conditions = collect_conditions(decision);
+    let conditions = tree.conditions(0);
     matrix.truth_table = enumerate_truth_table(decision, &conditions);
 
     for c in &conditions {
@@ -658,7 +660,8 @@ pub fn analyze_with_variant(tree: &DecisionTree, variant: Variant) -> Independen
 // ---------------------------------------------------------------------------
 
 /// Collect the set of atomic condition names referenced in a [`Node`],
-/// returned in deterministic sorted order.
+/// sorted by name. A set, not the decision's condition order: that
+/// is [`DecisionTree::conditions`], which needs the source spans.
 pub(crate) fn collect_conditions(node: &Node) -> Vec<String> {
     let mut set = BTreeSet::new();
     walk_conditions(node, &mut set);
@@ -703,7 +706,8 @@ fn evaluate(node: &Node, env: &BTreeMap<String, bool>) -> bool {
 }
 
 /// Enumerate the full `2^n`-row truth table for a decision and its
-/// condition list (assumed to be in sorted order).
+/// condition list: bit `i` of row `r`'s index is `conditions[i]`'s
+/// value, so the rows follow the decision's condition order.
 fn enumerate_truth_table(decision: &Node, conditions: &[String]) -> Vec<TruthTableRow> {
     let n = conditions.len();
     let mut table = Vec::with_capacity(1 << n);
@@ -835,6 +839,7 @@ mod tests {
     fn and_tree() -> DecisionTree {
         DecisionTree {
             decisions: vec![ite("a", cond("b"), const_(false))],
+            ..Default::default()
         }
     }
 
@@ -842,6 +847,7 @@ mod tests {
     fn or_tree() -> DecisionTree {
         DecisionTree {
             decisions: vec![ite("a", const_(true), cond("b"))],
+            ..Default::default()
         }
     }
 
@@ -849,6 +855,7 @@ mod tests {
     fn nested_tree() -> DecisionTree {
         DecisionTree {
             decisions: vec![ite("a", ite("b", const_(true), cond("c")), cond("c"))],
+            ..Default::default()
         }
     }
 
@@ -1234,6 +1241,7 @@ mod tests {
     fn anyhow_whitespace_tree() -> DecisionTree {
         DecisionTree {
             decisions: vec![ite("b == 32", const_(true), cond("b == 10"))],
+            ..Default::default()
         }
     }
 
@@ -1490,6 +1498,7 @@ mod tests {
                     ),
                 ),
             )],
+            ..Default::default()
         }
     }
 

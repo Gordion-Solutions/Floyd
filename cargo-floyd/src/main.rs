@@ -1086,9 +1086,7 @@ fn run_test_mode_cargo(
                     continue;
                 }
                 raw_candidates.push(RawCandidate {
-                    tree: floyd::DecisionTree {
-                        decisions: vec![node],
-                    },
+                    tree: floyd::DecisionTree::from_function(f, node),
                     prov,
                     artifact_idx: art_idx,
                     fn_idx,
@@ -1812,9 +1810,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     for (fn_idx, f) in mir.functions.iter().enumerate() {
         if let Ok((node, lift)) = decision::try_decompose_candidate_lifted(f) {
             artifact_candidates.push((
-                floyd::DecisionTree {
-                    decisions: vec![node],
-                },
+                floyd::DecisionTree::from_function(f, node),
                 floyd::DecisionProvenance {
                     lift,
                     ..correlate::provenance_for(f)
@@ -2882,6 +2878,7 @@ mod tests {
                 }),
                 else_branch: Box::new(decision::Node::Const { value: false }),
             }],
+            ..Default::default()
         };
         let vec_obs = |name: &str, a: bool, b: Option<bool>, result: bool| {
             let mut inputs: std::collections::BTreeMap<String, bool> =
@@ -2990,6 +2987,7 @@ mod tests {
                     name: "b == 10".to_string(),
                 }),
             }],
+            ..Default::default()
         };
         let counts = |t, f| floyd::BranchCounts {
             true_count: t,
@@ -3048,6 +3046,7 @@ mod tests {
                 }),
                 else_branch: Box::new(decision::Node::Const { value: false }),
             }],
+            ..Default::default()
         }
     }
 

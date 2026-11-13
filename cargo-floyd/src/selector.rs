@@ -212,6 +212,7 @@ mod tests {
         Candidate {
             tree: DecisionTree {
                 decisions: vec![node],
+                ..Default::default()
             },
             provenance: DecisionProvenance {
                 function_name: Some(name.to_string()),
@@ -278,6 +279,7 @@ mod tests {
         let no_cond = Candidate {
             tree: DecisionTree {
                 decisions: vec![Node::Const { value: true }],
+                ..Default::default()
             },
             provenance: DecisionProvenance {
                 function_name: Some("const_fn".to_string()),
@@ -299,6 +301,7 @@ mod tests {
         let only_const = Candidate {
             tree: DecisionTree {
                 decisions: vec![Node::Const { value: false }],
+                ..Default::default()
             },
             provenance: DecisionProvenance::default(),
             observations: vec![],
@@ -415,6 +418,7 @@ mod tests {
                     name: "b".to_string(),
                 }),
             }],
+            ..Default::default()
         };
         assert_eq!(count_conditions(&tree), 3);
     }

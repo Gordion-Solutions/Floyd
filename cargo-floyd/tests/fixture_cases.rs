@@ -720,7 +720,7 @@ fn generic_instantiations_are_summed() {
 fn method_trait_and_closure_decisions_demonstrate_mcdc() {
     assert_full_mcdc("impl_or", &["armed", "forced"], 3);
     assert_full_mcdc("trait_and", &["left", "right"], 3);
-    assert_full_mcdc("closure_and", &["enable", "v"], 3);
+    assert_full_mcdc("closure_and", &["v", "enable"], 3);
 }
 
 #[test]
