@@ -137,6 +137,36 @@ pub struct ConditionObservation {
     /// vectors. Omitted from JSON when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<Resolution>,
+    /// On the remainder of a test [`Resolution::FlowDecomposition`]
+    /// only partly resolved: how many of the test's evaluations its
+    /// vectors account for (`evaluations` is the rest). Omitted from
+    /// JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributed_evaluations: Option<u64>,
+    /// On an ambiguous observation whose counters
+    /// [`crate::correlate::observations_from_counts`] decomposed
+    /// (rule 6): every way the evaluations not accounted for by the
+    /// test's vectors can have split into condition vectors, one entry
+    /// per distinct set of walks some integer decomposition of the
+    /// counters takes, listing the vectors that decomposition takes
+    /// beyond the test's vectors (an entry may be empty). The list is
+    /// complete: the vectors the test really evaluated are its
+    /// vectors plus one of these entries. Empty when not enumerated
+    /// (never a partial list). Omitted from JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decompositions: Vec<Vec<WalkVector>>,
+}
+
+/// One condition vector of a decomposition (see
+/// [`ConditionObservation::decompositions`]): the values of the
+/// conditions the walk tests, and its outcome.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WalkVector {
+    /// Values of the conditions the walk tests (short-circuited ones
+    /// omitted).
+    pub inputs: BTreeMap<String, bool>,
+    /// The decision outcome.
+    pub result: bool,
 }
 
 /// Which rule of [`crate::correlate::observations_from_counts`]
@@ -179,6 +209,8 @@ impl ConditionObservation {
             evaluations: None,
             counts: BTreeMap::new(),
             resolved_by: None,
+            attributed_evaluations: None,
+            decompositions: Vec::new(),
         }
     }
 
@@ -197,6 +229,8 @@ impl ConditionObservation {
             evaluations: Some(evaluations),
             counts,
             resolved_by: None,
+            attributed_evaluations: None,
+            decompositions: Vec::new(),
         }
     }
 }
@@ -247,6 +281,27 @@ pub enum ConditionStatus {
         /// Names of the ambiguous tests that could hold a missing row
         /// of a completable pair.
         tests: Vec<String>,
+    },
+    /// MC/DC demonstrated without an identifiable pair: no pair has
+    /// both rows covered by condition vectors, but one multi-evaluation
+    /// test's counters admit only decompositions
+    /// ([`ConditionObservation::decompositions`]) each of which,
+    /// together with the condition vectors of every test, covers both
+    /// rows of *some* independence pair, and not the same pair in all
+    /// of them. The claim is only that an independence pair occurred
+    /// (in every run consistent with the counters), never which one;
+    /// `pair_candidates` lists, per decomposition, a pair it completes.
+    /// Counts as exercised.
+    ExercisedUnidentified {
+        /// Distinct pairs, one completed by each decomposition (at
+        /// least two).
+        pair_candidates: Vec<IndependencePair>,
+        /// Always false: which pair occurred is not determined.
+        pair_identifiable: bool,
+        /// The test whose decompositions were checked.
+        test: String,
+        /// How many decompositions that test admits.
+        decompositions: usize,
     },
 }
 
@@ -483,6 +538,56 @@ fn classify_condition(
                 missing: None,
             };
         }
+    }
+    // One test's decompositions. Sound: the decompositions of a test
+    // are complete (its real vectors are its credited vectors plus
+    // one of them) and every condition vector really occurred, so if
+    // each decomposition completes some pair with the vectors, the
+    // real run completed one of those pairs. Only the existence of a
+    // pair is claimed, unless every decomposition completes the same
+    // pair, which then occurred whichever decomposition is real.
+    for o in ambiguous.iter().filter(|o| !o.decompositions.is_empty()) {
+        let mut candidates: Vec<IndependencePair> = Vec::new();
+        let every = o.decompositions.iter().all(|walks| {
+            let in_walks = |row: &TruthTableRow| {
+                walks.iter().any(|w| {
+                    w.inputs.contains_key(cond)
+                        && w.result == row.result
+                        && w.inputs.iter().all(|(k, v)| row.inputs.get(k) == Some(v))
+                })
+            };
+            let completes = |row: &TruthTableRow| covered(row) || in_walks(row);
+            match pairs
+                .iter()
+                .find(|p| completes(&p.test_1) && completes(&p.test_2))
+            {
+                Some(p) => {
+                    if !candidates.contains(p) {
+                        candidates.push((*p).clone());
+                    }
+                    true
+                }
+                None => false,
+            }
+        });
+        if !every {
+            continue;
+        }
+        let status = if candidates.len() == 1 {
+            ConditionStatus::Exercised(candidates.remove(0))
+        } else {
+            ConditionStatus::ExercisedUnidentified {
+                pair_candidates: candidates,
+                pair_identifiable: false,
+                test: test_label(o),
+                decompositions: o.decompositions.len(),
+            }
+        };
+        return Classified {
+            status,
+            ruled_out: Vec::new(),
+            missing: None,
+        };
     }
     let mut takers: BTreeSet<usize> = BTreeSet::new();
     for pair in &pairs {

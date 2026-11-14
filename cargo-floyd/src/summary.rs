@@ -52,7 +52,9 @@ impl CoverageSummary {
         let conditions: &[String] = analysis.map_or(&[], |a| &a.matrix.conditions);
         for cond in conditions {
             match analysis.and_then(|a| a.condition_status.get(cond)) {
-                Some(ConditionStatus::Exercised(_)) => exercised += 1,
+                Some(
+                    ConditionStatus::Exercised(_) | ConditionStatus::ExercisedUnidentified { .. },
+                ) => exercised += 1,
                 Some(ConditionStatus::Ambiguous { .. }) => unknown += 1,
                 Some(ConditionStatus::Unexercised) | None => not_exercised += 1,
             }

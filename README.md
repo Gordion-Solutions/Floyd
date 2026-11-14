@@ -296,9 +296,15 @@ vector from a test only when
   the least count any solution gives them (the text report says
   `at least N evaluations`), and what they do not account for stays
   an ambiguous observation of the remaining evaluations and
-  counters, also tagged `flow_decomposition` (`N evaluations not
-  attributed` in the text report). Paths that only some solutions
-  take are never credited.
+  counters, also tagged `flow_decomposition`, with
+  `attributed_evaluations` saying how many evaluations the vectors
+  account for (`M evaluations not attributable to a vector (N
+  attributed to the vectors above)` in the text report). Paths that
+  only some solutions take are never credited as vectors. The
+  ambiguous observation lists the possible splits of the remaining
+  evaluations as `decompositions` (one entry per distinct set of
+  paths some solution takes, at most 64; omitted when there are
+  more), used for the check below.
 
 Any other test, such as `(a || b) && c` evaluated as (T,-,T) and
 (F,T,F) (the same counters as (T,-,F) and (F,T,T)), is reported as an
@@ -326,7 +332,34 @@ test took (a zero counter in every ambiguous test that evaluated the
 decision, and no vector), the condition is provably **UNEXERCISED**,
 and the report says why with the counters, for example
 `test_whitespace (9 evaluations) never took b == 10=T (0T/8F)`
-(text and JUnit; `ruled_out` in the JSON analysis).
+(text and JUnit; `ruled_out` in the JSON analysis). For a test the
+flow-decomposition rule resolved in part, the test is named with
+what was and was not attributed, for example
+`test_time_from_hms_micro (9 evaluations: 7 attributed to 2
+vector(s), 2 not attributable to a vector)`, in text and JUnit alike;
+the JSON remainder observation carries the same numbers
+(`attributed_evaluations`, `evaluations`).
+
+Before a condition is reported `UNKNOWN`, Floyd checks each ambiguous
+test's `decompositions` on its own: if *every* decomposition of that
+test, together with the condition vectors of all tests, covers both
+rows of *some* independence pair, then a pair occurred in the real
+run, whichever decomposition it was. The condition is then
+**EXERCISED** and counts as exercised in the summary and percentage,
+but the pair is not identifiable, and the report says so:
+
+```text
+  ✓ nano >= 2000000000: EXERCISED via one of: (..) -> T vs (..) -> F | (..) -> T vs (..) -> F  [pair not uniquely identifiable: 2 decompositions of naive::time::tests::test_time_from_hms_micro's counters, each completing one of these pairs]
+```
+
+In JSON the condition's status is `ExercisedUnidentified` with
+`pair_candidates` (one pair each decomposition completes),
+`pair_identifiable: false`, `test` and `decompositions`, instead of
+the `Exercised` pair; in JUnit the testcase passes, with the same
+text in `<system-out>` and a `floyd.pair_identifiable=false`
+property. Floyd claims only that some independence pair occurred,
+never which one. If any decomposition completes no pair, the
+condition stays `UNKNOWN`.
 
 An independence pair needs both of its rows, so for an unexercised
 condition the report names the rows still missing from one pair

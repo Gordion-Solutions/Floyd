@@ -60,15 +60,18 @@ pub fn and_or_tree(a: bool, b: bool, c: bool) -> bool {
 /// (F,T,F) -> F, so a = [1 T, 1 F], b = [1 T, 0 F], c = [1 T, 1 F].
 /// Not a tree: `c` is reached both from `a = T` and from
 /// `a = F, b = T`, and (T,-,F) + (F,T,T) leaves the same counters,
-/// so the test is ambiguous. `a`'s and `b`'s pairs both need
-/// (F,F,-) -> F, and no test ever made `b` false.
+/// so the test is ambiguous: no vector is credited. `a`'s and `b`'s
+/// pairs both need (F,F,-) -> F, and no test ever made `b` false.
+/// Each of the two decompositions completes a (different) masking
+/// pair for `c`: (T,-,T) / (F,T,F) or (T,-,F) / (F,T,T).
 ///
 /// Expected (`--only=dag_or_and`): one ambiguous observation
 /// (`evaluations: 2`, empty `inputs`, `result: null`, the raw
-/// `counts`); `c` `UNKNOWN`; `a` and `b` `UNEXERCISED`, with
-/// `analysis.ruled_out.b` naming `dag_or_and_loop`'s zero `b = F`
-/// counter; `summary.unknown == 1`, `summary.percentage == null`,
-/// text output says "no percentage", exit code 2.
+/// `counts`, both `decompositions`); `c` `ExercisedUnidentified`
+/// (two `pair_candidates`, `pair_identifiable: false`); `a` and `b`
+/// `UNEXERCISED`, with `analysis.ruled_out.b` naming
+/// `dag_or_and_loop`'s zero `b = F` counter; `summary.unknown == 0`,
+/// percentage 33, exit code 2.
 pub fn dag_or_and(a: bool, b: bool, c: bool) -> Option<u8> {
     if (a || b) && c {
         return None;
@@ -120,15 +123,16 @@ pub fn dag_zero_inflow(a: bool, b: bool, c: bool) -> Option<u8> {
 /// b = [1 T, 1 F], c = [1 T, 1 F]. (T,-,F) + (F,T,T) + (F,F,-)
 /// leaves the same counters, so the counters determine only
 /// (F,F,-) (the one walk that tests `b = F`, taken once in both
-/// decompositions). Every pair still needs a row only one of the
-/// two decompositions has.
+/// decompositions).
 ///
 /// Expected (`--only=dag_partial_flow`): two observations of the
 /// loop test, both `resolved_by: "flow_decomposition"`: the vector
 /// `a=F, b=F -> F` (`evaluations: 1`) and an ambiguous remainder
-/// (`evaluations: 2`, counts a = [1, 1], b = [1, 0], c = [1, 1]);
-/// all three conditions `UNKNOWN`, `summary.percentage == null`,
-/// exit code 2.
+/// (`evaluations: 2`, `attributed_evaluations: 1`, counts
+/// a = [1, 1], b = [1, 0], c = [1, 1], two `decompositions`); `a`
+/// and `b` `UNKNOWN` (one decomposition completes no pair for them),
+/// `c` `ExercisedUnidentified`; `summary.percentage == null`, exit
+/// code 2.
 pub fn dag_partial_flow(a: bool, b: bool, c: bool) -> Option<u8> {
     if (a || b) && c {
         return None;

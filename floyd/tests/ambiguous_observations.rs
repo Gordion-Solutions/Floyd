@@ -228,7 +228,7 @@ fn loop_test_with_both_conditions_two_sided_is_resolved_by_tree_counters() {
 }
 
 #[test]
-fn dag_loop_test_is_partly_ambiguous_and_its_conditions_are_unknown_not_unexercised() {
+fn dag_loop_test_is_partly_ambiguous_and_no_condition_is_unexercised() {
     let mir = mir::parse_text(OR_AND_MIR).expect("MIR parses");
     let tree = decision::decompose(&mir);
     assert_eq!(tree.decisions.len(), 1);
@@ -275,15 +275,31 @@ fn dag_loop_test_is_partly_ambiguous_and_its_conditions_are_unknown_not_unexerci
     assert_eq!(looped.counts["c"].true_count, 1);
     assert_eq!(looped.counts["c"].false_count, 1);
 
+    // The remainder lists both decompositions: (T,-,T) + (F,T,F) or
+    // (T,-,F) + (F,T,T). Each completes a different masking pair for
+    // c, so c is exercised without an identifiable pair; for a and b
+    // one decomposition completes no pair, so they stay unknown.
+    assert_eq!(looped.decompositions.len(), 2);
     for variant in [Variant::Masking, Variant::UniqueCause] {
         let analysis = masking::analyze_with_runtime(&tree, &observations, variant);
         assert_eq!(analysis.ambiguous_observations, 1);
         for c in ["a", "b", "c"] {
             match &analysis.condition_status[c] {
-                ConditionStatus::Ambiguous { tests } => {
+                ConditionStatus::Ambiguous { tests }
+                    if c != "c" || variant == Variant::UniqueCause =>
+                {
                     assert_eq!(tests, &vec!["loop_three".to_string()]);
                 }
-                other => panic!("{variant:?}: {c} should be unknown (ambiguous), got {other:?}"),
+                ConditionStatus::ExercisedUnidentified {
+                    pair_candidates,
+                    pair_identifiable: false,
+                    test,
+                    decompositions: 2,
+                } if c == "c" && variant == Variant::Masking => {
+                    assert_eq!(test, "loop_three");
+                    assert_eq!(pair_candidates.len(), 2);
+                }
+                other => panic!("{variant:?}: {c}: unexpected {other:?}"),
             }
         }
     }

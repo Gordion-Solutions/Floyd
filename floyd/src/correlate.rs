@@ -45,7 +45,7 @@
 
 use crate::coverage_index::{CoverageIndex, FunctionId, FunctionMatch, PathNormaliser};
 use crate::decision::{self, DecisionTree, Node};
-use crate::masking::{BranchCounts, ConditionObservation, Resolution};
+use crate::masking::{BranchCounts, ConditionObservation, Resolution, WalkVector};
 use crate::mir::{Mir, MirFunction, MirStatement, MirTerminator, SourceSpan};
 use crate::profile::CoverageReport;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -219,8 +219,20 @@ fn root_condition(node: &Node) -> Option<&str> {
 ///    account for stay one ambiguous observation whose `counts` are
 ///    the raw counters minus the vectors' share (never negative;
 ///    see below). All of them carry `resolved_by:
-///    flow_decomposition`. If no walk is taken in every solution, or
-///    there is no solution, or the search is too large, rule 7.
+///    flow_decomposition`, and the remainder lists its
+///    `decompositions` (per distinct set of walks a solution takes,
+///    the walks beyond the vectors; at most 64, else none). If no
+///    walk is taken in every solution, the test is an ordinary
+///    ambiguous observation (raw counters, no `resolved_by`) with its
+///    `decompositions`. If there is no solution, or the search is too
+///    large, rule 7.
+///
+///    The decompositions are complete: the walks the test really
+///    took are its vectors plus one listed entry (the true `x` is one
+///    of the solutions; see below). [`crate::masking`] uses this to
+///    report a condition exercised when every entry completes some
+///    independence pair, claiming only that a pair occurred, not
+///    which.
 /// 7. Otherwise the test is **ambiguous**: recorded with its
 ///    evaluation count and raw counters, no vector, no result.
 ///
@@ -712,8 +724,7 @@ fn flow_decomposition_rule(
         Frac::int(i128::from(evaluations)),
     ));
     let alive_bounds: Vec<u64> = alive.iter().map(|&w| bounds[w]).collect();
-    let solutions = integer_solutions(system, &alive_bounds)?;
-    let (min, max) = solutions?;
+    let Solutions { min, max, supports } = integer_solutions(system, &alive_bounds)??;
 
     let mut out = Vec::new();
     let mut remaining: BTreeMap<String, BranchCounts> = counts.clone();
@@ -743,16 +754,63 @@ fn flow_decomposition_rule(
         obs.resolved_by = Some(Resolution::FlowDecomposition);
         out.push(obs);
     }
+    // The decompositions the remainder admits: per distinct support
+    // of the solutions, the walks it takes beyond those credited
+    // above (an empty list is a decomposition too: the credited
+    // walks alone). Left empty, meaning "not enumerated", when there
+    // were too many to list; masking then cannot use them.
+    let decompositions: Vec<Vec<WalkVector>> = supports
+        .map(|masks| {
+            masks
+                .into_iter()
+                .map(|mask| {
+                    alive
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| mask & (1u64 << i) != 0 && min[i] == 0)
+                        .map(|(_, &w)| WalkVector {
+                            inputs: walks[w].0.iter().cloned().collect(),
+                            result: walks[w].1,
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     if out.is_empty() {
-        return None;
+        // Nothing every solution takes: the test stays an ordinary
+        // ambiguous observation (raw counters, no `resolved_by`), with
+        // its decompositions for masking's per-test check.
+        if decompositions.is_empty() {
+            return None;
+        }
+        let mut obs = ConditionObservation::ambiguous(test_name.clone(), evaluations, remaining);
+        obs.decompositions = decompositions;
+        return Some(vec![obs]);
     }
     if min != max {
         let mut rest =
             ConditionObservation::ambiguous(test_name.clone(), evaluations - attributed, remaining);
         rest.resolved_by = Some(Resolution::FlowDecomposition);
+        rest.attributed_evaluations = Some(attributed);
+        rest.decompositions = decompositions;
         out.push(rest);
     }
     Some(out)
+}
+
+/// At most this many distinct supports (sets of walks a solution
+/// takes) are listed as decompositions per test.
+const MAX_DECOMPOSITIONS: usize = 64;
+
+/// What [`integer_solutions`] found: the per-variable minimum and
+/// maximum over all solutions, and the distinct supports (bit `i`
+/// set iff variable `i` is non-zero), or `None` when there were more
+/// than [`MAX_DECOMPOSITIONS`] of them.
+struct Solutions {
+    min: Vec<u64>,
+    max: Vec<u64>,
+    supports: Option<BTreeSet<u64>>,
 }
 
 /// Every root-to-outcome walk of `node` (each condition tested, with
@@ -845,9 +903,10 @@ fn gcd(a: i128, b: i128) -> i128 {
     i128::try_from(a).unwrap_or(1)
 }
 
-/// Per-variable minimum and maximum over every integer solution `x`
-/// of `system` (rows `(coefficients, rhs)`) with `0 <= x_i <=
-/// bounds[i]`.
+/// Per-variable minimum and maximum, and the distinct supports, over
+/// every integer solution `x` of `system` (rows `(coefficients,
+/// rhs)`) with `0 <= x_i <= bounds[i]`. At most 64 variables (the
+/// caller's [`MAX_WALKS`]), so a support fits a `u64`.
 ///
 /// The outer `None` means the question could not be decided (an
 /// arithmetic overflow, or more than [`MAX_ASSIGNMENTS`]
@@ -858,12 +917,14 @@ fn gcd(a: i128, b: i128) -> i128 {
 /// assignment within the bounds is tried, and an assignment is a
 /// solution iff the pivot variables it determines are integers
 /// within their bounds.
-#[allow(clippy::type_complexity)]
 fn integer_solutions(
     mut system: Vec<(Vec<Frac>, Frac)>,
     bounds: &[u64],
-) -> Option<Option<(Vec<u64>, Vec<u64>)>> {
+) -> Option<Option<Solutions>> {
     let vars = bounds.len();
+    if vars > 64 {
+        return None;
+    }
     // Gauss-Jordan elimination. The pivot of each row is the
     // eligible column with the largest bound, so the free columns
     // (searched exhaustively) tend to be the ones with small bounds.
@@ -912,6 +973,7 @@ fn integer_solutions(
     let mut min = vec![u64::MAX; vars];
     let mut max = vec![0u64; vars];
     let mut found = false;
+    let mut supports = Some(BTreeSet::new());
     let mut x = vec![0u64; vars];
     let mut assignment = vec![0u64; free.len()];
     'search: loop {
@@ -940,9 +1002,19 @@ fn integer_solutions(
         }
         if ok {
             found = true;
+            let mut support = 0u64;
             for j in 0..vars {
                 min[j] = min[j].min(x[j]);
                 max[j] = max[j].max(x[j]);
+                if x[j] > 0 {
+                    support |= 1u64 << j;
+                }
+            }
+            if let Some(set) = supports.as_mut() {
+                set.insert(support);
+                if set.len() > MAX_DECOMPOSITIONS {
+                    supports = None;
+                }
             }
         }
         // Next assignment (odometer); done after the last.
@@ -955,7 +1027,7 @@ fn integer_solutions(
         }
         break;
     }
-    Some(found.then_some((min, max)))
+    Some(found.then_some(Solutions { min, max, supports }))
 }
 
 /// True iff every condition of `decision` occurs at exactly one
@@ -2759,15 +2831,180 @@ fn decide(_1: bool, _2: bool) -> bool {
                 ("nano >= 2000000000", 1, 1),
             ])
         );
+        // Its two decompositions: A alone or D alone.
+        let mut a = chrono_all_false();
+        a[4].1 = true;
+        let mut d = e.clone();
+        d[5].1 = true;
+        let walk = |entries: &[(&str, bool)], result| crate::masking::WalkVector {
+            inputs: inputs(entries),
+            result,
+        };
+        assert_eq!(
+            rest.decompositions,
+            [vec![walk(&d, true)], vec![walk(&a, true)]]
+        );
+        // Every decomposition completes a pair for n2 with the
+        // vectors (A with B, D with E), but not the same pair: n2 is
+        // EXERCISED without an identifiable pair.
         let tree = DecisionTree {
             decisions: vec![decision],
             ..Default::default()
         };
         let r = crate::masking::analyze_with_runtime(&tree, &obs, crate::masking::Variant::Masking);
         match &r.condition_status["nano >= 2000000000"] {
-            crate::masking::ConditionStatus::Ambiguous { tests } => assert_eq!(tests, &[test]),
-            other => panic!("expected UNKNOWN, got {other:?}"),
+            crate::masking::ConditionStatus::ExercisedUnidentified {
+                pair_candidates,
+                pair_identifiable,
+                test: t,
+                decompositions,
+            } => {
+                assert!(!pair_identifiable);
+                assert_eq!(t, test);
+                assert_eq!(*decompositions, 2);
+                assert_eq!(pair_candidates.len(), 2, "{pair_candidates:?}");
+                for p in pair_candidates {
+                    let rows = [&p.test_1, &p.test_2];
+                    let n2 = |r: &crate::masking::TruthTableRow| r.inputs["nano >= 2000000000"];
+                    assert!(rows.iter().any(|r| n2(r)) && rows.iter().any(|r| !n2(r)));
+                }
+                // One candidate's n2 = T row is A (n1 F), the other's
+                // is D (n1 T).
+                let n1 = |p: &crate::masking::IndependencePair| {
+                    let t = [&p.test_1, &p.test_2]
+                        .into_iter()
+                        .find(|r| r.inputs["nano >= 2000000000"])
+                        .expect("an n2 = T row");
+                    t.inputs["nano >= 1000000000"]
+                };
+                let mut n1s: Vec<bool> = pair_candidates.iter().map(n1).collect();
+                n1s.sort();
+                assert_eq!(n1s, [false, true]);
+            }
+            other => panic!("expected EXERCISED (unidentified), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn chrono_time_from_hms_micro_and_milli_exercise_every_condition() {
+        // With `test_rfc3339` and the micro/milli tests resolved by
+        // rule 6, the six conditions are all exercised, `nano >=
+        // 2000000000` without an identifiable pair.
+        let decision = chrono_from_hms_nano();
+        let mut all = Vec::new();
+        for (name, raw, n) in [
+            (
+                "rfc3339",
+                counts(&[
+                    ("hour >= 24", 1, 52),
+                    ("min >= 60", 1, 51),
+                    ("sec >= 60", 1, 50),
+                    ("nano >= 1000000000", 0, 50),
+                    ("sec != 59", 0, 0),
+                    ("nano >= 2000000000", 0, 50),
+                ]),
+                53,
+            ),
+            (
+                "milli",
+                counts(&[
+                    ("hour >= 24", 0, 7),
+                    ("min >= 60", 0, 7),
+                    ("sec >= 60", 0, 7),
+                    ("nano >= 1000000000", 3, 4),
+                    ("sec != 59", 0, 3),
+                    ("nano >= 2000000000", 1, 6),
+                ]),
+                7,
+            ),
+            (
+                "leap_second",
+                counts(&[
+                    ("hour >= 24", 0, 2),
+                    ("min >= 60", 0, 2),
+                    ("sec >= 60", 0, 2),
+                    ("nano >= 1000000000", 2, 0),
+                    ("sec != 59", 1, 1),
+                    ("nano >= 2000000000", 0, 1),
+                ]),
+                2,
+            ),
+        ] {
+            all.extend(observations_from_counts(
+                Some(name.into()),
+                &decision,
+                &raw,
+                Some(n),
+            ));
+        }
+        // (.., n1 F, s59 T)... the n1 pair's F row: a single evaluation.
+        all.push(ConditionObservation::vector(
+            Some("once".into()),
+            inputs(&chrono_all_false()),
+            false,
+        ));
+        let tree = DecisionTree {
+            decisions: vec![decision],
+            ..Default::default()
+        };
+        let r = crate::masking::analyze_with_runtime(&tree, &all, crate::masking::Variant::Masking);
+        for (c, s) in &r.condition_status {
+            let identified = matches!(s, crate::masking::ConditionStatus::Exercised(_));
+            let unidentified = matches!(
+                s,
+                crate::masking::ConditionStatus::ExercisedUnidentified { .. }
+            );
+            assert!(
+                identified || (unidentified && c == "nano >= 2000000000"),
+                "{c}: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decomposition_without_a_completing_pair_keeps_the_condition_unknown() {
+        // `(a || b) && c`: (T,-,T), (F,T,F), (F,F,-) leave the same
+        // counters as (T,-,F), (F,T,T), (F,F,-). (F,F,-) is credited;
+        // for `a` the second decomposition completes no pair, so `a`
+        // (and `b`) stay UNKNOWN; for `c` each decomposition completes
+        // a different pair.
+        let raw = counts(&[("a", 1, 2), ("b", 1, 1), ("c", 1, 1)]);
+        let obs = observations_from_counts(Some("loop".into()), &or_and_node(), &raw, None);
+        assert_eq!(obs.len(), 2);
+        assert_eq!(obs[1].decompositions.len(), 2);
+        let tree = DecisionTree {
+            decisions: vec![or_and_node()],
+            ..Default::default()
+        };
+        let r = crate::masking::analyze_with_runtime(&tree, &obs, crate::masking::Variant::Masking);
+        for c in ["a", "b"] {
+            assert!(
+                matches!(
+                    r.condition_status[c],
+                    crate::masking::ConditionStatus::Ambiguous { .. }
+                ),
+                "{c}: {:?}",
+                r.condition_status[c]
+            );
+        }
+        assert!(matches!(
+            r.condition_status["c"],
+            crate::masking::ConditionStatus::ExercisedUnidentified { .. }
+        ));
+
+        // The two-evaluation case credits nothing, but its ambiguous
+        // observation still carries both decompositions, and `c` is
+        // completed in each.
+        let raw = counts(&[("a", 1, 1), ("b", 1, 0), ("c", 1, 1)]);
+        let obs = observations_from_counts(Some("dag".into()), &or_and_node(), &raw, None);
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].resolved_by, None);
+        assert_eq!(obs[0].decompositions.len(), 2);
+        let r = crate::masking::analyze_with_runtime(&tree, &obs, crate::masking::Variant::Masking);
+        assert!(matches!(
+            r.condition_status["c"],
+            crate::masking::ConditionStatus::ExercisedUnidentified { .. }
+        ));
     }
 
     #[test]
