@@ -28,6 +28,7 @@ use floyd::masking::{
 };
 use floyd::mir;
 use floyd::runner;
+use floyd::toolchain::{Toolchain, ToolchainSpec, ToolchainSummary};
 
 mod failure;
 mod harness;
@@ -380,6 +381,11 @@ struct NoHarnessTarget {
 #[derive(serde::Serialize)]
 struct CargoRuntimeReport<'a> {
     manifest: String,
+    /// The toolchain that built the instrumented tests (name,
+    /// `rustc --version` line, release, host, channel, whether
+    /// `RUSTC_BOOTSTRAP=1` was used); `null` when it could not be
+    /// probed.
+    toolchain: Option<&'a ToolchainSummary>,
     /// `null` when the build failed before cargo reported it.
     workspace_root: Option<String>,
     test_targets: usize,
@@ -443,6 +449,8 @@ struct CandidateAnalysis {
 #[derive(serde::Serialize)]
 struct SingleRuntimeReport<'a> {
     source: String,
+    /// The toolchain that built the instrumented test binary.
+    toolchain: Option<&'a ToolchainSummary>,
     verdict: RuntimeVerdict,
     tests_discovered: &'a [String],
     observations: &'a [ConditionObservation],
@@ -503,8 +511,33 @@ fn main() -> ExitCode {
     // `--all-candidates`: analyse every measurable candidate, not
     // only the selected one (JSON `analyses`).
     let mut all_candidates = false;
+    // `--toolchain=<name|env|path:dir>`, else `FLOYD_TOOLCHAIN`, else
+    // `nightly`.
+    let mut toolchain_arg: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
+        if let Some(val) = args[i].strip_prefix("--toolchain=") {
+            toolchain_arg = Some(val.to_string());
+            args.remove(i);
+            continue;
+        }
+        if args[i] == "--toolchain" {
+            args.remove(i);
+            match args.get(i).copied() {
+                Some(v) if !v.starts_with('-') => {
+                    toolchain_arg = Some(v.to_string());
+                    args.remove(i);
+                }
+                _ => {
+                    eprintln!(
+                        "cargo-floyd: --toolchain requires a value (a rustup toolchain \
+                         name, env, or path:<dir>)"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+            continue;
+        }
         if args[i] == "--all-candidates" {
             all_candidates = true;
             args.remove(i);
@@ -637,6 +670,16 @@ fn main() -> ExitCode {
         }
     }
 
+    let toolchain_env = std::env::var(floyd::toolchain::TOOLCHAIN_ENV).ok();
+    let toolchain_spec =
+        match ToolchainSpec::select(toolchain_arg.as_deref(), toolchain_env.as_deref()) {
+            Ok(t) => t,
+            Err(msg) => {
+                eprintln!("cargo-floyd: {msg}");
+                return ExitCode::from(2);
+            }
+        };
+
     // Detect the optional `test` subcommand.
     let is_test_mode = args.first().copied() == Some("test");
     if is_test_mode {
@@ -688,6 +731,40 @@ fn main() -> ExitCode {
         Err(_) => t,
     });
 
+    // Probe the toolchain once: its channel decides whether the
+    // instrumented build needs `RUSTC_BOOTSTRAP=1`, and its version
+    // goes into every report.
+    let toolchain = match Toolchain::detect(toolchain_spec) {
+        Ok(t) => t,
+        Err(e) => {
+            let error = toolchain_error(&e);
+            eprintln!("cargo-floyd: {}", error.message);
+            if let (true, Source::Cargo(p)) = (is_test_mode, &source) {
+                return emit_run_error(
+                    format,
+                    &Partial {
+                        manifest: p,
+                        workspace_root: None,
+                        toolchain: None,
+                        test_targets: 0,
+                        tests_discovered: &[],
+                        out_of_scope: &[],
+                        skipped_oversize_mirs: &[],
+                        mir_parse_problems: &[],
+                        skipped_no_harness: &[],
+                        max_mir_mb: max_mir_mb.unwrap_or(DEFAULT_MAX_MIR_MB),
+                    },
+                    RuntimeVerdict::SetupFailed,
+                    &error,
+                );
+            }
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(note) = toolchain.bootstrap_note() {
+        eprintln!("cargo-floyd: {note}");
+    }
+
     match (is_test_mode, source) {
         (true, Source::Cargo(p)) => run_test_mode_cargo(
             &p,
@@ -698,16 +775,19 @@ fn main() -> ExitCode {
                 all_candidates,
             },
             max_mir_mb,
-            &cargo_args,
-            target_dir.as_deref(),
+            &BuildSettings {
+                toolchain: &toolchain,
+                cargo_args: &cargo_args,
+                target_dir: target_dir.as_deref(),
+            },
         ),
-        (true, Source::SingleFile(p)) => run_test_mode_single(&p, &workdir, format),
+        (true, Source::SingleFile(p)) => run_test_mode_single(&p, &workdir, &toolchain, format),
         (false, Source::Cargo(_)) => {
             eprintln!("cargo-floyd: static analysis on a cargo project is not supported yet;");
             eprintln!("  pass a single .rs file, or use `cargo floyd test` for runtime analysis.");
             ExitCode::from(2)
         }
-        (false, Source::SingleFile(p)) => run_static_mode(&p, &workdir, format),
+        (false, Source::SingleFile(p)) => run_static_mode(&p, &workdir, &toolchain, format),
     }
 }
 
@@ -754,8 +834,25 @@ fn resolve_source(arg: Option<&Path>) -> Result<Source, String> {
     ))
 }
 
-fn run_static_mode(source: &Path, workdir: &Path, format: Format) -> ExitCode {
-    let mir_path = match instrument::emit_mir(source, workdir) {
+/// The `error` object for a toolchain that could not be probed.
+fn toolchain_error(e: &floyd::toolchain::ToolchainError) -> failure::RunError {
+    let first = e.message.lines().next().unwrap_or("").trim();
+    failure::RunError {
+        stage: "toolchain".to_string(),
+        message: format!("toolchain {}: {first}", e.spec),
+        diagnostics: Vec::new(),
+        ice: None,
+        stderr: failure::trimmed_stderr(&e.message),
+    }
+}
+
+fn run_static_mode(
+    source: &Path,
+    workdir: &Path,
+    toolchain: &Toolchain,
+    format: Format,
+) -> ExitCode {
+    let mir_path = match instrument::emit_mir_with_toolchain(source, workdir, toolchain) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
@@ -784,7 +881,7 @@ fn run_static_mode(source: &Path, workdir: &Path, format: Format) -> ExitCode {
     let matrix = masking::analyze(&tree);
 
     match format {
-        Format::Text => print_static_report(source, &tree, &matrix),
+        Format::Text => print_static_report(source, toolchain, &tree, &matrix),
         Format::Json => match serde_json::to_string_pretty(&matrix) {
             Ok(s) => println!("{s}"),
             Err(e) => {
@@ -813,19 +910,33 @@ struct Selection {
     all_candidates: bool,
 }
 
+/// How a cargo runtime run builds the instrumented tests.
+struct BuildSettings<'a> {
+    /// `--toolchain` / `FLOYD_TOOLCHAIN`, probed.
+    toolchain: &'a Toolchain,
+    /// Feature selection passed to `cargo build --tests`.
+    cargo_args: &'a [String],
+    /// `--target-dir`.
+    target_dir: Option<&'a Path>,
+}
+
 fn run_test_mode_cargo(
     manifest: &Path,
     workdir: &Path,
     format: Format,
     selection: &Selection,
     max_mir_mb: Option<u64>,
-    cargo_args: &[String],
-    target_dir: Option<&Path>,
+    settings: &BuildSettings<'_>,
 ) -> ExitCode {
     let Selection {
         only_patterns,
         all_candidates,
     } = selection;
+    let BuildSettings {
+        toolchain,
+        cargo_args,
+        target_dir,
+    } = *settings;
     // Scope Floyd's `--emit=mir,link -Cinstrument-coverage
     // -Zcoverage-options=branch,condition -Zmir-include-spans` to
     // the primary package only, via a RUSTC_WRAPPER shim that
@@ -843,9 +954,11 @@ fn run_test_mode_cargo(
         .filter(|shim| shim.exists());
 
     let max_mir_mb = max_mir_mb.unwrap_or(DEFAULT_MAX_MIR_MB);
+    let toolchain_summary = toolchain.summary();
     let partial = |workspace_root| Partial {
         manifest,
         workspace_root,
+        toolchain: Some(&toolchain_summary),
         test_targets: 0,
         tests_discovered: &[],
         out_of_scope: &[],
@@ -857,11 +970,12 @@ fn run_test_mode_cargo(
 
     // Build all test artifacts in the cargo project.
     let build_started = std::time::SystemTime::now();
-    let build = match instrument::compile_cargo_project_wrapped(
+    let build = match instrument::compile_cargo_project_with_toolchain(
         manifest,
         cargo_args,
         target_dir,
         shim.as_deref(),
+        toolchain,
     ) {
         Ok(b) => b,
         Err(e) => {
@@ -870,8 +984,8 @@ fn run_test_mode_cargo(
         }
     };
 
-    let tools = runner::llvm_tool("llvm-profdata")
-        .and_then(|p| runner::llvm_tool("llvm-cov").map(|c| (p, c)));
+    let tools = runner::llvm_tool_with_toolchain("llvm-profdata", toolchain)
+        .and_then(|p| runner::llvm_tool_with_toolchain("llvm-cov", toolchain).map(|c| (p, c)));
     let (profdata_tool, cov_tool) = match tools {
         Ok(t) => t,
         Err(e) => {
@@ -988,7 +1102,7 @@ fn run_test_mode_cargo(
             }
         };
         mir_parse_problems.extend(mir.parse_problems().into_iter().map(problem));
-        let tests = match runner::list_tests(&artifact.binary_path) {
+        let tests = match runner::list_tests_with_toolchain(&artifact.binary_path, toolchain) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("cargo-floyd: {e}");
@@ -1193,7 +1307,12 @@ fn run_test_mode_cargo(
                     "cov-{:03}-{:03}.profraw",
                     job.art_idx, job.test_idx
                 ));
-                runner::run_test_isolated(&job.binary_path, &job.test_name, &prof)?;
+                runner::run_test_isolated_with_toolchain(
+                    &job.binary_path,
+                    &job.test_name,
+                    &prof,
+                    toolchain,
+                )?;
                 let coverage = runner::profraw_to_coverage(
                     &prof,
                     &profdata_tool,
@@ -1388,6 +1507,7 @@ fn run_test_mode_cargo(
     let test_targets = build.test_artifacts.len();
     let report = |verdict, observations, analysis, analyses| CargoRuntimeReport {
         manifest: manifest_str.clone(),
+        toolchain: Some(&toolchain_summary),
         workspace_root: Some(workspace_root_str.clone()),
         test_targets,
         verdict,
@@ -1467,6 +1587,7 @@ fn run_test_mode_cargo(
     match format {
         Format::Text => {
             println!("floyd  runtime MC/DC analysis of {}", manifest.display());
+            println!("Toolchain: {}", toolchain.describe());
             println!();
             println!("Test targets: {}", build.test_artifacts.len());
             print_runtime_report_body(&all_tests, &all_observations, &analysis, &not_measurable);
@@ -1496,7 +1617,8 @@ fn run_test_mode_cargo(
                     &manifest.display().to_string(),
                     &analysis,
                     &all_observations,
-                    not_measurable_count
+                    not_measurable_count,
+                    Some(&toolchain_summary),
                 )
             );
         }
@@ -1512,6 +1634,7 @@ const DEFAULT_MAX_MIR_MB: u64 = 50;
 struct Partial<'a> {
     manifest: &'a Path,
     workspace_root: Option<&'a Path>,
+    toolchain: Option<&'a ToolchainSummary>,
     test_targets: usize,
     tests_discovered: &'a [String],
     out_of_scope: &'a [DeclinedFunction],
@@ -1544,7 +1667,8 @@ fn emit_run_error(
             failure::render_error_junit(
                 &partial.manifest.display().to_string(),
                 verdict.as_str(),
-                error
+                error,
+                partial.toolchain,
             )
         ),
     }
@@ -1561,6 +1685,7 @@ fn error_report<'a>(
 ) -> CargoRuntimeReport<'a> {
     CargoRuntimeReport {
         manifest: partial.manifest.display().to_string(),
+        toolchain: partial.toolchain,
         workspace_root: partial.workspace_root.map(|p| p.display().to_string()),
         test_targets: partial.test_targets,
         verdict,
@@ -1738,9 +1863,16 @@ fn no_candidates_line(
     )
 }
 
-fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCode {
+fn run_test_mode_single(
+    source: &Path,
+    workdir: &Path,
+    toolchain: &Toolchain,
+    format: Format,
+) -> ExitCode {
+    let toolchain_summary = toolchain.summary();
     // 1. Build the file as a #[test]-enabled instrumented binary.
-    let compiled = match instrument::compile_test_target(source, workdir) {
+    let compiled = match instrument::compile_test_target_with_toolchain(source, workdir, toolchain)
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
@@ -1749,14 +1881,14 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     };
 
     // 2. Locate llvm-tools we need to ingest coverage per test.
-    let profdata_tool = match runner::llvm_tool("llvm-profdata") {
+    let profdata_tool = match runner::llvm_tool_with_toolchain("llvm-profdata", toolchain) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
             return ExitCode::from(1);
         }
     };
-    let cov_tool = match runner::llvm_tool("llvm-cov") {
+    let cov_tool = match runner::llvm_tool_with_toolchain("llvm-cov", toolchain) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
@@ -1783,7 +1915,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
         eprintln!("cargo-floyd: {}: {p}", compiled.mir_path.display());
     }
     // 4. Enumerate the binary's tests.
-    let tests = match runner::list_tests(&compiled.binary_path) {
+    let tests = match runner::list_tests_with_toolchain(&compiled.binary_path, toolchain) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
@@ -1829,7 +1961,12 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     let mut per_test_coverage: Vec<(String, CoverageIndex)> = Vec::with_capacity(tests.len());
     for (idx, test_name) in tests.iter().enumerate() {
         let prof = workdir.join(format!("cov-{idx:03}.profraw"));
-        if let Err(e) = runner::run_test_isolated(&compiled.binary_path, test_name, &prof) {
+        if let Err(e) = runner::run_test_isolated_with_toolchain(
+            &compiled.binary_path,
+            test_name,
+            &prof,
+            toolchain,
+        ) {
             eprintln!("cargo-floyd: {e}");
             return ExitCode::from(1);
         }
@@ -1886,6 +2023,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     // 6. Pick the best candidate, run the analysis.
     let report = |verdict, observations, analysis| SingleRuntimeReport {
         source: source.display().to_string(),
+        toolchain: Some(&toolchain_summary),
         verdict,
         tests_discovered: &tests,
         observations,
@@ -1928,7 +2066,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     analysis.provenance = Some(chosen.provenance);
 
     match format {
-        Format::Text => print_runtime_report(source, &tests, &observations, &analysis),
+        Format::Text => print_runtime_report(source, toolchain, &tests, &observations, &analysis),
         Format::Json => {
             if let Err(code) = print_json(&report(
                 RuntimeVerdict::Analysed,
@@ -1941,7 +2079,13 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
         Format::Junit => {
             print!(
                 "{}",
-                render_runtime_junit(&source.display().to_string(), &analysis, &observations, 0)
+                render_runtime_junit(
+                    &source.display().to_string(),
+                    &analysis,
+                    &observations,
+                    0,
+                    Some(&toolchain_summary),
+                )
             );
         }
     }
@@ -1966,7 +2110,8 @@ fn print_usage() {
     eprintln!("    cargo floyd test [--format=text|json|junit] [--only=<pat>]...");
     eprintln!("                     [--max-mir-size=<MB>] [--features=<list>]");
     eprintln!("                     [--all-features] [--no-default-features]");
-    eprintln!("                     [--target-dir=<dir>] [--all-candidates] [<path>]");
+    eprintln!("                     [--target-dir=<dir>] [--all-candidates]");
+    eprintln!("                     [--toolchain=<name>|env|path:<dir>] [<path>]");
     eprintln!("        Runtime MC/DC analysis: builds the project as a test");
     eprintln!("        crate with coverage instrumentation, runs each #[test]");
     eprintln!("        function individually, and reports which conditions the");
@@ -2016,7 +2161,15 @@ fn print_usage() {
     eprintln!("        --format=junit is not valid in static mode (no test");
     eprintln!("        verdicts to render).");
     eprintln!();
-    eprintln!("Requires nightly Rust + the llvm-tools-preview component:");
+    eprintln!("Toolchain (both modes): --toolchain=<name> (or FLOYD_TOOLCHAIN) selects");
+    eprintln!("the compiler; default nightly. <name> is a rustup toolchain, run as");
+    eprintln!("`cargo +<name>` / `rustc +<name>`. `env` uses $CARGO / $RUSTC, else the");
+    eprintln!("cargo and rustc on PATH, with no +<name> (e.g. Ferrocene via criticalup);");
+    eprintln!("`path:<dir>` uses <dir>/cargo and <dir>/rustc. A stable or beta compiler");
+    eprintln!("gets RUSTC_BOOTSTRAP=1 for the instrumented build only (Floyd needs");
+    eprintln!("-Z flags); the toolchain is recorded in every report.");
+    eprintln!();
+    eprintln!("Requires the toolchain's LLVM tools, e.g. for rustup:");
     eprintln!("    rustup component add llvm-tools-preview --toolchain nightly");
 }
 
@@ -2026,10 +2179,12 @@ fn print_usage() {
 
 fn print_static_report(
     source: &Path,
+    toolchain: &Toolchain,
     tree: &floyd::DecisionTree,
     matrix: &floyd::IndependenceMatrix,
 ) {
     println!("floyd  static MC/DC analysis of {}", source.display());
+    println!("Toolchain: {}", toolchain.describe());
     println!();
     println!("Decisions recovered: {}", tree.decisions.len());
     if !matrix.conditions.is_empty() {
@@ -2070,11 +2225,13 @@ fn print_static_report(
 
 fn print_runtime_report(
     source: &Path,
+    toolchain: &Toolchain,
     tests: &[String],
     observations: &[ConditionObservation],
     analysis: &RuntimeAnalysis,
 ) {
     println!("floyd  runtime MC/DC analysis of {}", source.display());
+    println!("Toolchain: {}", toolchain.describe());
     println!();
     print_runtime_report_body(tests, observations, analysis, &[]);
 }
@@ -2559,6 +2716,7 @@ fn render_runtime_junit(
     analysis: &RuntimeAnalysis,
     observations: &[ConditionObservation],
     not_measurable: usize,
+    toolchain: Option<&ToolchainSummary>,
 ) -> String {
     use std::fmt::Write as _;
     let conditions = &analysis.matrix.conditions;
@@ -2588,6 +2746,7 @@ fn render_runtime_junit(
     if let Some(pct) = summary.percentage {
         props.push(("floyd.percentage", format!("{pct:.0}")));
     }
+    props.extend(toolchain_properties(toolchain));
     for (name, value) in props {
         let _ = writeln!(
             out,
@@ -2671,6 +2830,32 @@ fn render_runtime_junit(
     out
 }
 
+/// The JUnit `<properties>` recording the toolchain:
+/// `floyd.toolchain` (the selection), `floyd.toolchain.version`
+/// (`rustc --version`), `.release`, `.host`, `.channel` and
+/// `.rustc_bootstrap`. Fields that were not probed are omitted.
+fn toolchain_properties(toolchain: Option<&ToolchainSummary>) -> Vec<(&'static str, String)> {
+    let Some(tc) = toolchain else {
+        return Vec::new();
+    };
+    let mut props = vec![("floyd.toolchain", tc.name.clone())];
+    if let Some(v) = &tc.version {
+        props.push(("floyd.toolchain.version", v.clone()));
+    }
+    if let Some(r) = &tc.release {
+        props.push(("floyd.toolchain.release", r.clone()));
+    }
+    if let Some(h) = &tc.host {
+        props.push(("floyd.toolchain.host", h.clone()));
+    }
+    props.push(("floyd.toolchain.channel", tc.channel.as_str().to_string()));
+    props.push((
+        "floyd.toolchain.rustc_bootstrap",
+        tc.rustc_bootstrap.to_string(),
+    ));
+    props
+}
+
 /// Escape the five XML special characters so condition names like
 /// `speed > 50` survive intact in attribute and text positions.
 /// The `&` replacement runs first so the subsequent escapes don't
@@ -2745,6 +2930,7 @@ mod tests {
             bytes: 1,
         }];
         let report = CargoRuntimeReport {
+            toolchain: None,
             manifest: "Cargo.toml".to_string(),
             workspace_root: Some(".".to_string()),
             test_targets: 1,
@@ -2950,6 +3136,7 @@ mod tests {
         );
         let observations = [vector, ambiguous];
         let report = SingleRuntimeReport {
+            toolchain: None,
             source: "lib.rs".to_string(),
             verdict: RuntimeVerdict::Analysed,
             tests_discovered: &[],
@@ -3096,7 +3283,7 @@ mod tests {
             analysis.condition_status.get("b"),
             Some(ConditionStatus::Ambiguous { tests }) if tests.len() == 5
         ));
-        let xml = render_runtime_junit("lib.rs", &analysis, &[], 2);
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 2, None);
         assert!(xml.contains(r#"type="AmbiguousCondition""#), "{xml}");
         assert!(
             xml.contains("vectors: loop_0, loop_1, loop_2 (+2 more). Add tests"),
@@ -3115,13 +3302,42 @@ mod tests {
     }
 
     #[test]
+    fn junit_records_the_toolchain_as_properties() {
+        let tc = ToolchainSummary {
+            name: "stable".into(),
+            version: Some("rustc 1.99.1 (58cf8f9c3 2026-10-13)".into()),
+            release: Some("1.99.1".into()),
+            host: Some("x86_64-apple-darwin".into()),
+            channel: floyd::toolchain::Channel::Stable,
+            rustc_bootstrap: true,
+        };
+        let xml = render_runtime_junit("lib.rs", &ambiguous_analysis(0), &[], 0, Some(&tc));
+        for prop in [
+            r#"<property name="floyd.toolchain" value="stable"/>"#,
+            r#"<property name="floyd.toolchain.version" value="rustc 1.99.1 (58cf8f9c3 2026-10-13)"/>"#,
+            r#"<property name="floyd.toolchain.release" value="1.99.1"/>"#,
+            r#"<property name="floyd.toolchain.channel" value="stable"/>"#,
+            r#"<property name="floyd.toolchain.rustc_bootstrap" value="true"/>"#,
+        ] {
+            assert!(xml.contains(prop), "{prop} missing:\n{xml}");
+        }
+        let error = failure::RunError::default();
+        let xml = failure::render_error_junit("/p/Cargo.toml", "build_failed", &error, Some(&tc));
+        assert!(xml.contains(r#"<property name="floyd.toolchain.channel" value="stable"/>"#));
+        assert!(
+            !render_runtime_junit("lib.rs", &ambiguous_analysis(0), &[], 0, None)
+                .contains("floyd.toolchain")
+        );
+    }
+
+    #[test]
     fn junit_carries_the_percentage_when_nothing_is_unknown() {
         let analysis = ambiguous_analysis(0);
         assert!(matches!(
             analysis.condition_status.get("b"),
             Some(ConditionStatus::Unexercised)
         ));
-        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0);
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0, None);
         assert!(xml.contains(r#"type="UnexercisedCondition""#), "{xml}");
         assert!(xml.contains(r#"<property name="floyd.percentage" value="50"/>"#));
         assert!(xml.contains(r#"<property name="floyd.unknown" value="0"/>"#));
@@ -3131,6 +3347,7 @@ mod tests {
     fn json_summary_reports_null_percentage_for_an_analysed_unknown() {
         let analysis = ambiguous_analysis(1);
         let report = SingleRuntimeReport {
+            toolchain: None,
             source: "lib.rs".to_string(),
             verdict: RuntimeVerdict::Analysed,
             tests_discovered: &[],
@@ -3194,7 +3411,7 @@ mod tests {
         );
         assert!(ruled_out_note(&analysis, "b == 32").is_none());
 
-        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0);
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0, None);
         assert!(xml.contains(r#"type="UnexercisedCondition""#), "{xml}");
         assert!(xml.contains("never took b == 10=T (0T/8F)"), "{xml}");
 
@@ -3238,7 +3455,7 @@ mod tests {
                  [the matching row (a=T, b=T) -> T is already covered]"
             )
         );
-        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0);
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0, None);
         assert!(
             xml.contains(
                 "needs a test where (a=T, b=F) -&gt; F [the matching row (a=T, b=T) -&gt; T \
@@ -3282,6 +3499,7 @@ mod tests {
         Partial {
             manifest: Path::new("/w/Cargo.toml"),
             workspace_root: Some(Path::new("/w")),
+            toolchain: None,
             test_targets: 2,
             tests_discovered: tests,
             out_of_scope: &[],

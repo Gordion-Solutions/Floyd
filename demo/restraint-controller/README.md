@@ -19,9 +19,11 @@ conditions are never demonstrated. Writing the tests Floyd asks for
 
 ## Setup
 
-Floyd needs a nightly toolchain with the LLVM tools. The walkthrough
-below was recorded with `cargo-floyd` built from this repository and
-nightly-2026-11-03:
+Floyd needs a toolchain with the LLVM tools, nightly by default. The
+walkthrough below was recorded with `cargo-floyd` built from this
+repository and nightly-2026-11-03 (`cargo floyd test
+--toolchain=stable` gives the same results on stable 1.99.1, apart
+from the `Toolchain:` line):
 
 ```sh
 rustup install nightly
@@ -38,7 +40,7 @@ below are shortened to `/path/to/floyd`.
 any toolchain: Floyd builds its instrumented test binaries in
 `target/floyd`, separate from the ones `cargo test` builds in
 `target/debug`. (Earlier versions shared `target/debug` and stopped
-with exit 1 after a `cargo +nightly test`; that is fixed.)
+with exit 1 after a `cargo test`; that is fixed.)
 
 ## Step 0: the clean state, 100% MC/DC
 
@@ -49,6 +51,7 @@ cargo floyd test    # exit code 0
 
 ```
 floyd  runtime MC/DC analysis of /path/to/floyd/demo/restraint-controller/Cargo.toml
+Toolchain: nightly (rustc 1.101.0-nightly (708c94ef0 2026-11-03), nightly channel)
 
 Test targets: 3
 Tests discovered: 5
@@ -113,6 +116,12 @@ cargo floyd test --format=junit
       <property name="floyd.unknown" value="0"/>
       <property name="floyd.not_measurable" value="0"/>
       <property name="floyd.percentage" value="100"/>
+      <property name="floyd.toolchain" value="nightly"/>
+      <property name="floyd.toolchain.version" value="rustc 1.101.0-nightly (708c94ef0 2026-11-03)"/>
+      <property name="floyd.toolchain.release" value="1.101.0-nightly"/>
+      <property name="floyd.toolchain.host" value="x86_64-apple-darwin"/>
+      <property name="floyd.toolchain.channel" value="nightly"/>
+      <property name="floyd.toolchain.rustc_bootstrap" value="false"/>
     </properties>
     <testcase name="occupant_present" classname="floyd.mcdc"/>
     <testcase name="crash_detected" classname="floyd.mcdc"/>
@@ -142,6 +151,7 @@ and `cargo test` is green. Floyd:
 
 ```
 floyd  runtime MC/DC analysis of /path/to/floyd/demo/restraint-controller/Cargo.toml
+Toolchain: nightly (rustc 1.101.0-nightly (708c94ef0 2026-11-03), nightly channel)
 
 Test targets: 2
 Tests discovered: 3

@@ -44,6 +44,37 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   now resolves to four vectors, and `nano >= 2000000000` is exercised
   without an identifiable pair (`test_time_from_hms_micro`'s counters
   admit two decompositions, each completing a different pair).
+- **Toolchain selection: `--toolchain=<name>|env|path:<dir>`** (also
+  `FLOYD_TOOLCHAIN`; default `nightly`, the previous behaviour).
+  `<name>` is a rustup toolchain, run as `cargo +<name>` / `rustc
+  +<name>`. `env` uses `$CARGO` / `$RUSTC` when set, else the `cargo`
+  and `rustc` on `PATH`, with no `+<name>` (for a compiler outside
+  rustup, such as Ferrocene installed with criticalup; untested);
+  `path:<dir>` uses `<dir>/cargo` and `<dir>/rustc`. Floyd reads the
+  channel from `rustc --version --verbose`; for a stable or beta
+  compiler it prints one line to stderr and sets `RUSTC_BOOTSTRAP=1`
+  for the instrumented build only: `floyd-rustc-shim` sets it on the
+  `rustc` processes when the build passes `FLOYD_RUSTC_BOOTSTRAP=1`,
+  so cargo, build scripts and the tests Floyd runs never see it.
+  `llvm-profdata` / `llvm-cov` are looked up in the chosen
+  toolchain's sysroot, and the missing-tools error names that
+  toolchain's install command. The `fixtures/mcdc-cases` verdicts are
+  identical on stable 1.99.1 and nightly 1.101.
+- **The toolchain is recorded in every report:** a `Toolchain:` line
+  in the text header, a JSON `toolchain` object (`name`, `version`,
+  `release`, `host`, `channel`, `rustc_bootstrap`; `null` when the
+  toolchain could not be probed, verdict `setup_failed` with `error.stage`
+  `toolchain`), and JUnit `floyd.toolchain*` properties, error
+  documents included.
+- **Library:** `floyd::toolchain` (`ToolchainSpec`, `Toolchain::detect`,
+  `Channel`, `ToolchainSummary`), and toolchain-taking variants of the
+  build and run functions: `instrument::compile_cargo_project_with_toolchain`,
+  `emit_mir_with_toolchain`, `compile_test_target_with_toolchain`,
+  `compile_with_coverage_with_toolchain`, and
+  `runner::llvm_tool_with_toolchain`, `list_tests_with_toolchain`,
+  `run_test_isolated_with_toolchain`, `run_with_toolchain`. The
+  existing functions keep their signatures and behaviour (`nightly`,
+  not probed).
 
 ### Changed
 

@@ -288,7 +288,12 @@ fn is_backtrace_frame(t: &str) -> bool {
 
 /// A JUnit document for a run that stopped with `error`: one
 /// `<testcase>` carrying an `<error>` whose `type` is the verdict.
-pub fn render_error_junit(source: &str, verdict: &str, error: &RunError) -> String {
+pub fn render_error_junit(
+    source: &str,
+    verdict: &str,
+    error: &RunError,
+    toolchain: Option<&floyd::toolchain::ToolchainSummary>,
+) -> String {
     use std::fmt::Write as _;
     let esc = crate::xml_escape;
     let mut body = String::new();
@@ -325,6 +330,13 @@ pub fn render_error_junit(source: &str, verdict: &str, error: &RunError) -> Stri
         r#"      <property name="floyd.verdict" value="{}"/>"#,
         esc(verdict)
     );
+    for (name, value) in crate::toolchain_properties(toolchain) {
+        let _ = writeln!(
+            out,
+            r#"      <property name="{name}" value="{}"/>"#,
+            esc(&value)
+        );
+    }
     let _ = writeln!(out, "    </properties>");
     let _ = writeln!(
         out,
@@ -428,7 +440,7 @@ not json
             ice: None,
             stderr: String::new(),
         };
-        let x = render_error_junit("/p/Cargo.toml", "build_failed", &e);
+        let x = render_error_junit("/p/Cargo.toml", "build_failed", &e, None);
         assert!(x.starts_with(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
         assert!(x.contains(r#"<testsuites name="floyd" tests="1" failures="0" errors="1">"#));
         assert!(x.contains(r#"<property name="floyd.verdict" value="build_failed"/>"#));

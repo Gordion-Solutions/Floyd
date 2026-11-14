@@ -23,12 +23,20 @@ A condition left unknown that way gets no percentage in the summary
 and, like an unexercised condition, makes the run exit with code 2
 (0: every condition exercised; 1: error or no decision analysed).
 
-Requires the nightly toolchain plus the LLVM coverage tools:
+Requires a toolchain with the LLVM coverage tools, nightly (the
+default) or stable:
 
 ```sh
 rustup install nightly
 rustup component add llvm-tools-preview --toolchain nightly
+# or: rustup component add llvm-tools-preview --toolchain stable
+#     cargo floyd test --toolchain=stable
 ```
+
+With a stable or beta compiler Floyd sets `RUSTC_BOOTSTRAP=1` for
+the instrumented build only, and records the toolchain in every
+report. `--toolchain=env` uses the `cargo`/`rustc` on `PATH` (for
+example Ferrocene installed with criticalup; untested).
 
 See the [main repository README](https://github.com/Gordion-Solutions/Floyd)
 for the full feature matrix, qualification stance, and ADRs.
