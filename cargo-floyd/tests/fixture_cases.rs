@@ -4,11 +4,13 @@
 //! The fixture has one module per engine bug class (observation
 //! collapse, name-based correlation, spurious candidates, assert
 //! terminators, not-measurable decisions, the value-arm lift,
-//! `harness = false` targets, processes the build or a test spawns).
+//! `harness = false` targets, processes the build or a test spawns,
+//! functions with no Boolean decision, user `matches!` predicates and
+//! decisions with too many conditions).
 //! Each function there documents the outcome Floyd must report for
 //! it; [`EXPECTED`] restates those outcomes and the tests below
 //! check them against the JSON report, per function: candidate or
-//! `out_of_scope` (with its `reason`), `invoked`, observation count,
+//! `out_of_scope` (with its `reason` and `detail`), `invoked`, observation count,
 //! `not_measurable.reason`, `lift`, the harness-free `note`; and,
 //! per `--only=<fn>` run, observation and ambiguous counts, the
 //! analysed conditions, `summary.percentage` and the exit code.
@@ -154,7 +156,7 @@ enum Expect {
         note: bool,
     },
     /// Not a candidate; listed in `out_of_scope` with exactly these
-    /// reasons (a `const fn` has a runtime and a CTFE body).
+    /// reasons, each `reason` or `reason:detail`.
     OutOfScope(&'static [&'static str]),
 }
 
@@ -187,11 +189,13 @@ const EXPECTED: &[(&str, Expect)] = &[
     ("drop_flag_loop", Expect::OutOfScope(&["unsupported_shape"])),
     ("const_entry", Expect::OutOfScope(&["unsupported_shape"])),
     ("wide_leaf", Expect::OutOfScope(&["non_bool_leaf"])),
-    ("setup_copy", Expect::OutOfScope(&["unsupported_shape"])),
+    // Only an `assert_eq!`.
     (
-        "ctfe_flag",
-        Expect::OutOfScope(&["ctfe_body", "unsupported_shape"]),
+        "setup_copy",
+        Expect::OutOfScope(&["no_decision:std_macro_only"]),
     ),
+    // The CTFE body is counted, not listed.
+    ("ctfe_flag", Expect::OutOfScope(&["unsupported_shape"])),
     // Non-bool arms whose decision is the comparison alone (see
     // `non_bool_arms_are_never_conditions`).
     ("struct_leaf", measured(1, None)),
@@ -210,8 +214,8 @@ const EXPECTED: &[(&str, Expect)] = &[
             note: false,
         },
     ),
-    ("eq", Expect::OutOfScope(&["unsupported_shape"])),
-    ("fmt", Expect::OutOfScope(&["unsupported_shape"])),
+    ("eq", Expect::OutOfScope(&["no_decision:derived_impl"])),
+    ("fmt", Expect::OutOfScope(&["no_decision:derived_impl"])),
     (
         "enum_match",
         Expect::Candidate {
@@ -253,6 +257,37 @@ const EXPECTED: &[(&str, Expect)] = &[
     ),
     // 7. Processes other than the test.
     ("spawned_and", measured(2, None)),
+    // 8. No Boolean decision, user `matches!`, too many conditions.
+    (
+        "mode_is_live",
+        Expect::Candidate {
+            invoked: false,
+            observations: 0,
+            lift: None,
+            not_measurable: Some("external_macro"),
+            note: false,
+        },
+    ),
+    (
+        "is_code_point",
+        Expect::OutOfScope(&["too_many_conditions"]),
+    ),
+    (
+        "require_even",
+        Expect::OutOfScope(&["no_decision:std_macro_only"]),
+    ),
+    (
+        "require_positive",
+        Expect::OutOfScope(&["no_decision:assert_only"]),
+    ),
+    (
+        "first_digit",
+        Expect::OutOfScope(&["no_decision:question_mark_or_loop_only"]),
+    ),
+    (
+        "mode_code",
+        Expect::OutOfScope(&["no_decision:pattern_match_only"]),
+    ),
 ];
 
 /// Does MIR function name `name` denote fixture function `key`?
@@ -367,10 +402,16 @@ fn every_fixture_function_has_its_expected_outcome() {
             .iter()
             .filter(|c| names(str_field(c, "function_name").unwrap_or_default(), key))
             .collect();
-        let declined: BTreeSet<&str> = out_of_scope(run)
+        let declined: BTreeSet<String> = out_of_scope(run)
             .iter()
             .filter(|o| names(str_field(o, "name").unwrap_or_default(), key))
-            .filter_map(|o| str_field(o, "reason"))
+            .filter_map(|o| {
+                let reason = str_field(o, "reason")?;
+                Some(match str_field(o, "detail") {
+                    Some(detail) => format!("{reason}:{detail}"),
+                    None => reason.to_string(),
+                })
+            })
             .collect();
         match expect {
             Expect::Candidate {
@@ -419,11 +460,79 @@ fn every_fixture_function_has_its_expected_outcome() {
                     found.is_empty(),
                     "`{key}` must not be a candidate: {found:?}"
                 );
-                let want: BTreeSet<&str> = reasons.iter().copied().collect();
+                let want: BTreeSet<String> = reasons.iter().map(|r| r.to_string()).collect();
                 assert_eq!(declined, want, "`{key}` out_of_scope reasons");
             }
         }
     }
+}
+
+#[test]
+#[ignore = "requires nightly Rust + llvm-tools-preview component"]
+fn out_of_scope_lists_each_function_once_with_counts() {
+    let run = full();
+    let oos = out_of_scope(run);
+    let summary = &run.json["out_of_scope_summary"];
+    assert_eq!(summary["total"].as_u64(), Some(oos.len() as u64));
+    // `ctfe_flag`'s CTFE body is counted, never listed.
+    assert!(
+        summary["ctfe_bodies_skipped"].as_u64() >= Some(1),
+        "{summary}"
+    );
+    assert!(oos
+        .iter()
+        .all(|o| str_field(o, "reason") != Some("ctfe_body")));
+    let by_reason = summary["by_reason"].as_object().expect("by_reason");
+    let counted: u64 = by_reason.values().filter_map(Value::as_u64).sum();
+    assert_eq!(counted, oos.len() as u64);
+    // No function is listed twice, and none is both a candidate and
+    // out of scope.
+    let mut seen = BTreeSet::new();
+    for o in oos {
+        let name = str_field(o, "name").unwrap_or_default();
+        assert!(seen.insert(name), "`{name}` listed twice in out_of_scope");
+    }
+    for c in candidates(run) {
+        let name = str_field(c, "function_name").unwrap_or_default();
+        assert!(
+            !seen.contains(name),
+            "`{name}` is a candidate and out of scope"
+        );
+    }
+    // The wide `matches!` carries its condition count; the user
+    // `matches!` candidate is located in the fixture, not in `core`.
+    let wide = oos
+        .iter()
+        .find(|o| names(str_field(o, "name").unwrap_or_default(), "is_code_point"))
+        .expect("is_code_point listed");
+    assert!(wide["conditions"].as_u64() > Some(12), "{wide}");
+    let live = candidates(run)
+        .iter()
+        .find(|c| {
+            names(
+                str_field(c, "function_name").unwrap_or_default(),
+                "mode_is_live",
+            )
+        })
+        .expect("mode_is_live listed");
+    assert!(
+        str_field(live, "source_file").is_some_and(|f| f.ends_with("src/no_decision.rs")),
+        "{live}"
+    );
+    // The text report groups the counts by reason.
+    let text = floyd("text", &[]);
+    assert!(
+        text.stdout
+            .contains("with no Boolean decision the user wrote"),
+        "{}",
+        text.stdout
+    );
+    assert!(
+        text.stdout
+            .contains("in a shape the engine does not recognise yet (unsupported_shape)"),
+        "{}",
+        text.stdout
+    );
 }
 
 #[test]

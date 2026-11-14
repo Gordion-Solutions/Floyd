@@ -121,7 +121,9 @@ pub fn slice_leaf<'a>(first: bool, x: &'a [u8], y: &'a [u8]) -> &'a [u8] {
 /// `Captures::extract`): `_k = copy _j; _m = Eq(..)` consumed in the
 /// same block, which must not be read as the block's value.
 ///
-/// Expected: not a candidate (no `Condition` named `len`).
+/// Expected: not a candidate (no `Condition` named `len`); its only
+/// `switchInt` is `assert_eq!`'s, so `out_of_scope` reason
+/// `no_decision`, detail `std_macro_only`.
 pub fn setup_copy(len: usize, want: usize) -> usize {
     assert_eq!(len, want, "length mismatch");
     len * 2
@@ -132,8 +134,10 @@ pub fn setup_copy(len: usize, want: usize) -> usize {
 /// `AsciiDenyList::new`). It is used only in a constant, so the
 /// runtime body never runs.
 ///
-/// Expected: the CTFE body is in `out_of_scope` with reason
-/// `ctfe_body`; it is never a candidate from the CTFE body.
+/// Expected: never a candidate from the CTFE body. The CTFE body is
+/// not listed (it is counted in `out_of_scope_summary.
+/// ctfe_bodies_skipped`); the runtime body is in `out_of_scope` with
+/// reason `unsupported_shape`.
 pub const fn ctfe_flag(deny: bool, bits: u32) -> u32 {
     let mut out = bits;
     if deny {

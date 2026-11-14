@@ -31,8 +31,10 @@ use floyd::runner;
 
 mod failure;
 mod harness;
+mod scan;
 mod selector;
 mod summary;
+use scan::{DeclinedFunction, OutOfScopeSummary};
 use std::path::Path;
 use std::process::ExitCode;
 use summary::CoverageSummary;
@@ -74,20 +76,6 @@ impl RuntimeVerdict {
             RuntimeVerdict::TestRunFailed => "test_run_failed",
         }
     }
-}
-
-/// A function with a `switchInt`-shaped decision that the engine's
-/// current patterns did not match.
-#[derive(serde::Serialize, Clone, Debug)]
-struct DeclinedFunction {
-    name: String,
-    source_file: Option<String>,
-    line: Option<u32>,
-    /// Why the decomposer declined it: `unsupported_shape`,
-    /// `non_bool_leaf` when an arm's value is a named local that is
-    /// not `bool`, `no_conditions` when the tree tests no condition,
-    /// or `ctfe_body` for a `const fn`'s `MIR FOR CTFE` body.
-    reason: decision::DeclineReason,
 }
 
 /// One decomposable candidate the engine considered, with whether
@@ -399,11 +387,17 @@ struct CargoRuntimeReport<'a> {
     /// measurable candidate, in `candidates` order. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     analyses: Option<&'a [CandidateAnalysis]>,
-    /// Functions with a `switchInt`-shaped decision that the
-    /// engine's current patterns did not match. The engine declined
-    /// them rather than report a wrong verdict — honest-scope
-    /// evidence for ISO 26262 / DO-178C qualification audits.
+    /// Every function with a `switchInt` that is not a candidate,
+    /// one entry per function (a `const fn`'s CTFE body is counted
+    /// in `out_of_scope_summary`, not listed), with its `reason`:
+    /// `no_decision` (no Boolean decision the user wrote; `detail`
+    /// says why) or a decision the engine declined rather than report
+    /// a wrong verdict — honest-scope evidence for ISO 26262 /
+    /// DO-178C qualification audits.
     out_of_scope: &'a [DeclinedFunction],
+    /// Counts of `out_of_scope` by `reason` (and `no_decision` by
+    /// `detail`), and the `const fn` CTFE bodies not listed.
+    out_of_scope_summary: OutOfScopeSummary,
     /// MIR files above the size guard that were not analysed.
     skipped_oversize_mirs: &'a [SkippedMir],
     /// The size guard in effect (`--max-mir-size`, default 50).
@@ -849,6 +843,7 @@ fn run_test_mode_cargo(
         test_targets: 0,
         tests_discovered: &[],
         out_of_scope: &[],
+        ctfe_bodies_skipped: 0,
         skipped_oversize_mirs: &[],
         mir_parse_problems: &[],
         skipped_no_harness: &[],
@@ -918,6 +913,9 @@ fn run_test_mode_cargo(
     let mut raw_candidates: Vec<RawCandidate> = Vec::new();
     let mut all_tests: Vec<String> = Vec::new();
     let mut declined: Vec<DeclinedFunction> = Vec::new();
+    let mut ctfe_bodies_skipped = 0usize;
+    // Workspace source lines for the `no_decision` classifier.
+    let sources = scan::SourceReader::new(&build.workspace_root);
     // Pragmatic scalability guard: rustc's `--emit=mir` on a test
     // binary that pulls in deep generic chains can produce MIR
     // files hundreds of megabytes in size (bytes'
@@ -999,6 +997,7 @@ fn run_test_mode_cargo(
                         test_targets: build.test_artifacts.len(),
                         tests_discovered: &all_tests,
                         out_of_scope: &declined,
+                        ctfe_bodies_skipped,
                         skipped_oversize_mirs: &skipped_oversize_mirs,
                         mir_parse_problems: &mir_parse_problems,
                         skipped_no_harness: &skipped_no_harness,
@@ -1013,86 +1012,19 @@ fn run_test_mode_cargo(
             all_tests.push(t.clone());
         }
         let art_idx = artifacts.len();
-        for (fn_idx, f) in mir.functions.iter().enumerate() {
-            // Require BOTH a successful decomposition AND the
-            // presence of at least one `switchInt` in the function.
-            // Without that `switchInt` gate, boolean-passthrough
-            // helpers like `fn f(x: bool) -> bool { x }` register
-            // as candidates — the decomposer produces a
-            // `Node::Condition { name: "x" }`, but the function has
-            // no actual decision in it (no branch), so llvm-cov
-            // emits zero branch regions for it, correlation can't
-            // produce an observation, and the candidate shows up
-            // under the "reached-but-unobserved" bucket as a
-            // false-positive correlation bug. It's not a bug —
-            // there is no decision to measure in the first place.
-            // These passthroughs are not out-of-scope either; they
-            // are "no boolean decision at all", so they do not
-            // belong in the OOS report.
-            if decision::has_switchint(f) {
-                let (node, lift) = match decision::try_decompose_candidate_lifted(f) {
-                    Ok(decomposed) => decomposed,
-                    Err(reason) => {
-                        // Has a switchInt (so some kind of decision)
-                        // but the decomposer did not match any
-                        // supported pattern. Honest-scope report entry.
-                        let prov = correlate::provenance_for(f);
-                        declined.push(DeclinedFunction {
-                            name: prov.function_name.unwrap_or_default(),
-                            source_file: prov.source_file,
-                            line: prov.line,
-                            reason,
-                        });
-                        continue;
-                    }
-                };
-                let prov = floyd::DecisionProvenance {
-                    lift,
-                    ..correlate::provenance_for(f)
-                };
-                // `--only=<pattern>` scopes Floyd to the
-                // functions the user named. On real embedded
-                // crates the whole-crate scan is both slow and
-                // noisy — a qualification engineer typically
-                // has a specific list of safety-critical gates
-                // they need to prove MC/DC on. If any --only
-                // pattern is present and this function's name
-                // doesn't contain any of them, drop it before
-                // scoring; it will not appear in the verdict
-                // or in the honest-scope report.
-                if !only_patterns.is_empty() {
-                    let fn_name = prov.function_name.as_deref().unwrap_or(&f.name);
-                    let hit = only_patterns
-                        .iter()
-                        .any(|pat| fn_name.contains(pat.as_str()));
-                    if !hit {
-                        continue;
-                    }
-                }
-                // Reject candidates whose decision spans come
-                // from inlined-stdlib macro expansions.
-                // Rustc paths of the form `/rustc/<hash>/library/
-                // core/src/macros/mod.rs` are the hygiene
-                // bindings of `assert_eq!`, `debug_assert!`,
-                // `panic!`, and friends — not user-written
-                // decisions. On blake3 and other
-                // test-heavy crates, every `#[test] fn x() {
-                // assert_eq!(a, b); }` was being flagged as a
-                // candidate whose "conditions" `left_val` and
-                // `right_val` are the macro's own locals,
-                // producing reached-but-unobserved false
-                // positives in the AllUnobserved verdict.
-                if is_stdlib_macro_span(prov.source_file.as_deref()) {
-                    continue;
-                }
-                raw_candidates.push(RawCandidate {
-                    tree: floyd::DecisionTree::from_function(f, node),
-                    prov,
-                    artifact_idx: art_idx,
-                    fn_idx,
-                });
-            }
-        }
+        // Every function with a `switchInt` becomes a candidate, an
+        // `out_of_scope` entry or a counted CTFE body (see `scan`).
+        let scanned = scan::scan_functions(&mir, only_patterns, &|file: &str, line| {
+            sources.line(file, line)
+        });
+        declined.extend(scanned.declined);
+        ctfe_bodies_skipped += scanned.ctfe_bodies_skipped;
+        raw_candidates.extend(scanned.candidates.into_iter().map(|c| RawCandidate {
+            tree: c.tree,
+            prov: c.prov,
+            artifact_idx: art_idx,
+            fn_idx: c.fn_idx,
+        }));
         artifacts.push(ArtifactInfo {
             mir,
             binary_path: artifact.binary_path.clone(),
@@ -1229,6 +1161,7 @@ fn run_test_mode_cargo(
                     test_targets: build.test_artifacts.len(),
                     tests_discovered: &all_tests,
                     out_of_scope: &declined,
+                    ctfe_bodies_skipped,
                     skipped_oversize_mirs: &skipped_oversize_mirs,
                     mir_parse_problems: &mir_parse_problems,
                     skipped_no_harness: &skipped_no_harness,
@@ -1386,6 +1319,7 @@ fn run_test_mode_cargo(
     let manifest_str = manifest.display().to_string();
     let workspace_root_str = build.workspace_root.display().to_string();
     let test_targets = build.test_artifacts.len();
+    let out_of_scope_summary = OutOfScopeSummary::new(&declined, ctfe_bodies_skipped);
     let report = |verdict, observations, analysis, analyses| CargoRuntimeReport {
         manifest: manifest_str.clone(),
         workspace_root: Some(workspace_root_str.clone()),
@@ -1399,6 +1333,7 @@ fn run_test_mode_cargo(
         candidates: &candidate_summaries,
         analyses,
         out_of_scope: &declined,
+        out_of_scope_summary: OutOfScopeSummary::new(&declined, ctfe_bodies_skipped),
         skipped_oversize_mirs: &skipped_mirs,
         max_mir_size_mb: max_mir_mb,
         mir_parse_problems: &mir_parse_problems,
@@ -1410,7 +1345,7 @@ fn run_test_mode_cargo(
         match format {
             Format::Text => print_out_of_scope_report(
                 &mut std::io::stdout(),
-                &declined,
+                &out_of_scope_summary,
                 &skipped_oversize_mirs,
                 max_mir_mb,
                 &mir_parse_problems,
@@ -1423,7 +1358,7 @@ fn run_test_mode_cargo(
             }
             Format::Junit => print_out_of_scope_report(
                 &mut std::io::stderr(),
-                &declined,
+                &out_of_scope_summary,
                 &skipped_oversize_mirs,
                 max_mir_mb,
                 &mir_parse_problems,
@@ -1472,7 +1407,7 @@ fn run_test_mode_cargo(
             print_runtime_report_body(&all_tests, &all_observations, &analysis, &not_measurable);
             print_out_of_scope_report(
                 &mut std::io::stdout(),
-                &declined,
+                &out_of_scope_summary,
                 &skipped_oversize_mirs,
                 max_mir_mb,
                 &mir_parse_problems,
@@ -1495,7 +1430,8 @@ fn run_test_mode_cargo(
                 render_runtime_junit(
                     &manifest.display().to_string(),
                     &analysis,
-                    not_measurable_count
+                    not_measurable_count,
+                    Some(&out_of_scope_summary),
                 )
             );
         }
@@ -1514,6 +1450,7 @@ struct Partial<'a> {
     test_targets: usize,
     tests_discovered: &'a [String],
     out_of_scope: &'a [DeclinedFunction],
+    ctfe_bodies_skipped: usize,
     skipped_oversize_mirs: &'a [(std::path::PathBuf, u64)],
     mir_parse_problems: &'a [MirParseProblem],
     skipped_no_harness: &'a [NoHarnessTarget],
@@ -1571,6 +1508,10 @@ fn error_report<'a>(
         candidates: &[],
         analyses: None,
         out_of_scope: partial.out_of_scope,
+        out_of_scope_summary: OutOfScopeSummary::new(
+            partial.out_of_scope,
+            partial.ctfe_bodies_skipped,
+        ),
         skipped_oversize_mirs: skipped,
         max_mir_size_mb: partial.max_mir_mb,
         mir_parse_problems: partial.mir_parse_problems,
@@ -1940,7 +1881,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
         Format::Junit => {
             print!(
                 "{}",
-                render_runtime_junit(&source.display().to_string(), &analysis, 0)
+                render_runtime_junit(&source.display().to_string(), &analysis, 0, None)
             );
         }
     }
@@ -2350,31 +2291,9 @@ fn format_inputs(conditions: &[String], row: &TruthTableRow) -> String {
         .join(", ")
 }
 
-/// Does this source-file path belong to the standard-library
-/// macro expansion namespace that rustc stamps at compile time?
-///
-/// The canonical shape is `/rustc/<hash>/library/<crate>/src/...`
-/// where `<crate>` is `core`, `std`, `alloc`, `proc_macro`, or a
-/// test-harness crate. Also catches cargo-registry proc-macro
-/// expansions whose spans point back to the macro definition
-/// site rather than the user call site. Candidates whose
-/// decision lives in those paths are macro hygiene bindings
-/// (`left_val` / `right_val` from `assert_eq!`, etc.), not
-/// user-written decisions, and should not be surfaced as MC/DC
-/// candidates.
-fn is_stdlib_macro_span(file: Option<&str>) -> bool {
-    let Some(f) = file else {
-        return false;
-    };
-    f.starts_with("/rustc/")
-        || f.contains("/library/core/")
-        || f.contains("/library/std/")
-        || f.contains("/library/alloc/")
-}
-
 fn print_out_of_scope_report(
     out: &mut dyn std::io::Write,
-    declined: &[impl std::fmt::Debug],
+    out_of_scope: &OutOfScopeSummary,
     skipped_oversize_mirs: &[(std::path::PathBuf, u64)],
     max_mir_mb: u64,
     mir_parse_problems: &[MirParseProblem],
@@ -2396,16 +2315,12 @@ fn print_out_of_scope_report(
             let _ = writeln!(out, "  {} ({})", t.target, t.package);
         }
     }
-    if !declined.is_empty() {
+    let lines = out_of_scope.text();
+    if !lines.is_empty() {
         let _ = writeln!(out);
-        let _ = writeln!(
-            out,
-            "Out of scope: {} function(s) have a decision in a shape \
-             the engine's current patterns do not recognise. The engine \
-             declined them rather than report a wrong verdict. See \
-             --format=json's `out_of_scope` for the full list.",
-            declined.len()
-        );
+        for line in lines {
+            let _ = writeln!(out, "{line}");
+        }
     }
     if !skipped_oversize_mirs.is_empty() {
         let _ = writeln!(out);
@@ -2463,7 +2378,12 @@ fn bool_glyph(v: bool) -> &'static str {
 /// The format is the de-facto JUnit XML that Jenkins, GitLab CI,
 /// GitHub Actions, Bazel/Buck2, and the other CIs the automotive
 /// industry already deploys render natively.
-fn render_runtime_junit(source: &str, analysis: &RuntimeAnalysis, not_measurable: usize) -> String {
+fn render_runtime_junit(
+    source: &str,
+    analysis: &RuntimeAnalysis,
+    not_measurable: usize,
+    out_of_scope: Option<&OutOfScopeSummary>,
+) -> String {
     use std::fmt::Write as _;
     let conditions = &analysis.matrix.conditions;
     let summary = CoverageSummary::new(Some(analysis), not_measurable);
@@ -2492,6 +2412,27 @@ fn render_runtime_junit(source: &str, analysis: &RuntimeAnalysis, not_measurable
     if let Some(pct) = summary.percentage {
         props.push(("floyd.percentage", format!("{pct:.0}")));
     }
+    let mut oos_props: Vec<(String, String)> = Vec::new();
+    if let Some(oos) = out_of_scope {
+        oos_props.push(("floyd.out_of_scope".into(), oos.total.to_string()));
+        for (reason, n) in &oos.by_reason {
+            oos_props.push((format!("floyd.out_of_scope.{reason}"), n.to_string()));
+        }
+        for (detail, n) in &oos.no_decision {
+            oos_props.push((
+                format!("floyd.out_of_scope.no_decision.{detail}"),
+                n.to_string(),
+            ));
+        }
+        oos_props.push((
+            "floyd.ctfe_bodies_skipped".into(),
+            oos.ctfe_bodies_skipped.to_string(),
+        ));
+    }
+    let props = props
+        .into_iter()
+        .map(|(n, v)| (n.to_string(), v))
+        .chain(oos_props);
     for (name, value) in props {
         let _ = writeln!(
             out,
@@ -2577,12 +2518,32 @@ mod tests {
 
     #[test]
     fn decline_json_report_carries_out_of_scope_and_candidates() {
-        let declined = vec![DeclinedFunction {
-            name: "crate::f".to_string(),
-            source_file: Some("src/lib.rs".to_string()),
-            line: Some(7),
-            reason: decision::DeclineReason::NonBoolLeaf,
-        }];
+        let declined = vec![
+            DeclinedFunction {
+                name: "crate::f".to_string(),
+                source_file: Some("src/lib.rs".to_string()),
+                line: Some(7),
+                reason: decision::DeclineReason::NonBoolLeaf,
+                detail: None,
+                conditions: None,
+            },
+            DeclinedFunction {
+                name: "crate::tests::t".to_string(),
+                source_file: Some("src/lib.rs".to_string()),
+                line: Some(40),
+                reason: decision::DeclineReason::NoDecision,
+                detail: Some(floyd::scope::NoDecisionDetail::StdMacroOnly),
+                conditions: None,
+            },
+            DeclinedFunction {
+                name: "crate::is_code_point".to_string(),
+                source_file: Some("src/lib.rs".to_string()),
+                line: Some(90),
+                reason: decision::DeclineReason::TooManyConditions,
+                detail: None,
+                conditions: Some(41),
+            },
+        ];
         let candidates = vec![
             CandidateSummary {
                 function_name: Some("crate::g".to_string()),
@@ -2635,6 +2596,7 @@ mod tests {
             candidates: &candidates,
             analyses: None,
             out_of_scope: &declined,
+            out_of_scope_summary: OutOfScopeSummary::new(&declined, 2),
             skipped_oversize_mirs: &skipped,
             max_mir_size_mb: 50,
             mir_parse_problems: &[],
@@ -2648,6 +2610,21 @@ mod tests {
         assert_eq!(v["out_of_scope"][0]["name"], "crate::f");
         assert_eq!(v["out_of_scope"][0]["line"], 7);
         assert_eq!(v["out_of_scope"][0]["reason"], "non_bool_leaf");
+        assert!(v["out_of_scope"][0].get("detail").is_none());
+        assert!(v["out_of_scope"][0].get("conditions").is_none());
+        assert_eq!(v["out_of_scope"][1]["reason"], "no_decision");
+        assert_eq!(v["out_of_scope"][1]["detail"], "std_macro_only");
+        assert_eq!(v["out_of_scope"][2]["reason"], "too_many_conditions");
+        assert_eq!(v["out_of_scope"][2]["conditions"], 41);
+        assert_eq!(
+            v["out_of_scope_summary"],
+            serde_json::json!({
+                "total": 3,
+                "by_reason": {"no_decision": 1, "non_bool_leaf": 1, "too_many_conditions": 1},
+                "no_decision": {"std_macro_only": 1},
+                "ctfe_bodies_skipped": 2
+            })
+        );
         assert_eq!(v["candidates"][0]["function_name"], "crate::g");
         assert_eq!(v["candidates"][0]["invoked"], false);
         assert_eq!(v["candidates"][0]["display_name"], "crate::g");
@@ -2928,7 +2905,7 @@ mod tests {
             analysis.condition_status.get("b"),
             Some(ConditionStatus::Ambiguous { tests }) if tests.len() == 5
         ));
-        let xml = render_runtime_junit("lib.rs", &analysis, 2);
+        let xml = render_runtime_junit("lib.rs", &analysis, 2, None);
         assert!(xml.contains(r#"type="AmbiguousCondition""#), "{xml}");
         assert!(xml.contains("(loop_0, loop_1, loop_2 (+2 more))"), "{xml}");
         assert!(!xml.contains("loop_3"), "{xml}");
@@ -2950,10 +2927,46 @@ mod tests {
             analysis.condition_status.get("b"),
             Some(ConditionStatus::Unexercised)
         ));
-        let xml = render_runtime_junit("lib.rs", &analysis, 0);
+        let xml = render_runtime_junit("lib.rs", &analysis, 0, None);
         assert!(xml.contains(r#"type="UnexercisedCondition""#), "{xml}");
         assert!(xml.contains(r#"<property name="floyd.percentage" value="50"/>"#));
         assert!(xml.contains(r#"<property name="floyd.unknown" value="0"/>"#));
+    }
+
+    #[test]
+    fn junit_properties_count_out_of_scope_by_reason() {
+        let analysis = ambiguous_analysis(0);
+        let declined = [
+            decision::DeclineReason::NoDecision,
+            decision::DeclineReason::UnsupportedShape,
+        ]
+        .into_iter()
+        .map(|reason| DeclinedFunction {
+            name: "f".into(),
+            source_file: None,
+            line: None,
+            reason,
+            detail: (reason == decision::DeclineReason::NoDecision)
+                .then_some(floyd::scope::NoDecisionDetail::DerivedImpl),
+            conditions: None,
+        })
+        .collect::<Vec<_>>();
+        let oos = OutOfScopeSummary::new(&declined, 3);
+        let xml = render_runtime_junit("lib.rs", &analysis, 0, Some(&oos));
+        for (name, value) in [
+            ("floyd.out_of_scope", "2"),
+            ("floyd.out_of_scope.no_decision", "1"),
+            ("floyd.out_of_scope.unsupported_shape", "1"),
+            ("floyd.out_of_scope.no_decision.derived_impl", "1"),
+            ("floyd.ctfe_bodies_skipped", "3"),
+        ] {
+            assert!(
+                xml.contains(&format!(r#"<property name="{name}" value="{value}"/>"#)),
+                "{name}: {xml}"
+            );
+        }
+        let xml = render_runtime_junit("lib.rs", &analysis, 0, None);
+        assert!(!xml.contains("floyd.out_of_scope"));
     }
 
     #[test]
@@ -3023,7 +3036,7 @@ mod tests {
         );
         assert!(ruled_out_note(&analysis, "b == 32").is_none());
 
-        let xml = render_runtime_junit("lib.rs", &analysis, 0);
+        let xml = render_runtime_junit("lib.rs", &analysis, 0, None);
         assert!(xml.contains(r#"type="UnexercisedCondition""#), "{xml}");
         assert!(xml.contains("never took b == 10=T (0T/8F)"), "{xml}");
 
@@ -3067,7 +3080,7 @@ mod tests {
                  [the matching row (a=T, b=T) -> T is already covered]"
             )
         );
-        let xml = render_runtime_junit("lib.rs", &analysis, 0);
+        let xml = render_runtime_junit("lib.rs", &analysis, 0, None);
         assert!(
             xml.contains(
                 "needs a test where (a=T, b=F) -&gt; F [the matching row (a=T, b=T) -&gt; T \
@@ -3114,6 +3127,7 @@ mod tests {
             test_targets: 2,
             tests_discovered: tests,
             out_of_scope: &[],
+            ctfe_bodies_skipped: 0,
             skipped_oversize_mirs: skipped,
             mir_parse_problems: &[],
             skipped_no_harness: no_harness,
@@ -3192,7 +3206,14 @@ mod tests {
         assert!(!no_candidates_line(&[], 3, 50).contains("max-mir-size"));
 
         let mut out = Vec::new();
-        print_out_of_scope_report(&mut out, &[] as &[DeclinedFunction], &skipped, 80, &[], &[]);
+        print_out_of_scope_report(
+            &mut out,
+            &OutOfScopeSummary::default(),
+            &skipped,
+            80,
+            &[],
+            &[],
+        );
         let out = String::from_utf8(out).unwrap();
         assert!(
             out.contains("above the 80 MB scalability threshold"),
@@ -3232,7 +3253,7 @@ mod tests {
         let mut out = Vec::new();
         print_out_of_scope_report(
             &mut out,
-            &[] as &[DeclinedFunction],
+            &OutOfScopeSummary::default(),
             &[],
             50,
             &problems,
