@@ -10,8 +10,10 @@
 //!   profile, which would attribute the child's evaluations to the
 //!   test, nor into the project directory.
 //! - The environment Floyd sets for its instrumented build
-//!   (`RUSTC_WRAPPER`, rustflags) must not reach the test, or a
-//!   `cargo`/`rustc` the test spawns builds instrumented programs.
+//!   (`RUSTC_WRAPPER`, rustflags, and with a stable compiler
+//!   `RUSTC_BOOTSTRAP` / `FLOYD_RUSTC_BOOTSTRAP`) must not reach the
+//!   test, or a `cargo`/`rustc` the test spawns builds instrumented
+//!   programs, or accepts unstable features it would refuse.
 //! - The crate's build script (`build.rs`) must not be instrumented:
 //!   cargo runs it in the package directory without
 //!   `LLVM_PROFILE_FILE`, so it would leave `default_*.profraw`
@@ -51,6 +53,11 @@ mod tests {
         "-Zmir-include-spans",
         "-Zcoverage-options",
     ];
+    /// Variables that leak whatever their value: Floyd sets them for
+    /// the instrumented build of a stable or beta compiler only, and
+    /// `cargo-floyd/tests/fixture_cases.rs` runs cargo-floyd with
+    /// `RUSTC_BOOTSTRAP` removed from its environment.
+    const BOOTSTRAP_VARS: &[&str] = &["RUSTC_BOOTSTRAP", "FLOYD_RUSTC_BOOTSTRAP"];
 
     /// Run directly by Floyd, and as a child of `spawned_and_spawner`.
     #[test]
@@ -87,6 +94,11 @@ mod tests {
                     leaked.push(format!("{var}={value}"));
                     break;
                 }
+            }
+        }
+        for var in BOOTSTRAP_VARS {
+            if let Some(value) = std::env::var_os(var) {
+                leaked.push(format!("{var}={}", value.to_string_lossy()));
             }
         }
         if !leaked.is_empty() {

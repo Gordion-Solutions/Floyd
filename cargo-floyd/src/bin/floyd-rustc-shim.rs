@@ -20,6 +20,18 @@
 //!
 //! The shim must be fast and side-effect-free: cargo invokes it
 //! once per compilation unit, including internal probe builds.
+//!
+//! The shim does not know or care which toolchain is in use: it runs
+//! whatever `rustc` cargo hands it. When the instrumented build uses
+//! a stable or beta compiler, cargo-floyd sets
+//! `FLOYD_RUSTC_BOOTSTRAP=1` (`floyd::toolchain::SHIM_BOOTSTRAP_ENV`)
+//! on the `cargo build`, and the shim runs that `rustc`, for every
+//! crate and probe, with `RUSTC_BOOTSTRAP=1` so it accepts Floyd's
+//! `-Z` flags. `RUSTC_BOOTSTRAP` is set on the `rustc` child only:
+//! cargo and the build scripts it runs never see it. (A build script
+//! that compiles a probe through `RUSTC_WRAPPER` does reach the shim,
+//! and its probe compiles as it would on nightly, the same as the
+//! rest of the instrumented build.)
 
 use std::env;
 use std::ffi::OsString;
@@ -75,17 +87,19 @@ fn main() {
         rustc_args.push(OsString::from("-Ccodegen-units=1"));
     }
 
-    let status = Command::new(&rustc_path)
-        .args(&rustc_args)
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!(
-                "floyd-rustc-shim: failed to exec real rustc at {}: {}",
-                rustc_path.to_string_lossy(),
-                e
-            );
-            exit(2);
-        });
+    let mut rustc = Command::new(&rustc_path);
+    rustc.args(&rustc_args);
+    if env::var_os(floyd::toolchain::SHIM_BOOTSTRAP_ENV).is_some_and(|v| v == "1") {
+        rustc.env("RUSTC_BOOTSTRAP", "1");
+    }
+    let status = rustc.status().unwrap_or_else(|e| {
+        eprintln!(
+            "floyd-rustc-shim: failed to exec real rustc at {}: {}",
+            rustc_path.to_string_lossy(),
+            e
+        );
+        exit(2);
+    });
     exit(status.code().unwrap_or(1));
 }
 

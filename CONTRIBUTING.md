@@ -73,7 +73,8 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
 ```
 
 If your change touches the runtime pipeline, also run the gated
-end-to-end tests (requires nightly + `llvm-tools-preview`):
+end-to-end tests (requires nightly and stable, each with
+`llvm-tools-preview`):
 
 ```sh
 cargo test --workspace -- --ignored

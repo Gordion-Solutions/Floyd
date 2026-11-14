@@ -13,6 +13,7 @@ Project page: <https://gordionsolutions.co.uk/software/#floyd>
 ```
 $ cd demo/restraint-controller && cargo floyd test
 floyd  runtime MC/DC analysis of /path/to/floyd/demo/restraint-controller/Cargo.toml
+Toolchain: nightly (rustc 1.101.0-nightly (708c94ef0 2026-11-03), nightly channel)
 
 Test targets: 3
 Tests discovered: 5
@@ -110,9 +111,11 @@ cargo floyd test
 ## Install
 
 ```sh
-# Nightly toolchain + LLVM coverage tools (one-time).
+# A toolchain with the LLVM coverage tools (one-time): nightly ...
 rustup install nightly
 rustup component add llvm-tools-preview --toolchain nightly
+# ... or stable.
+rustup component add llvm-tools-preview --toolchain stable
 
 # Floyd itself.
 cargo install cargo-floyd
@@ -121,8 +124,36 @@ cargo install cargo-floyd
 Then, inside any cargo project with `#[test]` functions:
 
 ```sh
-cargo floyd test
+cargo floyd test                       # nightly (the default)
+cargo floyd test --toolchain=stable    # or any rustup toolchain name
 ```
+
+Floyd needs two unstable compiler flags (`-Zcoverage-options` and
+`-Zmir-include-spans`). With a stable or beta compiler it sets
+`RUSTC_BOOTSTRAP=1` for the instrumented build only (on `rustc`
+itself, through Floyd's wrapper: not on cargo, build scripts or the
+tests it runs) and says so on stderr. The toolchain, its `rustc
+--version`, channel and whether `RUSTC_BOOTSTRAP` was used are
+recorded in the text report header, the JSON `toolchain` object and
+the JUnit `floyd.toolchain.*` properties. The `fixtures/mcdc-cases`
+regression suite gives identical verdicts on stable 1.99.1 and
+nightly 1.101. An older compiler can produce different MIR: on
+1.83.0 the engine declines three of the fixture's decisions it
+recognises on current compilers (they are listed in `out_of_scope`,
+not given a wrong verdict).
+
+**Ferrocene (untested).** Ferrocene, the ISO 26262-qualified Rust
+compiler, is installed with criticalup and has no rustup toolchain
+name. Floyd has not been tested with it. In principle: add the LLVM
+tools package to your `criticalup.toml` and run `criticalup install`,
+then run `cargo floyd test --toolchain=env`, which uses `$CARGO` /
+`$RUSTC` when set, otherwise the `cargo` and `rustc` on `PATH`, with
+no `+<name>` argument (`--toolchain=path:<dir>` names a directory
+holding `cargo` and `rustc` instead). Ferrocene reports a stable
+channel, so Floyd enables `RUSTC_BOOTSTRAP=1` for the instrumented
+build; whether that is acceptable under your qualification plan is
+for your safety case to decide, since the unstable flags are outside
+Ferrocene's qualified scope.
 
 Floyd builds the project's tests with `-Cinstrument-coverage
 -Zcoverage-options=branch,condition`, runs each test in isolation,
@@ -371,6 +402,8 @@ jobs:
       - run: cargo install cargo-floyd
       - name: Run Floyd
         run: cargo floyd test --format=junit > floyd-mcdc.xml
+        # On stable instead: dtolnay/rust-toolchain@stable with the
+        # same component, and `cargo floyd test --toolchain=stable`.
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4
@@ -389,6 +422,8 @@ floyd-mcdc:
     - cargo install cargo-floyd
   script:
     - cargo floyd test --format=junit > floyd-mcdc.xml
+  # Stable: image rust:latest, the same component, and
+  # `cargo floyd test --toolchain=stable --format=junit`.
   artifacts:
     when: always
     reports:
@@ -419,6 +454,7 @@ upload floyd-mcdc.xml`).
 | `--all-features`, `--no-default-features` | Passed to the instrumented build, as for `cargo test`. Crates whose test suite expects `cargo test --all-features` (such as `time`) need it. |
 | `--target-dir=<dir>` | The project's target directory, as for cargo (default: `CARGO_TARGET_DIR`, `build.target-dir`, else `target/`). The instrumented build goes into `<dir>/floyd`. |
 | `--all-candidates` | With `--format=json`, also analyse every measurable candidate, not only the selected one, and add them as `analyses`; the selected decision's report and the exit code are unchanged. Cargo projects only. |
+| `--toolchain=<name>\|env\|path:<dir>` | The compiler to build and read coverage with (default `nightly`; also `FLOYD_TOOLCHAIN`). `<name>` is a rustup toolchain, run as `cargo +<name>` / `rustc +<name>`. `env` uses `$CARGO` / `$RUSTC` when set (cargo sets `CARGO` for `cargo floyd`, so it is the cargo that launched Floyd), else `cargo` / `rustc` on `PATH`, with no `+<name>`; `path:<dir>` uses `<dir>/cargo` and `<dir>/rustc`. A stable or beta compiler gets `RUSTC_BOOTSTRAP=1` for the instrumented build only. `llvm-profdata` / `llvm-cov` come from that toolchain's sysroot. Recorded in every report (see [Toolchain](#toolchain)). |
 
 ### Build directory
 
@@ -426,7 +462,7 @@ Floyd builds the instrumented tests in its own directory,
 `<target>/floyd` (for example `target/floyd/`), never in the
 directory `cargo test` uses. Cargo does not see the instrumentation
 Floyd adds per crate as a change, so in a shared directory it would
-reuse plain test binaries left by `cargo +nightly test`; a separate
+reuse plain test binaries left by `cargo test`; a separate
 directory also keeps Floyd's build and yours from invalidating each
 other. A second `cargo floyd test` reuses the instrumented build.
 `target/floyd` sits inside `target/`, so an ignore rule for `target/`
@@ -435,7 +471,42 @@ already covers it; to speed up CI, cache it with the rest of
 `-Zcoverage-options` and `-Zmir-include-spans` go through cargo's
 rustflags (appended to `RUSTFLAGS` or `CARGO_ENCODED_RUSTFLAGS` when
 you set one, otherwise to `build.rustflags`), so cargo rebuilds when
-they change.
+they change. Switching `--toolchain` also rebuilds, since cargo
+fingerprints the compiler version.
+
+### Toolchain
+
+The toolchain is recorded as qualification evidence. The text report
+header has a line such as
+
+```text
+Toolchain: stable (rustc 1.99.1 (58cf8f9c3 2026-10-13), stable channel, RUSTC_BOOTSTRAP=1 for the instrumented build)
+```
+
+the JSON report a `toolchain` object (`null` only when the toolchain
+could not be probed, a `setup_failed` run):
+
+```json
+"toolchain": {
+  "name": "stable",
+  "version": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "release": "1.99.1",
+  "host": "x86_64-apple-darwin",
+  "channel": "stable",
+  "rustc_bootstrap": true
+}
+```
+
+and the JUnit suite the properties `floyd.toolchain`,
+`floyd.toolchain.version`, `.release`, `.host`, `.channel` and
+`.rustc_bootstrap`. `channel` is read from `rustc --version
+--verbose` (`release:`): `nightly`, `dev`, `beta` or `stable`
+(Ferrocene included). `RUSTC_BOOTSTRAP=1` is set for stable and beta
+only, through the `floyd-rustc-shim` wrapper, on the `rustc`
+processes of the instrumented build; cargo, build scripts and the
+tests Floyd runs never see it. Library users:
+`floyd::toolchain::Toolchain::detect` and the `*_with_toolchain`
+functions of `floyd::instrument` and `floyd::runner`.
 
 ### Errors
 

@@ -14,11 +14,16 @@
 //! analysed conditions, `summary.percentage` and the exit code.
 //!
 //! Tagged `#[ignore]` because it needs the nightly toolchain with
-//! `llvm-tools-preview` (cargo-floyd builds with `cargo +nightly`).
-//! Run with:
+//! `llvm-tools-preview` (cargo-floyd builds with `cargo +nightly` by
+//! default), and for
+//! [`stable_toolchain_gives_the_same_verdicts_and_leaks_no_bootstrap`]
+//! the stable toolchain with `llvm-tools-preview` too. Run with:
 //! ```text
 //! cargo test -p cargo-floyd --test fixture_cases -- --ignored
 //! ```
+//! cargo-floyd reads `FLOYD_TOOLCHAIN`, which these runs inherit, so
+//! `FLOYD_TOOLCHAIN=stable cargo test ... -- --ignored` runs every
+//! check against another toolchain.
 
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -55,7 +60,11 @@ fn target_dir() -> PathBuf {
 /// and that no process, the build script or a child a test spawned,
 /// left a `*.profraw` in the fixture directory.
 fn floyd(format: &str, extra: &[&str]) -> Run {
-    let tag = extra.join("_").replace(['=', '-', ':'], "");
+    let tag: String = extra
+        .join("_")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
     let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let marker = tmp.join(format!(
         "no-harness-ran-{format}-{tag}-{}",
@@ -75,6 +84,9 @@ fn floyd(format: &str, extra: &[&str]) -> Run {
         .env("CARGO_TARGET_DIR", target_dir())
         .env("MCDC_CASES_NO_HARNESS_MARKER", &marker)
         .env("MCDC_CASES_LEAK_MARKER", &leak)
+        // Any `RUSTC_BOOTSTRAP` a test or the build script sees then
+        // comes from Floyd (see `child_process.rs`, `build.rs`).
+        .env_remove("RUSTC_BOOTSTRAP")
         .output()
         .expect("run cargo-floyd");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -939,4 +951,88 @@ fn a_child_process_is_not_attributed_to_the_test_that_spawned_it() {
         run.json["summary"]
     );
     assert_eq!(run.code, 2);
+}
+
+/// Candidate verdicts of a whole-crate run, keyed by function name:
+/// `invoked`, observation count, `not_measurable.reason`, `lift`.
+fn candidate_verdicts(run: &Run) -> BTreeSet<String> {
+    candidates(run)
+        .iter()
+        .map(|c| {
+            format!(
+                "{} invoked={} observations={} not_measurable={} lift={}",
+                c["function_name"],
+                c["invoked"],
+                c["observations"],
+                c["not_measurable"]["reason"],
+                c["lift"]
+            )
+        })
+        .collect()
+}
+
+/// `out_of_scope` entries as `name: reason`.
+fn declined(run: &Run) -> BTreeSet<String> {
+    out_of_scope(run)
+        .iter()
+        .map(|d| format!("{}: {}", d["name"], d["reason"]))
+        .collect()
+}
+
+#[test]
+#[ignore = "requires nightly and stable Rust + llvm-tools-preview component"]
+fn stable_toolchain_gives_the_same_verdicts_and_leaks_no_bootstrap() {
+    // A stable compiler accepts Floyd's `-Z` flags only with
+    // `RUSTC_BOOTSTRAP=1`, which cargo-floyd routes through the shim
+    // to `rustc` alone. `floyd` fails the run if a test saw it (the
+    // leak marker) and the build script panics if it saw it. Its own
+    // target directory, so the toolchain switch does not rebuild the
+    // shared one under the other tests.
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("mcdc-cases-stable-target");
+    let target_arg = format!("--target-dir={}", target.display());
+    let run = floyd("json", &["--toolchain=stable", &target_arg]);
+    let tc = &run.json["toolchain"];
+    assert_eq!(tc["name"], "stable", "toolchain: {tc}");
+    assert_eq!(tc["channel"], "stable", "toolchain: {tc}");
+    assert_eq!(tc["rustc_bootstrap"], true, "toolchain: {tc}");
+    let release = tc["release"].as_str().expect("release");
+    assert!(!release.contains('-'), "stable release {release}");
+    assert!(
+        tc["version"]
+            .as_str()
+            .is_some_and(|v| v.starts_with(&format!("rustc {release} "))),
+        "toolchain: {tc}"
+    );
+    assert!(
+        run.stderr.contains(&format!(
+            "toolchain stable {release} is not nightly; enabling RUSTC_BOOTSTRAP=1 for the \
+             instrumented build only"
+        )),
+        "stderr:\n{}",
+        run.stderr
+    );
+
+    // The verdicts match the default toolchain's run.
+    let reference = full();
+    assert_eq!(candidate_verdicts(&run), candidate_verdicts(reference));
+    assert_eq!(declined(&run), declined(reference));
+    assert_eq!(run.json["analysis"], reference.json["analysis"]);
+    assert_eq!(run.json["summary"], reference.json["summary"]);
+    assert_eq!(run.code, reference.code);
+}
+
+#[test]
+#[ignore = "requires nightly Rust + llvm-tools-preview component"]
+fn the_default_toolchain_is_recorded_without_bootstrap() {
+    let run = full();
+    let tc = &run.json["toolchain"];
+    if std::env::var_os("FLOYD_TOOLCHAIN").is_none() {
+        assert_eq!(tc["name"], "nightly", "toolchain: {tc}");
+        assert_eq!(tc["channel"], "nightly", "toolchain: {tc}");
+        assert_eq!(tc["rustc_bootstrap"], false, "toolchain: {tc}");
+        assert!(!run.stderr.contains("RUSTC_BOOTSTRAP"), "{}", run.stderr);
+    }
+    assert!(tc["version"]
+        .as_str()
+        .is_some_and(|v| v.starts_with("rustc ")));
 }

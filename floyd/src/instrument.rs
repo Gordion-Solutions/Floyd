@@ -1,6 +1,8 @@
 //! Compile Rust sources with coverage + MIR instrumentation.
 //!
-//! Per ADR-0002, Floyd uses nightly rustc with:
+//! Per ADR-0002, Floyd uses rustc with the unstable flags below. They
+//! need a nightly compiler, or a stable/beta one (Ferrocene included)
+//! run with `RUSTC_BOOTSTRAP=1`; see [`crate::toolchain`]:
 //! - `--emit=mir -Zmir-include-spans` to obtain span-annotated MIR for
 //!   the static decision recovery.
 //! - `-Cinstrument-coverage -Zcoverage-options=branch,condition` to
@@ -12,8 +14,8 @@
 //! test target enumeration, dependency build) lands as a separate
 //! `compile_cargo_project` entry point in a follow-up commit.
 
+use crate::toolchain::{Toolchain, ToolchainSpec, SHIM_BOOTSTRAP_ENV};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Result of a successful [`compile_with_coverage`] invocation.
 #[derive(Debug, Clone)]
@@ -61,11 +63,22 @@ impl std::error::Error for InstrumentError {}
 /// Useful when you want static decision analysis without producing
 /// or running an instrumented binary — typical for the corpus
 /// patterns (no `fn main`). Uses `-Zmir-include-spans` so source
-/// spans are available for any future correlate step.
+/// spans are available for any future correlate step. Uses the
+/// default toolchain (`rustc +nightly`); see [`emit_mir_with_toolchain`].
 pub fn emit_mir(source: &Path, workdir: &Path) -> Result<PathBuf, InstrumentError> {
+    emit_mir_with_toolchain(source, workdir, &default_toolchain())
+}
+
+/// [`emit_mir`] with the given toolchain.
+pub fn emit_mir_with_toolchain(
+    source: &Path,
+    workdir: &Path,
+    toolchain: &Toolchain,
+) -> Result<PathBuf, InstrumentError> {
     let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
     let mir_path = workdir.join(format!("{stem}.mir"));
-    rustc_nightly(
+    rustc_run(
+        toolchain,
         "rustc --emit=mir (lib)",
         &[
             "--edition",
@@ -146,7 +159,7 @@ pub const FINGERPRINTED_RUSTFLAGS: &[&str] =
 /// Cargo's fingerprint does not cover what the `RUSTC_WRAPPER` shim
 /// adds, so building into the project's own target directory would
 /// reuse plain, uninstrumented test binaries left there by `cargo
-/// +nightly test` (no `.mir`, no coverage map). A directory only
+/// test` (no `.mir`, no coverage map). A directory only
 /// Floyd builds in never holds such binaries, and keeps Floyd's
 /// build from invalidating the user's.
 pub fn floyd_target_dir(project_target_dir: &Path) -> PathBuf {
@@ -158,7 +171,7 @@ pub fn floyd_target_dir(project_target_dir: &Path) -> PathBuf {
 ///
 /// Internally:
 /// 1. Probes `cargo metadata` to discover the workspace root.
-/// 2. Runs `cargo +nightly build --tests --message-format=json
+/// 2. Runs `cargo +<toolchain> build --tests --message-format=json
 ///    --target-dir <target>/floyd` ([`floyd_target_dir`]) with
 ///    [`FINGERPRINTED_RUSTFLAGS`] added to cargo's rustflags. The
 ///    caller sets `RUSTC_WRAPPER` to the `floyd-rustc-shim`, which adds
@@ -169,7 +182,8 @@ pub fn floyd_target_dir(project_target_dir: &Path) -> PathBuf {
 ///
 /// `manifest_path` may be a `Cargo.toml` path or a directory
 /// containing one; it gets passed through to cargo as
-/// `--manifest-path`. Requires the nightly toolchain.
+/// `--manifest-path`. Uses the default toolchain (`cargo +nightly`);
+/// see [`compile_cargo_project_with_toolchain`] to choose another.
 pub fn compile_cargo_project(manifest_path: &Path) -> Result<CargoBuildResult, InstrumentError> {
     compile_cargo_project_with_args(manifest_path, &[])
 }
@@ -227,11 +241,47 @@ pub fn compile_cargo_project_in(
 /// instead of `default_*.profraw` in its working directory (the
 /// project directory). Build scripts are not instrumented (see the
 /// shim).
+///
+/// Uses the default toolchain (`cargo +nightly`, not probed); see
+/// [`compile_cargo_project_with_toolchain`].
 pub fn compile_cargo_project_wrapped(
     manifest_path: &Path,
     cargo_args: &[String],
     target_dir: Option<&Path>,
     rustc_wrapper: Option<&Path>,
+) -> Result<CargoBuildResult, InstrumentError> {
+    compile_cargo_project_with_toolchain(
+        manifest_path,
+        cargo_args,
+        target_dir,
+        rustc_wrapper,
+        &default_toolchain(),
+    )
+}
+
+/// The toolchain of the functions that predate toolchain selection:
+/// `nightly`, taken to be a nightly compiler without probing it.
+fn default_toolchain() -> Toolchain {
+    Toolchain::assumed(ToolchainSpec::default())
+}
+
+/// [`compile_cargo_project_wrapped`] with `cargo` and `rustc` from
+/// `toolchain` (`cargo +<name>`, or the `env` / `path:` binaries with
+/// `RUSTC` naming the toolchain's `rustc`).
+///
+/// When [`Toolchain::bootstrap`] is set (a stable or beta compiler),
+/// the `cargo build` asks the `rustc_wrapper` shim, through
+/// [`SHIM_BOOTSTRAP_ENV`], to run `rustc` with `RUSTC_BOOTSTRAP=1`, so
+/// the variable reaches the compiler and nothing else: not cargo, not
+/// the build scripts cargo runs, not the tests run afterwards. Without
+/// a wrapper the `cargo build` itself gets `RUSTC_BOOTSTRAP=1`, which
+/// its build scripts then inherit.
+pub fn compile_cargo_project_with_toolchain(
+    manifest_path: &Path,
+    cargo_args: &[String],
+    target_dir: Option<&Path>,
+    rustc_wrapper: Option<&Path>,
+    toolchain: &Toolchain,
 ) -> Result<CargoBuildResult, InstrumentError> {
     let manifest = if manifest_path.is_dir() {
         manifest_path.join("Cargo.toml")
@@ -246,9 +296,9 @@ pub fn compile_cargo_project_wrapped(
     }
 
     // Step 1: cargo metadata to discover workspace.
-    let metadata_out = Command::new("cargo")
+    let metadata_out = toolchain
+        .cargo_command()
         .args([
-            "+nightly",
             "metadata",
             "--no-deps",
             "--format-version=1",
@@ -321,34 +371,14 @@ pub fn compile_cargo_project_wrapped(
             })?,
     };
     let floyd_target = floyd_target_dir(&project_target);
-    let mut build = Command::new("cargo");
-    build
-        .args([
-            "+nightly",
-            "build",
-            "--tests",
-            "--message-format=json",
-            "--manifest-path",
-        ])
-        .arg(&manifest)
-        .arg("--target-dir")
-        .arg(&floyd_target);
-    if let Some(wrapper) = rustc_wrapper {
-        build.env("RUSTC_WRAPPER", wrapper);
-    }
     let build_profiles = floyd_target.join(BUILD_PROFILE_SUBDIR);
-    build.env("LLVM_PROFILE_FILE", build_profiles.join("%p-%m.profraw"));
-    match rustflags_route(
-        std::env::var_os("CARGO_ENCODED_RUSTFLAGS"),
-        std::env::var_os("RUSTFLAGS"),
-    ) {
-        RustflagsRoute::Env(key, value) => {
-            build.env(key, value);
-        }
-        RustflagsRoute::Config(arg) => {
-            build.arg("--config").arg(arg);
-        }
-    }
+    let mut build = instrumented_build_command(
+        toolchain,
+        &manifest,
+        &floyd_target,
+        rustc_wrapper,
+        &build_profiles,
+    );
     let build_out = build.args(cargo_args).output();
     let _ = std::fs::remove_dir_all(&build_profiles);
     let build_out = build_out.map_err(|e| {
@@ -468,6 +498,62 @@ fn sort_test_artifacts(artifacts: &mut [TestArtifact]) {
     });
 }
 
+/// The instrumented `cargo build --tests` command, before the
+/// caller's extra cargo arguments: `RUSTC_WRAPPER`, the bootstrap
+/// variable (see [`bootstrap_var`]), `LLVM_PROFILE_FILE` under
+/// `build_profiles` and [`FINGERPRINTED_RUSTFLAGS`] are set on this
+/// one command, never in Floyd's own environment.
+fn instrumented_build_command(
+    toolchain: &Toolchain,
+    manifest: &Path,
+    floyd_target: &Path,
+    rustc_wrapper: Option<&Path>,
+    build_profiles: &Path,
+) -> std::process::Command {
+    let mut build = toolchain.cargo_command();
+    build
+        .args([
+            "build",
+            "--tests",
+            "--message-format=json",
+            "--manifest-path",
+        ])
+        .arg(manifest)
+        .arg("--target-dir")
+        .arg(floyd_target);
+    if let Some(wrapper) = rustc_wrapper {
+        build.env("RUSTC_WRAPPER", wrapper);
+    }
+    if toolchain.bootstrap {
+        build.env(bootstrap_var(rustc_wrapper.is_some()), "1");
+    }
+    build.env("LLVM_PROFILE_FILE", build_profiles.join("%p-%m.profraw"));
+    match rustflags_route(
+        std::env::var_os("CARGO_ENCODED_RUSTFLAGS"),
+        std::env::var_os("RUSTFLAGS"),
+    ) {
+        RustflagsRoute::Env(key, value) => {
+            build.env(key, value);
+        }
+        RustflagsRoute::Config(arg) => {
+            build.arg("--config").arg(arg);
+        }
+    }
+    build
+}
+
+/// The variable that makes the instrumented build's `rustc` accept
+/// `-Z` flags: [`SHIM_BOOTSTRAP_ENV`], which the wrapper shim turns
+/// into `RUSTC_BOOTSTRAP=1` on `rustc` alone, or `RUSTC_BOOTSTRAP`
+/// itself when there is no wrapper.
+fn bootstrap_var(has_wrapper: bool) -> &'static str {
+    if has_wrapper {
+        SHIM_BOOTSTRAP_ENV
+    } else {
+        "RUSTC_BOOTSTRAP"
+    }
+}
+
 /// How [`FINGERPRINTED_RUSTFLAGS`] reach cargo.
 #[derive(Debug, PartialEq, Eq)]
 enum RustflagsRoute {
@@ -515,16 +601,27 @@ fn rustflags_route(
 /// The `--test` flag wraps the source in libtest's test runner so
 /// `#[test]` functions become individually invocable via
 /// `--exact <name>`. Used by `cargo-floyd test` (runtime mode) to
-/// drive per-test profraw collection.
+/// drive per-test profraw collection. Uses the default toolchain;
+/// see [`compile_test_target_with_toolchain`].
 pub fn compile_test_target(
     source: &Path,
     workdir: &Path,
+) -> Result<InstrumentResult, InstrumentError> {
+    compile_test_target_with_toolchain(source, workdir, &default_toolchain())
+}
+
+/// [`compile_test_target`] with the given toolchain.
+pub fn compile_test_target_with_toolchain(
+    source: &Path,
+    workdir: &Path,
+    toolchain: &Toolchain,
 ) -> Result<InstrumentResult, InstrumentError> {
     let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
     let mir_path = workdir.join(format!("{stem}.mir"));
     let binary_path = workdir.join(stem);
 
-    rustc_nightly(
+    rustc_run(
+        toolchain,
         "rustc --test --emit=mir",
         &[
             "--edition",
@@ -539,7 +636,8 @@ pub fn compile_test_target(
         source,
     )?;
 
-    rustc_nightly(
+    rustc_run(
+        toolchain,
         "rustc --test -Cinstrument-coverage",
         &[
             "--edition",
@@ -564,24 +662,36 @@ pub fn compile_test_target(
 /// runtime coverage instrumentation enabled.
 ///
 /// Runs two rustc invocations:
-/// 1. `rustc +nightly --emit=mir -Zmir-include-spans` — writes the
+/// 1. `rustc +<toolchain> --emit=mir -Zmir-include-spans` — writes the
 ///    MIR text into `workdir/<stem>.mir`.
-/// 2. `rustc +nightly -Cinstrument-coverage -Zcoverage-options=branch,condition`
+/// 2. `rustc +<toolchain> -Cinstrument-coverage -Zcoverage-options=branch,condition`
 ///    — produces the executable at `workdir/<stem>`.
 ///
 /// Returns both paths so the caller can hand them to
 /// [`crate::mir::parse_text`] and [`crate::runner`] respectively.
 ///
-/// Requires a nightly toolchain reachable via `rustc +nightly`.
+/// Uses the default toolchain (`rustc +nightly`); see
+/// [`compile_with_coverage_with_toolchain`].
 pub fn compile_with_coverage(
     source: &Path,
     workdir: &Path,
+) -> Result<InstrumentResult, InstrumentError> {
+    compile_with_coverage_with_toolchain(source, workdir, &default_toolchain())
+}
+
+/// [`compile_with_coverage`] with the given toolchain (and
+/// `RUSTC_BOOTSTRAP=1` on both `rustc` runs for a stable or beta one).
+pub fn compile_with_coverage_with_toolchain(
+    source: &Path,
+    workdir: &Path,
+    toolchain: &Toolchain,
 ) -> Result<InstrumentResult, InstrumentError> {
     let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
     let mir_path = workdir.join(format!("{stem}.mir"));
     let binary_path = workdir.join(stem);
 
-    rustc_nightly(
+    rustc_run(
+        toolchain,
         "rustc --emit=mir",
         &[
             "--edition",
@@ -595,7 +705,8 @@ pub fn compile_with_coverage(
         source,
     )?;
 
-    rustc_nightly(
+    rustc_run(
+        toolchain,
         "rustc -Cinstrument-coverage",
         &[
             "--edition",
@@ -615,14 +726,14 @@ pub fn compile_with_coverage(
     })
 }
 
-fn rustc_nightly(
+fn rustc_run(
+    toolchain: &Toolchain,
     stage: &'static str,
     flags: &[&str],
     output: &Path,
     source: &Path,
 ) -> Result<(), InstrumentError> {
-    let mut cmd = Command::new("rustc");
-    cmd.arg("+nightly");
+    let mut cmd = toolchain.rustc_command();
     for f in flags {
         cmd.arg(f);
     }
@@ -681,6 +792,59 @@ mod tests {
                 "-Zcoverage-options=branch,condition -Zmir-include-spans".into()
             )
         );
+    }
+
+    fn build_env(cmd: &std::process::Command, key: &str) -> Option<String> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+    }
+
+    fn toolchain(release: &str) -> Toolchain {
+        let text = format!("rustc {release} (x 2026-11-01)\nrelease: {release}\n");
+        Toolchain::from_version(
+            ToolchainSpec::Rustup("tc".into()),
+            crate::toolchain::VersionInfo::parse(&text).unwrap(),
+        )
+    }
+
+    /// A stable compiler's build asks the shim for `RUSTC_BOOTSTRAP`
+    /// and does not set it on cargo; a nightly build sets neither.
+    #[test]
+    fn bootstrap_is_set_on_the_instrumented_build_only_when_needed() {
+        let build = |tc: &Toolchain, wrapper: Option<&Path>| {
+            instrumented_build_command(
+                tc,
+                Path::new("/p/Cargo.toml"),
+                Path::new("/p/target/floyd"),
+                wrapper,
+                Path::new("/p/target/floyd/build-profraw"),
+            )
+        };
+        let shim = Path::new("/bin/floyd-rustc-shim");
+        let stable = toolchain("1.99.1");
+        let cmd = build(&stable, Some(shim));
+        assert_eq!(
+            build_env(&cmd, "FLOYD_RUSTC_BOOTSTRAP").as_deref(),
+            Some("1")
+        );
+        assert_eq!(build_env(&cmd, "RUSTC_BOOTSTRAP"), None);
+        assert_eq!(
+            build_env(&cmd, "RUSTC_WRAPPER").as_deref(),
+            Some("/bin/floyd-rustc-shim")
+        );
+        assert_eq!(cmd.get_args().next().unwrap(), "+tc");
+        let cmd = build(&stable, None);
+        assert_eq!(build_env(&cmd, "RUSTC_BOOTSTRAP").as_deref(), Some("1"));
+        assert_eq!(build_env(&cmd, "FLOYD_RUSTC_BOOTSTRAP"), None);
+        let beta = toolchain("1.100.0-beta.2");
+        assert!(build_env(&build(&beta, Some(shim)), "FLOYD_RUSTC_BOOTSTRAP").is_some());
+        for tc in [toolchain("1.101.0-nightly"), default_toolchain()] {
+            let cmd = build(&tc, Some(shim));
+            assert_eq!(build_env(&cmd, "FLOYD_RUSTC_BOOTSTRAP"), None);
+            assert_eq!(build_env(&cmd, "RUSTC_BOOTSTRAP"), None);
+        }
     }
 
     #[test]
