@@ -7,6 +7,55 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## Unreleased
 
+### Added
+
+- **Flow-decomposition rule for multi-evaluation tests.** A test
+  that evaluated a decision several times, with two or more
+  conditions both true and false on a decision that is not a tree,
+  was always ambiguous. Floyd now treats the test's branch counters
+  as linear equations on how many evaluations took each path
+  through the decision, enumerates every whole-number solution, and
+  credits a condition vector only for a path that every solution
+  takes (a condition never reached, or never true or never false,
+  excludes every path through that edge). A unique solution gives
+  every vector its exact count; otherwise the paths common to all
+  solutions are credited with their least count and the rest of the
+  test stays an ambiguous remainder with the counters the vectors do
+  not account for. Both carry `"resolved_by": "flow_decomposition"`;
+  the text report marks lower-bound counts `at least N evaluations`
+  and the remainder `M evaluations not attributable to a vector (N
+  attributed to the vectors above)`; the remainder carries
+  `attributed_evaluations` in JSON, and a `ruled_out` entry computed
+  from a remainder has `"remainder": true`. An ambiguous observation
+  the rule enumerated lists its possible splits as `decompositions`.
+- **Exercised without an identifiable pair.** When every
+  decomposition of one multi-evaluation test, together with all
+  condition vectors, completes some independence pair for a
+  condition, but not the same pair, the condition is EXERCISED: a
+  pair provably occurred, though which one is unknown. JSON status
+  `ExercisedUnidentified` (`pair_candidates`, `pair_identifiable:
+  false`, `test`, `decompositions`); text `EXERCISED via one of:
+  (pair) | (pair)  [pair not uniquely identifiable: N decompositions
+  ...]`; JUnit a passing testcase with that text in `<system-out>`
+  and a `floyd.pair_identifiable=false` property. It counts as
+  exercised in the summary, percentage and exit code.
+- On chrono 0.4, `NaiveTime::from_hms_nano_opt` goes from 2 exercised
+  and 4 unknown to 6 of 6 exercised: `test_rfc3339` (53 evaluations)
+  now resolves to four vectors, and `nano >= 2000000000` is exercised
+  without an identifiable pair (`test_time_from_hms_micro`'s counters
+  admit two decompositions, each completing a different pair).
+
+### Changed
+
+- **UNKNOWN wording.** The reason now reads "the rows an independence
+  pair still needs are possible only in N test(s) that evaluated the
+  decision more than once, whose counters do not attribute those
+  rows to condition vectors", and a partly resolved test is named
+  with what was attributed (`9 evaluations: 7 attributed to 2
+  vector(s), 2 not attributable to a vector`). The JUnit failure
+  message uses the same text. The fixture `dag_or_and`'s `c` is now
+  exercised without an identifiable pair (was unknown).
+
 ### Fixed
 
 - **Conditions are listed in source order.** A decision's conditions

@@ -60,15 +60,18 @@ pub fn and_or_tree(a: bool, b: bool, c: bool) -> bool {
 /// (F,T,F) -> F, so a = [1 T, 1 F], b = [1 T, 0 F], c = [1 T, 1 F].
 /// Not a tree: `c` is reached both from `a = T` and from
 /// `a = F, b = T`, and (T,-,F) + (F,T,T) leaves the same counters,
-/// so the test is ambiguous. `a`'s and `b`'s pairs both need
-/// (F,F,-) -> F, and no test ever made `b` false.
+/// so the test is ambiguous: no vector is credited. `a`'s and `b`'s
+/// pairs both need (F,F,-) -> F, and no test ever made `b` false.
+/// Each of the two decompositions completes a (different) masking
+/// pair for `c`: (T,-,T) / (F,T,F) or (T,-,F) / (F,T,T).
 ///
 /// Expected (`--only=dag_or_and`): one ambiguous observation
 /// (`evaluations: 2`, empty `inputs`, `result: null`, the raw
-/// `counts`); `c` `UNKNOWN`; `a` and `b` `UNEXERCISED`, with
-/// `analysis.ruled_out.b` naming `dag_or_and_loop`'s zero `b = F`
-/// counter; `summary.unknown == 1`, `summary.percentage == null`,
-/// text output says "no percentage", exit code 2.
+/// `counts`, both `decompositions`); `c` `ExercisedUnidentified`
+/// (two `pair_candidates`, `pair_identifiable: false`); `a` and `b`
+/// `UNEXERCISED`, with `analysis.ruled_out.b` naming
+/// `dag_or_and_loop`'s zero `b = F` counter; `summary.unknown == 0`,
+/// percentage 33, exit code 2.
 pub fn dag_or_and(a: bool, b: bool, c: bool) -> Option<u8> {
     if (a || b) && c {
         return None;
@@ -88,6 +91,49 @@ pub fn dag_or_and(a: bool, b: bool, c: bool) -> Option<u8> {
 /// `evaluations: 3` and `resolved_by: "single_two_sided"`. No test
 /// made the decision false, so no condition is exercised.
 pub fn dag_one_two_sided(a: bool, b: bool, c: bool) -> Option<u8> {
+    if (a || b) && c {
+        return None;
+    }
+    Some(1)
+}
+
+/// `(a || b) && c`, the shape of `dag_or_and`, evaluated three
+/// times by `dag_zero_inflow_loop`: (T,-,T) -> T, (T,-,F) -> F and
+/// (F,F,-) -> F, so a = [2 T, 1 F], b = [0 T, 1 F], c = [1 T, 1 F].
+/// Not a tree and three conditions two-sided, so neither the tree
+/// rule nor the single-two-sided rule applies. But `b` was never
+/// true, so no evaluation took a walk through `b = T`: both of `c`'s
+/// evaluations came from `a = T`, and the counters determine all
+/// three vectors (flow decomposition). `dag_zero_inflow_ftt` adds
+/// (F,T,T) -> T, which `b`'s pair needs.
+///
+/// Expected (`--only=dag_zero_inflow`): four vector observations,
+/// none ambiguous; the loop's three each `evaluations: 1` and
+/// `resolved_by: "flow_decomposition"`; every condition exercised,
+/// `summary.percentage == 100`, exit 0.
+pub fn dag_zero_inflow(a: bool, b: bool, c: bool) -> Option<u8> {
+    if (a || b) && c {
+        return None;
+    }
+    Some(1)
+}
+
+/// `(a || b) && c` evaluated three times by `dag_partial_flow_loop`:
+/// (T,-,T) -> T, (F,T,F) -> F and (F,F,-) -> F, so a = [1 T, 2 F],
+/// b = [1 T, 1 F], c = [1 T, 1 F]. (T,-,F) + (F,T,T) + (F,F,-)
+/// leaves the same counters, so the counters determine only
+/// (F,F,-) (the one walk that tests `b = F`, taken once in both
+/// decompositions).
+///
+/// Expected (`--only=dag_partial_flow`): two observations of the
+/// loop test, both `resolved_by: "flow_decomposition"`: the vector
+/// `a=F, b=F -> F` (`evaluations: 1`) and an ambiguous remainder
+/// (`evaluations: 2`, `attributed_evaluations: 1`, counts
+/// a = [1, 1], b = [1, 0], c = [1, 1], two `decompositions`); `a`
+/// and `b` `UNKNOWN` (one decomposition completes no pair for them),
+/// `c` `ExercisedUnidentified`; `summary.percentage == null`, exit
+/// code 2.
+pub fn dag_partial_flow(a: bool, b: bool, c: bool) -> Option<u8> {
     if (a || b) && c {
         return None;
     }
@@ -170,6 +216,41 @@ mod tests {
             }
         }
         assert_eq!(hits, 3);
+    }
+
+    #[test]
+    fn dag_zero_inflow_loop() {
+        let mut hits = 0;
+        for (a, b, c) in [
+            (true, false, true),
+            (true, true, false),
+            (false, false, true),
+        ] {
+            if dag_zero_inflow(a, b, c).is_none() {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn dag_zero_inflow_ftt() {
+        assert!(dag_zero_inflow(false, true, true).is_none());
+    }
+
+    #[test]
+    fn dag_partial_flow_loop() {
+        let mut hits = 0;
+        for (a, b, c) in [
+            (true, false, true),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            if dag_partial_flow(a, b, c).is_none() {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 1);
     }
 
     #[test]

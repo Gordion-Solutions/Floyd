@@ -277,9 +277,37 @@ vector from a test only when
   them. Where both this and the tree rule apply they give the same
   vectors, so Floyd tries the tree rule first for its exact
   per-vector counts.
+- otherwise, for any decision shape, the counters are linear
+  equations on how many evaluations took each path through the
+  decision (each condition's true count is the number of
+  evaluations on paths that test it true, and so on), and Floyd
+  enumerates every whole-number solution. A path is credited only
+  if *every* solution takes it. A condition that was never reached
+  (both counters 0), or never took a value, rules out every path
+  through that edge, which often leaves one solution. For example,
+  chrono's `hour >= 24 || min >= 60 || sec >= 60 || (nano >=
+  1_000_000_000 && sec != 59) || nano >= 2_000_000_000`, evaluated 53
+  times by `test_rfc3339` with `hour >= 24`, `min >= 60` and
+  `sec >= 60` each true once and `sec != 59` never reached, has one
+  solution: each of the three `true` paths once and the all-false
+  path 50 times. These vectors carry `"resolved_by":
+  "flow_decomposition"` and their own counts. When the solutions
+  differ, the paths every solution takes are still credited, with
+  the least count any solution gives them (the text report says
+  `at least N evaluations`), and what they do not account for stays
+  an ambiguous observation of the remaining evaluations and
+  counters, also tagged `flow_decomposition`, with
+  `attributed_evaluations` saying how many evaluations the vectors
+  account for (`M evaluations not attributable to a vector (N
+  attributed to the vectors above)` in the text report). Paths that
+  only some solutions take are never credited as vectors. The
+  ambiguous observation lists the possible splits of the remaining
+  evaluations as `decompositions` (one entry per distinct set of
+  paths some solution takes, at most 64; omitted when there are
+  more), used for the check below.
 
-Any other test, such as one where two or more conditions were both
-true and false in a decision that is not a tree, is reported as an
+Any other test, such as `(a || b) && c` evaluated as (T,-,T) and
+(F,T,F) (the same counters as (T,-,F) and (F,T,T)), is reported as an
 **ambiguous observation**: `--format=json` marks it `"ambiguous": true` with its
 `evaluations` count and raw per-condition `counts`, the text report
 lists it as `AMBIGUOUS`, and it is excluded from independence-pair
@@ -304,7 +332,34 @@ test took (a zero counter in every ambiguous test that evaluated the
 decision, and no vector), the condition is provably **UNEXERCISED**,
 and the report says why with the counters, for example
 `test_whitespace (9 evaluations) never took b == 10=T (0T/8F)`
-(text and JUnit; `ruled_out` in the JSON analysis).
+(text and JUnit; `ruled_out` in the JSON analysis). For a test the
+flow-decomposition rule resolved in part, the test is named with
+what was and was not attributed, for example
+`test_time_from_hms_micro (9 evaluations: 7 attributed to 2
+vector(s), 2 not attributable to a vector)`, in text and JUnit alike;
+the JSON remainder observation carries the same numbers
+(`attributed_evaluations`, `evaluations`).
+
+Before a condition is reported `UNKNOWN`, Floyd checks each ambiguous
+test's `decompositions` on its own: if *every* decomposition of that
+test, together with the condition vectors of all tests, covers both
+rows of *some* independence pair, then a pair occurred in the real
+run, whichever decomposition it was. The condition is then
+**EXERCISED** and counts as exercised in the summary and percentage,
+but the pair is not identifiable, and the report says so:
+
+```text
+  ✓ nano >= 2000000000: EXERCISED via one of: (..) -> T vs (..) -> F | (..) -> T vs (..) -> F  [pair not uniquely identifiable: 2 decompositions of naive::time::tests::test_time_from_hms_micro's counters, each completing one of these pairs]
+```
+
+In JSON the condition's status is `ExercisedUnidentified` with
+`pair_candidates` (one pair each decomposition completes),
+`pair_identifiable: false`, `test` and `decompositions`, instead of
+the `Exercised` pair; in JUnit the testcase passes, with the same
+text in `<system-out>` and a `floyd.pair_identifiable=false`
+property. Floyd claims only that some independence pair occurred,
+never which one. If any decomposition completes no pair, the
+condition stays `UNKNOWN`.
 
 An independence pair needs both of its rows, so for an unexercised
 condition the report names the rows still missing from one pair

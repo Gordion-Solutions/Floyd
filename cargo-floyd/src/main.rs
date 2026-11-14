@@ -23,8 +23,8 @@ use floyd::coverage_index::{CoverageIndex, PathNormaliser};
 use floyd::decision;
 use floyd::instrument;
 use floyd::masking::{
-    self, ConditionObservation, ConditionStatus, IndependencePair, RuntimeAnalysis, TruthTableRow,
-    Variant,
+    self, ConditionObservation, ConditionStatus, IndependencePair, Resolution, RuntimeAnalysis,
+    TruthTableRow, Variant,
 };
 use floyd::mir;
 use floyd::runner;
@@ -1495,6 +1495,7 @@ fn run_test_mode_cargo(
                 render_runtime_junit(
                     &manifest.display().to_string(),
                     &analysis,
+                    &all_observations,
                     not_measurable_count
                 )
             );
@@ -1940,7 +1941,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
         Format::Junit => {
             print!(
                 "{}",
-                render_runtime_junit(&source.display().to_string(), &analysis, 0)
+                render_runtime_junit(&source.display().to_string(), &analysis, &observations, 0)
             );
         }
     }
@@ -2131,6 +2132,7 @@ fn print_runtime_report_body(
                 );
                 continue;
             }
+            let at_least = is_lower_bound(obs, observations);
             let mut parts: Vec<String> = analysis
                 .matrix
                 .conditions
@@ -2142,8 +2144,11 @@ fn print_runtime_report_body(
                 })
                 .collect();
             parts.push(format!("result={}", obs.result.map_or("?", bool_glyph)));
-            if let Some(n) = obs.evaluations.filter(|n| *n > 1) {
-                parts.push(format!("({n} evaluations)"));
+            match obs.evaluations {
+                Some(1) if at_least => parts.push("(at least 1 evaluation)".to_string()),
+                Some(n) if at_least => parts.push(format!("(at least {n} evaluations)")),
+                Some(n) if n > 1 => parts.push(format!("({n} evaluations)")),
+                _ => {}
             }
             println!("  {label:30}  {}", parts.join("  "));
         }
@@ -2160,6 +2165,22 @@ fn print_runtime_report_body(
                     "  ✓ {cond}: EXERCISED  via ({t1}) -> {}   vs   ({t2}) -> {}",
                     bool_glyph(pair.test_1.result),
                     bool_glyph(pair.test_2.result),
+                );
+            }
+            Some(ConditionStatus::ExercisedUnidentified {
+                pair_candidates,
+                test,
+                decompositions,
+                ..
+            }) => {
+                println!(
+                    "  ✓ {cond}: {}",
+                    unidentified_text(
+                        &analysis.matrix.conditions,
+                        pair_candidates,
+                        test,
+                        *decompositions
+                    )
                 );
             }
             Some(ConditionStatus::Ambiguous { tests }) => {
@@ -2191,14 +2212,61 @@ fn print_runtime_report_body(
     }
 }
 
-/// The status text after `? {cond}: ` for a condition whose only
-/// evidence is ambiguous: `UNKNOWN`, why, and the tests (at most
-/// [`summary::TESTS_SHOWN`] named, with their evaluation counts).
+/// True for a vector of a test [`Resolution::FlowDecomposition`] only
+/// partly resolved (the test also has a remainder observation): its
+/// `evaluations` is then a lower bound, not an exact count.
+fn is_lower_bound(obs: &ConditionObservation, observations: &[ConditionObservation]) -> bool {
+    obs.resolved_by == Some(Resolution::FlowDecomposition)
+        && observations
+            .iter()
+            .any(|o| is_remainder(o) && o.test_name == obs.test_name)
+}
+
+/// True for the ambiguous remainder of a test
+/// [`Resolution::FlowDecomposition`] only partly resolved.
+fn is_remainder(obs: &ConditionObservation) -> bool {
+    obs.ambiguous && obs.resolved_by == Some(Resolution::FlowDecomposition)
+}
+
+/// The status text after `✓ {cond}: ` (text) or the JUnit
+/// `system-out` of a [`ConditionStatus::ExercisedUnidentified`]
+/// condition: the candidate pairs, and that which one occurred is not
+/// determined.
+fn unidentified_text(
+    conditions: &[String],
+    candidates: &[IndependencePair],
+    test: &str,
+    decompositions: usize,
+) -> String {
+    let pairs: Vec<String> = candidates
+        .iter()
+        .map(|p| {
+            format!(
+                "({}) -> {} vs ({}) -> {}",
+                format_inputs(conditions, &p.test_1),
+                bool_glyph(p.test_1.result),
+                format_inputs(conditions, &p.test_2),
+                bool_glyph(p.test_2.result),
+            )
+        })
+        .collect();
+    format!(
+        "EXERCISED via one of: {}  [pair not uniquely identifiable: {decompositions} \
+         decompositions of {test}'s counters, each completing one of these pairs]",
+        pairs.join(" | ")
+    )
+}
+
+/// The status text after `? {cond}: ` (text) and the JUnit failure
+/// message for a condition whose only evidence is ambiguous:
+/// `UNKNOWN`, why, and the tests (at most [`summary::TESTS_SHOWN`]
+/// named, each with what its counters attributed and what they did
+/// not).
 fn unknown_reason(tests: &[String], observations: &[ConditionObservation]) -> String {
     format!(
-        "UNKNOWN — the outcomes an independence pair still needs were taken only in {} \
-         test(s) that evaluated the decision more than once, so no condition vector can be \
-         attributed: {}",
+        "UNKNOWN — the rows an independence pair still needs are possible only in {} \
+         test(s) that evaluated the decision more than once, whose counters do not attribute \
+         those rows to condition vectors: {}",
         tests.len(),
         format_ambiguous_tests(tests, observations)
     )
@@ -2215,9 +2283,11 @@ fn ruled_out_note(analysis: &RuntimeAnalysis, cond: &str) -> Option<String> {
     let labels: Vec<String> = why
         .iter()
         .map(|r| {
-            let evals = r
-                .evaluations
-                .map_or_else(String::new, |n| format!(" ({n} evaluations)"));
+            let evals = match (r.evaluations, r.remainder) {
+                (Some(n), true) => format!(" ({n} evaluations not attributable to a vector)"),
+                (Some(n), false) => format!(" ({n} evaluations)"),
+                (None, _) => String::new(),
+            };
             format!(
                 "{}{evals} never took {}={} ({}T/{}F) as ({}) -> {} needs",
                 r.test,
@@ -2297,7 +2367,17 @@ fn format_ambiguous_counts(conditions: &[String], obs: &ConditionObservation) ->
     let evals = obs
         .evaluations
         .map_or_else(|| "?".to_string(), |n| n.to_string());
-    format!("evaluated {evals}x: {}", counts.join("  "))
+    if is_remainder(obs) {
+        let attributed = obs.attributed_evaluations.map_or_else(String::new, |a| {
+            format!(" ({a} attributed to the vectors above)")
+        });
+        format!(
+            "{evals} evaluations not attributable to a vector{attributed}: {}",
+            counts.join("  ")
+        )
+    } else {
+        format!("evaluated {evals}x: {}", counts.join("  "))
+    }
 }
 
 /// `t1 (256 evaluations), t2 (3 evaluations)` for the tests behind a
@@ -2306,12 +2386,23 @@ fn format_ambiguous_counts(conditions: &[String], obs: &ConditionObservation) ->
 /// `(+N more)` (all of them are in the per-test listing).
 fn format_ambiguous_tests(tests: &[String], observations: &[ConditionObservation]) -> String {
     summary::cap_tests(tests, |t| {
-        let evals = observations
+        let found = observations
             .iter()
-            .find(|o| o.ambiguous && o.test_name.as_deref() == Some(t))
-            .and_then(|o| o.evaluations);
-        match evals {
-            Some(n) => format!("{t} ({n} evaluations)"),
+            .find(|o| o.ambiguous && o.test_name.as_deref() == Some(t));
+        match found.and_then(|o| o.evaluations.map(|n| (o, n))) {
+            Some((o, n)) if is_remainder(o) => {
+                let a = o.attributed_evaluations.unwrap_or(0);
+                let vectors = observations
+                    .iter()
+                    .filter(|v| !v.ambiguous && v.test_name.as_deref() == Some(t))
+                    .count();
+                format!(
+                    "{t} ({} evaluations: {a} attributed to {vectors} vector(s), {n} not \
+                     attributable to a vector)",
+                    a + n
+                )
+            }
+            Some((_, n)) => format!("{t} ({n} evaluations)"),
             None => t.to_string(),
         }
     })
@@ -2463,7 +2554,12 @@ fn bool_glyph(v: bool) -> &'static str {
 /// The format is the de-facto JUnit XML that Jenkins, GitLab CI,
 /// GitHub Actions, Bazel/Buck2, and the other CIs the automotive
 /// industry already deploys render natively.
-fn render_runtime_junit(source: &str, analysis: &RuntimeAnalysis, not_measurable: usize) -> String {
+fn render_runtime_junit(
+    source: &str,
+    analysis: &RuntimeAnalysis,
+    observations: &[ConditionObservation],
+    not_measurable: usize,
+) -> String {
     use std::fmt::Write as _;
     let conditions = &analysis.matrix.conditions;
     let summary = CoverageSummary::new(Some(analysis), not_measurable);
@@ -2510,15 +2606,41 @@ fn render_runtime_junit(source: &str, analysis: &RuntimeAnalysis, not_measurable
                 );
                 continue;
             }
+            Some(ConditionStatus::ExercisedUnidentified {
+                pair_candidates,
+                test,
+                decompositions,
+                ..
+            }) => {
+                // A pass: an independence pair is proven to exist.
+                let _ = writeln!(
+                    out,
+                    r#"    <testcase name="{case_name}" classname="floyd.mcdc">"#
+                );
+                let _ = writeln!(out, "      <properties>");
+                let _ = writeln!(
+                    out,
+                    r#"        <property name="floyd.pair_identifiable" value="false"/>"#
+                );
+                let _ = writeln!(out, "      </properties>");
+                let _ = writeln!(
+                    out,
+                    "      <system-out>{}</system-out>",
+                    xml_escape(&unidentified_text(
+                        conditions,
+                        pair_candidates,
+                        test,
+                        *decompositions
+                    ))
+                );
+                let _ = writeln!(out, r#"    </testcase>"#);
+                continue;
+            }
             Some(ConditionStatus::Ambiguous { tests }) => (
                 "AmbiguousCondition",
                 format!(
-                    "UNKNOWN: the outcomes an independence pair still needs were taken only \
-                     in {} test(s) that evaluated the decision more than once ({}); aggregate \
-                     counters cannot attribute a condition vector to them. Add tests that \
-                     each evaluate the decision once.",
-                    tests.len(),
-                    summary::cap_tests(tests, str::to_string)
+                    "{}. Add tests that each evaluate the decision once.",
+                    unknown_reason(tests, observations)
                 ),
             ),
             Some(ConditionStatus::Unexercised) | None => (
@@ -2866,6 +2988,52 @@ mod tests {
         assert_eq!(format_ambiguous_tests(&many, &[]), "t0, t1, t2 (+2 more)");
     }
 
+    #[test]
+    fn flow_decomposition_remainder_is_labelled_as_unattributed() {
+        // chrono `test_time_from_hms_micro`: rule 6 credits two
+        // vectors (lower bounds) and keeps 2 of the 9 evaluations as
+        // the remainder.
+        let raw = |t, f| floyd::BranchCounts {
+            true_count: t,
+            false_count: f,
+        };
+        let mut vector = ConditionObservation::vector(
+            Some("micro".to_string()),
+            [("n2".to_string(), false)].into_iter().collect(),
+            false,
+        );
+        vector.evaluations = Some(5);
+        vector.resolved_by = Some(Resolution::FlowDecomposition);
+        let mut rest = ConditionObservation::ambiguous(
+            Some("micro".to_string()),
+            2,
+            [("n2".to_string(), raw(1, 1))].into_iter().collect(),
+        );
+        rest.resolved_by = Some(Resolution::FlowDecomposition);
+        rest.attributed_evaluations = Some(7);
+        let observations = [vector, rest];
+        assert!(is_lower_bound(&observations[0], &observations));
+        let conditions = ["n2".to_string()];
+        assert_eq!(
+            format_ambiguous_counts(&conditions, &observations[1]),
+            "2 evaluations not attributable to a vector (7 attributed to the vectors above): \
+             n2=1T/1F"
+        );
+        assert_eq!(
+            format_ambiguous_tests(&["micro".to_string()], &observations),
+            "micro (9 evaluations: 7 attributed to 1 vector(s), 2 not attributable to a vector)"
+        );
+        let v = serde_json::to_value(&observations).unwrap();
+        assert_eq!(v[0]["resolved_by"], "flow_decomposition");
+        assert_eq!(v[1]["resolved_by"], "flow_decomposition");
+        assert_eq!(v[1]["ambiguous"], true);
+        assert_eq!(v[1]["attributed_evaluations"], 7);
+        assert_eq!(v[1]["evaluations"], 2);
+
+        // A unique decomposition has no remainder: exact counts.
+        assert!(!is_lower_bound(&observations[0], &observations[..1]));
+    }
+
     fn ambiguous_analysis(ambiguous_tests: usize) -> RuntimeAnalysis {
         let tree = floyd::DecisionTree {
             // a && b
@@ -2928,9 +3096,12 @@ mod tests {
             analysis.condition_status.get("b"),
             Some(ConditionStatus::Ambiguous { tests }) if tests.len() == 5
         ));
-        let xml = render_runtime_junit("lib.rs", &analysis, 2);
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 2);
         assert!(xml.contains(r#"type="AmbiguousCondition""#), "{xml}");
-        assert!(xml.contains("(loop_0, loop_1, loop_2 (+2 more))"), "{xml}");
+        assert!(
+            xml.contains("vectors: loop_0, loop_1, loop_2 (+2 more). Add tests"),
+            "{xml}"
+        );
         assert!(!xml.contains("loop_3"), "{xml}");
         assert!(xml.contains(r#"<testsuite name="lib.rs" tests="2" failures="1">"#));
         assert!(xml.contains(r#"<property name="floyd.unknown" value="1"/>"#));
@@ -2950,7 +3121,7 @@ mod tests {
             analysis.condition_status.get("b"),
             Some(ConditionStatus::Unexercised)
         ));
-        let xml = render_runtime_junit("lib.rs", &analysis, 0);
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0);
         assert!(xml.contains(r#"type="UnexercisedCondition""#), "{xml}");
         assert!(xml.contains(r#"<property name="floyd.percentage" value="50"/>"#));
         assert!(xml.contains(r#"<property name="floyd.unknown" value="0"/>"#));
@@ -3023,7 +3194,7 @@ mod tests {
         );
         assert!(ruled_out_note(&analysis, "b == 32").is_none());
 
-        let xml = render_runtime_junit("lib.rs", &analysis, 0);
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0);
         assert!(xml.contains(r#"type="UnexercisedCondition""#), "{xml}");
         assert!(xml.contains("never took b == 10=T (0T/8F)"), "{xml}");
 
@@ -3067,7 +3238,7 @@ mod tests {
                  [the matching row (a=T, b=T) -> T is already covered]"
             )
         );
-        let xml = render_runtime_junit("lib.rs", &analysis, 0);
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0);
         assert!(
             xml.contains(
                 "needs a test where (a=T, b=F) -&gt; F [the matching row (a=T, b=T) -&gt; T \
@@ -3094,7 +3265,7 @@ mod tests {
         let line = unknown_reason(&tests, &[]);
         assert!(
             line.starts_with(
-                "UNKNOWN — the outcomes an independence pair still needs were taken only in 4 \
+                "UNKNOWN — the rows an independence pair still needs are possible only in 4 \
                  test(s)"
             ),
             "{line}"
