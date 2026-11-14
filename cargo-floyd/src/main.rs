@@ -23,8 +23,8 @@ use floyd::coverage_index::{CoverageIndex, PathNormaliser};
 use floyd::decision;
 use floyd::instrument;
 use floyd::masking::{
-    self, ConditionObservation, ConditionStatus, IndependencePair, RuntimeAnalysis, TruthTableRow,
-    Variant,
+    self, ConditionObservation, ConditionStatus, IndependencePair, Resolution, RuntimeAnalysis,
+    TruthTableRow, Variant,
 };
 use floyd::mir;
 use floyd::runner;
@@ -2131,6 +2131,7 @@ fn print_runtime_report_body(
                 );
                 continue;
             }
+            let at_least = is_lower_bound(obs, observations);
             let mut parts: Vec<String> = analysis
                 .matrix
                 .conditions
@@ -2142,8 +2143,11 @@ fn print_runtime_report_body(
                 })
                 .collect();
             parts.push(format!("result={}", obs.result.map_or("?", bool_glyph)));
-            if let Some(n) = obs.evaluations.filter(|n| *n > 1) {
-                parts.push(format!("({n} evaluations)"));
+            match obs.evaluations {
+                Some(1) if at_least => parts.push("(at least 1 evaluation)".to_string()),
+                Some(n) if at_least => parts.push(format!("(at least {n} evaluations)")),
+                Some(n) if n > 1 => parts.push(format!("({n} evaluations)")),
+                _ => {}
             }
             println!("  {label:30}  {}", parts.join("  "));
         }
@@ -2191,6 +2195,22 @@ fn print_runtime_report_body(
     }
 }
 
+/// True for a vector of a test [`Resolution::FlowDecomposition`] only
+/// partly resolved (the test also has a remainder observation): its
+/// `evaluations` is then a lower bound, not an exact count.
+fn is_lower_bound(obs: &ConditionObservation, observations: &[ConditionObservation]) -> bool {
+    obs.resolved_by == Some(Resolution::FlowDecomposition)
+        && observations
+            .iter()
+            .any(|o| is_remainder(o) && o.test_name == obs.test_name)
+}
+
+/// True for the ambiguous remainder of a test
+/// [`Resolution::FlowDecomposition`] only partly resolved.
+fn is_remainder(obs: &ConditionObservation) -> bool {
+    obs.ambiguous && obs.resolved_by == Some(Resolution::FlowDecomposition)
+}
+
 /// The status text after `? {cond}: ` for a condition whose only
 /// evidence is ambiguous: `UNKNOWN`, why, and the tests (at most
 /// [`summary::TESTS_SHOWN`] named, with their evaluation counts).
@@ -2215,9 +2235,11 @@ fn ruled_out_note(analysis: &RuntimeAnalysis, cond: &str) -> Option<String> {
     let labels: Vec<String> = why
         .iter()
         .map(|r| {
-            let evals = r
-                .evaluations
-                .map_or_else(String::new, |n| format!(" ({n} evaluations)"));
+            let evals = match (r.evaluations, r.remainder) {
+                (Some(n), true) => format!(" ({n} unattributed evaluations)"),
+                (Some(n), false) => format!(" ({n} evaluations)"),
+                (None, _) => String::new(),
+            };
             format!(
                 "{}{evals} never took {}={} ({}T/{}F) as ({}) -> {} needs",
                 r.test,
@@ -2297,7 +2319,11 @@ fn format_ambiguous_counts(conditions: &[String], obs: &ConditionObservation) ->
     let evals = obs
         .evaluations
         .map_or_else(|| "?".to_string(), |n| n.to_string());
-    format!("evaluated {evals}x: {}", counts.join("  "))
+    if is_remainder(obs) {
+        format!("{evals} evaluations not attributed: {}", counts.join("  "))
+    } else {
+        format!("evaluated {evals}x: {}", counts.join("  "))
+    }
 }
 
 /// `t1 (256 evaluations), t2 (3 evaluations)` for the tests behind a
@@ -2306,12 +2332,12 @@ fn format_ambiguous_counts(conditions: &[String], obs: &ConditionObservation) ->
 /// `(+N more)` (all of them are in the per-test listing).
 fn format_ambiguous_tests(tests: &[String], observations: &[ConditionObservation]) -> String {
     summary::cap_tests(tests, |t| {
-        let evals = observations
+        let found = observations
             .iter()
-            .find(|o| o.ambiguous && o.test_name.as_deref() == Some(t))
-            .and_then(|o| o.evaluations);
-        match evals {
-            Some(n) => format!("{t} ({n} evaluations)"),
+            .find(|o| o.ambiguous && o.test_name.as_deref() == Some(t));
+        match found.and_then(|o| o.evaluations.map(|n| (n, is_remainder(o)))) {
+            Some((n, true)) => format!("{t} ({n} unattributed evaluations)"),
+            Some((n, false)) => format!("{t} ({n} evaluations)"),
             None => t.to_string(),
         }
     })
@@ -2864,6 +2890,48 @@ mod tests {
         );
         let many: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
         assert_eq!(format_ambiguous_tests(&many, &[]), "t0, t1, t2 (+2 more)");
+    }
+
+    #[test]
+    fn flow_decomposition_remainder_is_labelled_as_unattributed() {
+        // chrono `test_time_from_hms_micro`: rule 6 credits two
+        // vectors (lower bounds) and keeps 2 of the 9 evaluations as
+        // the remainder.
+        let raw = |t, f| floyd::BranchCounts {
+            true_count: t,
+            false_count: f,
+        };
+        let mut vector = ConditionObservation::vector(
+            Some("micro".to_string()),
+            [("n2".to_string(), false)].into_iter().collect(),
+            false,
+        );
+        vector.evaluations = Some(5);
+        vector.resolved_by = Some(Resolution::FlowDecomposition);
+        let mut rest = ConditionObservation::ambiguous(
+            Some("micro".to_string()),
+            2,
+            [("n2".to_string(), raw(1, 1))].into_iter().collect(),
+        );
+        rest.resolved_by = Some(Resolution::FlowDecomposition);
+        let observations = [vector, rest];
+        assert!(is_lower_bound(&observations[0], &observations));
+        let conditions = ["n2".to_string()];
+        assert_eq!(
+            format_ambiguous_counts(&conditions, &observations[1]),
+            "2 evaluations not attributed: n2=1T/1F"
+        );
+        assert_eq!(
+            format_ambiguous_tests(&["micro".to_string()], &observations),
+            "micro (2 unattributed evaluations)"
+        );
+        let v = serde_json::to_value(&observations).unwrap();
+        assert_eq!(v[0]["resolved_by"], "flow_decomposition");
+        assert_eq!(v[1]["resolved_by"], "flow_decomposition");
+        assert_eq!(v[1]["ambiguous"], true);
+
+        // A unique decomposition has no remainder: exact counts.
+        assert!(!is_lower_bound(&observations[0], &observations[..1]));
     }
 
     fn ambiguous_analysis(ambiguous_tests: usize) -> RuntimeAnalysis {

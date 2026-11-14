@@ -277,9 +277,31 @@ vector from a test only when
   them. Where both this and the tree rule apply they give the same
   vectors, so Floyd tries the tree rule first for its exact
   per-vector counts.
+- otherwise, for any decision shape, the counters are linear
+  equations on how many evaluations took each path through the
+  decision (each condition's true count is the number of
+  evaluations on paths that test it true, and so on), and Floyd
+  enumerates every whole-number solution. A path is credited only
+  if *every* solution takes it. A condition that was never reached
+  (both counters 0), or never took a value, rules out every path
+  through that edge, which often leaves one solution. For example,
+  chrono's `hour >= 24 || min >= 60 || sec >= 60 || (nano >=
+  1_000_000_000 && sec != 59) || nano >= 2_000_000_000`, evaluated 53
+  times by `test_rfc3339` with `hour >= 24`, `min >= 60` and
+  `sec >= 60` each true once and `sec != 59` never reached, has one
+  solution: each of the three `true` paths once and the all-false
+  path 50 times. These vectors carry `"resolved_by":
+  "flow_decomposition"` and their own counts. When the solutions
+  differ, the paths every solution takes are still credited, with
+  the least count any solution gives them (the text report says
+  `at least N evaluations`), and what they do not account for stays
+  an ambiguous observation of the remaining evaluations and
+  counters, also tagged `flow_decomposition` (`N evaluations not
+  attributed` in the text report). Paths that only some solutions
+  take are never credited.
 
-Any other test, such as one where two or more conditions were both
-true and false in a decision that is not a tree, is reported as an
+Any other test, such as `(a || b) && c` evaluated as (T,-,T) and
+(F,T,F) (the same counters as (T,-,F) and (F,T,T)), is reported as an
 **ambiguous observation**: `--format=json` marks it `"ambiguous": true` with its
 `evaluations` count and raw per-condition `counts`, the text report
 lists it as `AMBIGUOUS`, and it is excluded from independence-pair

@@ -130,8 +130,11 @@ pub struct ConditionObservation {
     /// The rule that split a multi-evaluation test's counters into
     /// this vector, when it was not a single evaluation or a uniform
     /// repetition of one vector (see
-    /// [`crate::correlate::observations_from_counts`]). Omitted from
-    /// JSON when `None`.
+    /// [`crate::correlate::observations_from_counts`]). On an
+    /// ambiguous observation, [`Resolution::FlowDecomposition`] marks
+    /// the remainder of a test that rule only partly resolved: its
+    /// `counts` are then the raw counters minus those of the test's
+    /// vectors. Omitted from JSON when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<Resolution>,
 }
@@ -139,7 +142,7 @@ pub struct ConditionObservation {
 /// Which rule of [`crate::correlate::observations_from_counts`]
 /// resolved a multi-evaluation test's aggregate counters into
 /// several condition vectors. Serialised in snake case
-/// (`"single_two_sided"`, `"tree_counters"`).
+/// (`"single_two_sided"`, `"tree_counters"`, `"flow_decomposition"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Resolution {
@@ -153,6 +156,15 @@ pub enum Resolution {
     /// number of evaluations that took its vector. Each vector's
     /// `evaluations` is that leaf flow.
     TreeCounters,
+    /// Rule 6: every non-negative integer decomposition of the
+    /// counters into root-to-outcome walks takes this walk at least
+    /// once (any decision shape, DAGs included). `evaluations` is the
+    /// least number of times any decomposition takes it: exact when
+    /// the decomposition is unique, otherwise a lower bound, and the
+    /// test then also has one ambiguous observation with this tag
+    /// whose `counts` and `evaluations` are what the vectors do not
+    /// account for (the raw counters minus the vectors' share).
+    FlowDecomposition,
 }
 
 impl ConditionObservation {
@@ -344,6 +356,13 @@ pub struct RuledOut {
     pub value: bool,
     /// The test's counters for `condition`; the one for `value` is 0.
     pub counts: BranchCounts,
+    /// True when the test's observation is the remainder of a test
+    /// [`Resolution::FlowDecomposition`] only partly resolved:
+    /// `evaluations` and `counts` are then the evaluations and
+    /// counters the test's vectors do not account for, not its raw
+    /// totals. Omitted from JSON when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remainder: bool,
 }
 
 /// Combine static MC/DC analysis with observed test runs.
@@ -564,6 +583,7 @@ fn rule_out(o: &ConditionObservation, row: &TruthTableRow, decision: &Node) -> O
             condition: name,
             value,
             counts,
+            remainder: o.resolved_by == Some(Resolution::FlowDecomposition),
         })
     })
 }

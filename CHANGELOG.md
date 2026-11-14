@@ -7,6 +7,31 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## Unreleased
 
+### Added
+
+- **Flow-decomposition rule for multi-evaluation tests.** A test
+  that evaluated a decision several times, with two or more
+  conditions both true and false on a decision that is not a tree,
+  was always ambiguous. Floyd now treats the test's branch counters
+  as linear equations on how many evaluations took each path
+  through the decision, enumerates every whole-number solution, and
+  credits a condition vector only for a path that every solution
+  takes (a condition never reached, or never true or never false,
+  excludes every path through that edge). A unique solution gives
+  every vector its exact count; otherwise the paths common to all
+  solutions are credited with their least count and the rest of the
+  test stays an ambiguous remainder with the counters the vectors do
+  not account for. Both carry `"resolved_by": "flow_decomposition"`;
+  the text report marks lower-bound counts `at least N evaluations`
+  and the remainder `N evaluations not attributed`, and a
+  `ruled_out` entry computed from a remainder has `"remainder":
+  true`. On chrono 0.4, `NaiveTime::from_hms_nano_opt` goes from 2
+  exercised and 4 unknown to 5 exercised and 1 unknown: its
+  `test_rfc3339` (53 evaluations) now resolves to four vectors.
+  `nano >= 2000000000` stays unknown: the counters of the two tests
+  that made it true admit two decompositions that differ on the
+  rows its pairs need.
+
 ### Fixed
 
 - **Conditions are listed in source order.** A decision's conditions

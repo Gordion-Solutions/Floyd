@@ -228,7 +228,7 @@ fn loop_test_with_both_conditions_two_sided_is_resolved_by_tree_counters() {
 }
 
 #[test]
-fn dag_loop_test_is_ambiguous_and_its_conditions_are_unknown_not_unexercised() {
+fn dag_loop_test_is_partly_ambiguous_and_its_conditions_are_unknown_not_unexercised() {
     let mir = mir::parse_text(OR_AND_MIR).expect("MIR parses");
     let tree = decision::decompose(&mir);
     assert_eq!(tree.decisions.len(), 1);
@@ -248,15 +248,30 @@ fn dag_loop_test_is_ambiguous_and_its_conditions_are_unknown_not_unexercised() {
 
     // (T,-,T), (F,T,F), (F,F,-), or (T,-,F), (F,T,T), (F,F,-): the
     // same counters, a = [1 T, 2 F], b = [1 T, 1 F], c = [1 T, 1 F].
+    // Both decompositions take (F,F,-) once (b was false once, and
+    // only that walk tests b = F), so rule 6 credits that vector and
+    // keeps the other two evaluations as an ambiguous remainder.
     let tests = [("loop_three", or_and_coverage(3, (1, 2), (1, 1), (1, 1)))];
     let observations = observe(&mir, &tree, &tests);
-    assert_eq!(observations.len(), 1);
-    let looped = &observations[0];
+    assert_eq!(observations.len(), 2);
+    let ff = &observations[0];
+    assert!(!ff.ambiguous);
+    assert_eq!(ff.resolved_by, Some(Resolution::FlowDecomposition));
+    assert_eq!(ff.evaluations, Some(1));
+    assert_eq!(ff.inputs.get("a"), Some(&false));
+    assert_eq!(ff.inputs.get("b"), Some(&false));
+    assert_eq!(ff.inputs.get("c"), None);
+    assert_eq!(ff.result, Some(false));
+    let looped = &observations[1];
     assert!(looped.ambiguous);
     assert!(looped.inputs.is_empty());
     assert_eq!(looped.result, None);
-    assert_eq!(looped.resolved_by, None);
-    assert_eq!(looped.evaluations, Some(3));
+    assert_eq!(looped.resolved_by, Some(Resolution::FlowDecomposition));
+    assert_eq!(looped.evaluations, Some(2));
+    assert_eq!(looped.counts["a"].true_count, 1);
+    assert_eq!(looped.counts["a"].false_count, 1);
+    assert_eq!(looped.counts["b"].true_count, 1);
+    assert_eq!(looped.counts["b"].false_count, 0);
     assert_eq!(looped.counts["c"].true_count, 1);
     assert_eq!(looped.counts["c"].false_count, 1);
 

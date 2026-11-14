@@ -207,7 +207,21 @@ fn root_condition(node: &Node) -> Option<&str> {
 ///    both apply they give the same vectors, but rule 4 gives each
 ///    vector its own evaluation count and its checks are the
 ///    stricter.
-/// 6. Otherwise the test is **ambiguous**: recorded with its
+/// 6. **Flow decomposition.** Any decision shape whose conditions
+///    have distinct counters (DAGs included). The counters are
+///    linear equations on the number of evaluations that took each
+///    root-to-outcome walk; every non-negative integer solution is
+///    enumerated (see "Why rule 6 is sound"). If the solution is
+///    unique, one vector per walk taken, `evaluations` its exact
+///    count. Otherwise every walk taken at least once in *every*
+///    solution is a vector, `evaluations` the least count any
+///    solution gives it, and the evaluations those vectors do not
+///    account for stay one ambiguous observation whose `counts` are
+///    the raw counters minus the vectors' share (never negative;
+///    see below). All of them carry `resolved_by:
+///    flow_decomposition`. If no walk is taken in every solution, or
+///    there is no solution, or the search is too large, rule 7.
+/// 7. Otherwise the test is **ambiguous**: recorded with its
 ///    evaluation count and raw counters, no vector, no result.
 ///
 /// # Why rule 4 is sound
@@ -312,17 +326,77 @@ fn root_condition(node: &Node) -> Option<&str> {
 /// vectors are sound and complete. The outcome of each comes from
 /// the tree. Short-circuited conditions are simply off a walk: a
 /// condition only on `P_T` has a counter total of `k_T`, below `N`.
-/// When any check fails, the test is ambiguous (rule 6). With two
+/// When any check fails, rule 6 is tried. With two
 /// or more two-sided conditions the walks are no longer a function
 /// of one value, so rule 5 does not apply; such a test is resolved
-/// only by rule 4, when the decision is a tree.
+/// by rule 4, when the decision is a tree, or by rule 6.
+///
+/// # Why rule 6 is sound
+///
+/// Unfold the decision into its root-to-outcome walks: the leaves of
+/// its [`Node`] tree, where a DAG node reached from two predecessors
+/// appears once per predecessor with the same name (and the same
+/// counter). Distinct leaves part at some node, where one condition
+/// takes different values, so walks and condition vectors are in
+/// one-to-one correspondence. Let `x_w` be the number of the test's
+/// evaluations that took walk `w`. The model every rule relies on
+/// gives:
+///
+/// - every evaluation takes exactly one walk, so `sum_w x_w = N`;
+/// - each condition is tested at most once on a walk (checked; the
+///   rule declines otherwise), and the counter of condition `c`
+///   counts every test of `c` wherever in the decision it happens,
+///   so for each `c` with a counter and each value `v`,
+///   `sum over walks testing c = v of x_w = count(c, v)`. (A
+///   condition without a counter would contribute no equation, which
+///   only admits more solutions; but it means a region is missing,
+///   so the rule declines, as rule 4 does);
+/// - consequently `x_w <= count(c, v)` for every `(c, v)` on `w`, and
+///   in particular `x_w = 0` if some condition on `w` never took the
+///   value `w` needs (the zero-inflow case: a condition with both
+///   counters zero was never reached, so no walk through it
+///   happened).
+///
+/// So the true `x` is a non-negative integer solution of these
+/// equations within those bounds. The rule computes the reduced row
+/// echelon form of the system (exact rational arithmetic; any
+/// overflow declines), which expresses every pivot variable in terms
+/// of the free ones, and enumerates every integer value of every
+/// free variable within its bound; each assignment determines the
+/// pivot variables uniquely, and the assignment is kept iff every
+/// pivot variable is a non-negative integer within its bound. As
+/// row reduction preserves the solution set, the kept assignments
+/// are exactly the integer solutions, the true `x` among them.
+/// Every conclusion the rule draws holds in *every* solution, hence
+/// in the true one:
+///
+/// - a vector is emitted only for a walk with `x_w >= 1` in every
+///   solution: it occurred, at least `min x_w` times. A walk that
+///   some solution leaves at zero is never credited;
+/// - when the solution is unique, it is the true `x`;
+/// - the remainder `r = x - m` (`m` the per-walk minimum over all
+///   solutions) is non-negative in every solution, so the remaining
+///   counters `count(c, v) - sum over emitted walks w testing
+///   c = v of m_w` equal `sum over walks testing c = v of r_w`,
+///   never negative. A walk that some solution takes beyond its
+///   minimum has `r_w >= 1` there, so every counter on that walk is
+///   non-zero in the remainder: [`crate::masking`]'s zero-counter
+///   test on the remainder can only rule out rows that did not occur
+///   (beyond the vectors already emitted).
+///
+/// If there is no solution, the counters were not produced by this
+/// decision and the test is ambiguous. On `(a || b) && c` with
+/// (T,-,T) + (F,T,F) versus (T,-,F) + (F,T,T) the two solutions share
+/// no walk, so the test stays ambiguous; but with `b` never true,
+/// the walks through `b = T` are excluded and the rest is
+/// determined.
 ///
 /// `N == 0` (the test never evaluated the decision) or a root with
 /// no counters yields no observation at all. Condition names in
 /// `counts` that the decision does not reference are ignored.
 ///
 /// Each name in `counts` is taken to be its own counter; [`join_test`]
-/// additionally withholds rule 4 when two of the decision's
+/// additionally withholds rules 4 and 6 when two of the decision's
 /// conditions were joined to one span.
 pub fn observations_from_counts(
     test_name: Option<String>,
@@ -334,8 +408,8 @@ pub fn observations_from_counts(
 }
 
 /// [`observations_from_counts`], with `distinct_counters` false when
-/// two of the decision's conditions share one counter (rule 4 then
-/// does not apply).
+/// two of the decision's conditions share one counter (rules 4 and 6 then
+/// do not apply).
 fn reduce_counts(
     test_name: Option<String>,
     decision: &Node,
@@ -404,7 +478,18 @@ fn reduce_counts(
         return obs;
     }
 
-    // Rule 6.
+    // Rule 6: the general case, any decision shape (DAGs too): the
+    // counters as linear constraints on how many evaluations took
+    // each walk, decided over every non-negative integer solution.
+    if distinct_counters {
+        if let Some(obs) =
+            flow_decomposition_rule(&test_name, decision, &decision_counts, evaluations)
+        {
+            return obs;
+        }
+    }
+
+    // Rule 7.
     vec![ConditionObservation::ambiguous(
         test_name,
         evaluations,
@@ -544,6 +629,333 @@ fn tree_counters_rule(
             })
             .collect(),
     )
+}
+
+/// At most this many root-to-outcome walks for rule 6; a larger
+/// decision is left ambiguous.
+const MAX_WALKS: usize = 64;
+
+/// At most this many free-variable assignments are enumerated per
+/// test by rule 6; a larger search is left ambiguous.
+const MAX_ASSIGNMENTS: u64 = 1 << 20;
+
+/// Rule 6 of [`observations_from_counts`]: decide the walks every
+/// integer flow decomposition of the counters takes. See "Why rule 6
+/// is sound" there. `None` (the test stays ambiguous) when no walk
+/// is taken in every solution, there is no solution, or the decision
+/// or the search is too large. The caller has checked that no two
+/// condition names share a counter.
+fn flow_decomposition_rule(
+    test_name: &Option<String>,
+    decision: &Node,
+    counts: &BTreeMap<String, BranchCounts>,
+    evaluations: u64,
+) -> Option<Vec<ConditionObservation>> {
+    // A condition without a counter would only remove equations,
+    // which is sound, but it means the coverage data and the
+    // decision do not match one to one (a missing region): decline,
+    // as rule 4 does.
+    if crate::masking::collect_conditions(decision)
+        .iter()
+        .any(|c| !counts.contains_key(c))
+    {
+        return None;
+    }
+    let mut walks = Vec::new();
+    decision_walks(decision, &mut Vec::new(), &mut walks);
+    if walks.len() > MAX_WALKS {
+        return None;
+    }
+    for (walk, _) in &walks {
+        let names: BTreeSet<&str> = walk.iter().map(|(c, _)| c.as_str()).collect();
+        if names.len() != walk.len() {
+            return None; // a condition tested twice on one walk
+        }
+    }
+    let count_of = |name: &str, value: bool| {
+        counts
+            .get(name)
+            .map(|c| if value { c.true_count } else { c.false_count })
+    };
+    // Upper bound of each walk: no walk is taken more often than any
+    // (condition, value) on it was counted, nor more than N times.
+    let bounds: Vec<u64> = walks
+        .iter()
+        .map(|(walk, _)| {
+            walk.iter()
+                .filter_map(|(c, v)| count_of(c, *v))
+                .fold(evaluations, u64::min)
+        })
+        .collect();
+    let alive: Vec<usize> = (0..walks.len()).filter(|&w| bounds[w] > 0).collect();
+    if alive.is_empty() {
+        return None;
+    }
+
+    // One equation per (condition with a counter, value), over the
+    // walks that can be non-zero, plus `sum x_w = N`.
+    let mut system: Vec<(Vec<Frac>, Frac)> = Vec::new();
+    for (name, c) in counts {
+        for (value, rhs) in [(true, c.true_count), (false, c.false_count)] {
+            let row = alive
+                .iter()
+                .map(|&w| {
+                    let tests = walks[w].0.iter().any(|(n, v)| n == name && *v == value);
+                    Frac::int(i128::from(tests))
+                })
+                .collect();
+            system.push((row, Frac::int(i128::from(rhs))));
+        }
+    }
+    system.push((
+        vec![Frac::int(1); alive.len()],
+        Frac::int(i128::from(evaluations)),
+    ));
+    let alive_bounds: Vec<u64> = alive.iter().map(|&w| bounds[w]).collect();
+    let solutions = integer_solutions(system, &alive_bounds)?;
+    let (min, max) = solutions?;
+
+    let mut out = Vec::new();
+    let mut remaining: BTreeMap<String, BranchCounts> = counts.clone();
+    let mut attributed = 0u64;
+    for (i, &w) in alive.iter().enumerate() {
+        if min[i] == 0 {
+            continue;
+        }
+        let (walk, result) = &walks[w];
+        for (name, value) in walk {
+            if let Some(c) = remaining.get_mut(name) {
+                let slot = if *value {
+                    &mut c.true_count
+                } else {
+                    &mut c.false_count
+                };
+                *slot = slot.checked_sub(min[i])?;
+            }
+        }
+        attributed += min[i];
+        let mut obs = ConditionObservation::vector(
+            test_name.clone(),
+            walk.iter().cloned().collect(),
+            *result,
+        );
+        obs.evaluations = Some(min[i]);
+        obs.resolved_by = Some(Resolution::FlowDecomposition);
+        out.push(obs);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    if min != max {
+        let mut rest =
+            ConditionObservation::ambiguous(test_name.clone(), evaluations - attributed, remaining);
+        rest.resolved_by = Some(Resolution::FlowDecomposition);
+        out.push(rest);
+    }
+    Some(out)
+}
+
+/// Every root-to-outcome walk of `node` (each condition tested, with
+/// its value) and its outcome, true edge first. `path` is the walk
+/// from the root to `node`.
+fn decision_walks(
+    node: &Node,
+    path: &mut Vec<(String, bool)>,
+    out: &mut Vec<(Vec<(String, bool)>, bool)>,
+) {
+    match node {
+        Node::Const { value } => out.push((path.clone(), *value)),
+        Node::Condition { name } => {
+            for value in [true, false] {
+                let mut walk = path.clone();
+                walk.push((name.clone(), value));
+                out.push((walk, value));
+            }
+        }
+        Node::Ite {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            for (value, branch) in [(true, then_branch), (false, else_branch)] {
+                path.push((cond.clone(), value));
+                decision_walks(branch, path, out);
+                path.pop();
+            }
+        }
+    }
+}
+
+/// An exact rational `n / d`, `d > 0`, in lowest terms. Arithmetic
+/// is checked: `None` on overflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Frac {
+    n: i128,
+    d: i128,
+}
+
+impl Frac {
+    fn int(n: i128) -> Self {
+        Frac { n, d: 1 }
+    }
+
+    fn new(n: i128, d: i128) -> Option<Self> {
+        if d == 0 {
+            return None;
+        }
+        let g = gcd(n, d).max(1);
+        let (n, d) = (n / g, d / g);
+        if d < 0 {
+            Some(Frac {
+                n: n.checked_neg()?,
+                d: d.checked_neg()?,
+            })
+        } else {
+            Some(Frac { n, d })
+        }
+    }
+
+    fn is_zero(self) -> bool {
+        self.n == 0
+    }
+
+    fn sub(self, o: Self) -> Option<Self> {
+        Frac::new(
+            self.n
+                .checked_mul(o.d)?
+                .checked_sub(o.n.checked_mul(self.d)?)?,
+            self.d.checked_mul(o.d)?,
+        )
+    }
+
+    fn mul(self, o: Self) -> Option<Self> {
+        Frac::new(self.n.checked_mul(o.n)?, self.d.checked_mul(o.d)?)
+    }
+
+    fn div(self, o: Self) -> Option<Self> {
+        Frac::new(self.n.checked_mul(o.d)?, self.d.checked_mul(o.n)?)
+    }
+}
+
+fn gcd(a: i128, b: i128) -> i128 {
+    let (mut a, mut b) = (a.unsigned_abs(), b.unsigned_abs());
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    i128::try_from(a).unwrap_or(1)
+}
+
+/// Per-variable minimum and maximum over every integer solution `x`
+/// of `system` (rows `(coefficients, rhs)`) with `0 <= x_i <=
+/// bounds[i]`.
+///
+/// The outer `None` means the question could not be decided (an
+/// arithmetic overflow, or more than [`MAX_ASSIGNMENTS`]
+/// free-variable assignments to try); the inner `None` means there
+/// is no solution. The search is exhaustive: after Gauss-Jordan
+/// elimination each pivot variable equals its row's rhs minus a
+/// combination of the free variables, so every free-variable
+/// assignment within the bounds is tried, and an assignment is a
+/// solution iff the pivot variables it determines are integers
+/// within their bounds.
+#[allow(clippy::type_complexity)]
+fn integer_solutions(
+    mut system: Vec<(Vec<Frac>, Frac)>,
+    bounds: &[u64],
+) -> Option<Option<(Vec<u64>, Vec<u64>)>> {
+    let vars = bounds.len();
+    // Gauss-Jordan elimination. The pivot of each row is the
+    // eligible column with the largest bound, so the free columns
+    // (searched exhaustively) tend to be the ones with small bounds.
+    let mut pivots: Vec<(usize, usize)> = Vec::new(); // (row, column)
+    let mut row = 0;
+    while row < system.len() {
+        let column = (0..vars)
+            .filter(|&j| !system[row].0[j].is_zero())
+            .max_by_key(|&j| (bounds[j], std::cmp::Reverse(j)));
+        let Some(column) = column else {
+            if !system[row].1.is_zero() {
+                return Some(None); // 0 = non-zero: no solution
+            }
+            system.swap_remove(row);
+            continue;
+        };
+        let p = system[row].0[column];
+        for j in 0..vars {
+            system[row].0[j] = system[row].0[j].div(p)?;
+        }
+        system[row].1 = system[row].1.div(p)?;
+        let (pivot_coefs, pivot_rhs) = system[row].clone();
+        for (other, (coefs, rhs)) in system.iter_mut().enumerate() {
+            if other == row || coefs[column].is_zero() {
+                continue;
+            }
+            let factor = coefs[column];
+            for j in 0..vars {
+                coefs[j] = coefs[j].sub(factor.mul(pivot_coefs[j])?)?;
+            }
+            *rhs = rhs.sub(factor.mul(pivot_rhs)?)?;
+        }
+        pivots.push((row, column));
+        row += 1;
+    }
+    let pivot_columns: BTreeSet<usize> = pivots.iter().map(|&(_, c)| c).collect();
+    let free: Vec<usize> = (0..vars).filter(|j| !pivot_columns.contains(j)).collect();
+    let mut space: u64 = 1;
+    for &j in &free {
+        space = space.checked_mul(bounds[j].checked_add(1)?)?;
+        if space > MAX_ASSIGNMENTS {
+            return None;
+        }
+    }
+
+    let mut min = vec![u64::MAX; vars];
+    let mut max = vec![0u64; vars];
+    let mut found = false;
+    let mut x = vec![0u64; vars];
+    let mut assignment = vec![0u64; free.len()];
+    'search: loop {
+        for (k, &j) in free.iter().enumerate() {
+            x[j] = assignment[k];
+        }
+        let mut ok = true;
+        for &(r, column) in &pivots {
+            let (coefs, rhs) = &system[r];
+            let mut value = *rhs;
+            for &j in &free {
+                if !coefs[j].is_zero() {
+                    value = value.sub(coefs[j].mul(Frac::int(i128::from(x[j])))?)?;
+                }
+            }
+            match (value.d == 1)
+                .then(|| u64::try_from(value.n).ok())
+                .flatten()
+            {
+                Some(v) if v <= bounds[column] => x[column] = v,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            found = true;
+            for j in 0..vars {
+                min[j] = min[j].min(x[j]);
+                max[j] = max[j].max(x[j]);
+            }
+        }
+        // Next assignment (odometer); done after the last.
+        for (k, &j) in free.iter().enumerate() {
+            if assignment[k] < bounds[j] {
+                assignment[k] += 1;
+                continue 'search;
+            }
+            assignment[k] = 0;
+        }
+        break;
+    }
+    Some(found.then_some((min, max)))
 }
 
 /// True iff every condition of `decision` occurs at exactly one
@@ -1601,7 +2013,8 @@ fn decide(_1: bool, _2: bool) -> bool {
         // (a || b) && c: (T,-,T) + (F,T,F) and (T,-,F) + (F,T,T) both
         // leave a = [1, 1], b = [1, 0], c = [1, 1]. c sits at two
         // nodes, so the graph is not a tree and the counters cannot
-        // split c's counts between them.
+        // split c's counts between them: the two decompositions share
+        // no walk, so rule 6 credits nothing either.
         assert!(!is_tree(&or_and_node()));
         let raw = counts(&[("a", 1, 1), ("b", 1, 0), ("c", 1, 1)]);
         let obs = observations_from_counts(Some("dag".into()), &or_and_node(), &raw, Some(2));
@@ -1611,9 +2024,59 @@ fn decide(_1: bool, _2: bool) -> bool {
         assert_eq!(obs[0].resolved_by, None);
         assert_eq!(obs[0].counts, raw);
 
-        // Even when the counters happen to be flow-consistent on one
-        // of c's nodes (b never reached c): no partial resolution.
+        // When b was never true, no walk through `b = T` happened, so
+        // every evaluation that reached c came from `a = T`: rule 6
+        // (not rule 4, the decision is not a tree) splits the test.
         let raw = counts(&[("a", 2, 1), ("b", 0, 1), ("c", 1, 1)]);
+        let obs = observations_from_counts(None, &or_and_node(), &raw, None);
+        assert_eq!(
+            resolved(&obs),
+            [
+                flow_vector(&[("a", true), ("c", true)], true, 1),
+                flow_vector(&[("a", true), ("c", false)], false, 1),
+                flow_vector(&[("a", false), ("b", false)], false, 1),
+            ]
+        );
+    }
+
+    fn flow_vector(entries: &[(&str, bool)], result: bool, k: u64) -> Resolved {
+        (
+            inputs(entries),
+            Some(result),
+            Some(k),
+            Some(Resolution::FlowDecomposition),
+        )
+    }
+
+    #[test]
+    fn flow_decomposition_without_a_solution_stays_ambiguous() {
+        // c true twice, but the only walk that can reach c is
+        // `a = T` (b was never true), and a was true once.
+        let raw = counts(&[("a", 1, 1), ("b", 0, 1), ("c", 2, 0)]);
+        let obs = observations_from_counts(None, &or_and_node(), &raw, None);
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+        assert_eq!(obs[0].resolved_by, None);
+        assert_eq!(obs[0].counts, raw);
+    }
+
+    #[test]
+    fn flow_decomposition_declines_an_oversized_search() {
+        // Two decompositions per split of 10^7 evaluations: more free
+        // assignments than the rule tries. Ambiguous, not guessed.
+        let m = 10_000_000;
+        let raw = counts(&[("a", m, m), ("b", m, 0), ("c", m, m)]);
+        let obs = observations_from_counts(None, &or_and_node(), &raw, None);
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].ambiguous);
+        assert_eq!(obs[0].resolved_by, None);
+    }
+
+    #[test]
+    fn flow_decomposition_declines_a_condition_without_a_counter() {
+        // As `dag_or_and_stays_ambiguous`'s determined case, with b's
+        // counter missing: a missing region, so no rule fires.
+        let raw = counts(&[("a", 2, 1), ("c", 2, 0)]);
         let obs = observations_from_counts(None, &or_and_node(), &raw, None);
         assert_eq!(obs.len(), 1);
         assert!(obs[0].ambiguous);
@@ -2122,9 +2585,12 @@ fn decide(_1: bool, _2: bool) -> bool {
     }
 
     #[test]
-    fn two_two_sided_conditions_stay_ambiguous_on_real_chrono_shape() {
+    fn two_two_sided_conditions_on_chrono_shape_resolve_by_flow_decomposition() {
         // Same decision, a test that hit both `sec != 59` and
-        // `nano >= 1000000000` both ways: no rule applies.
+        // `nano >= 1000000000` both ways. Rules 4 (not a tree: `nano
+        // >= 2000000000` sits under both) and 5 (two two-sided
+        // conditions) decline. `nano >= 2000000000` was never true,
+        // so each walk is fixed by the others' counters: rule 6.
         let raw = counts(&[
             ("hour >= 24", 0, 3),
             ("min >= 60", 0, 3),
@@ -2134,8 +2600,195 @@ fn decide(_1: bool, _2: bool) -> bool {
             ("nano >= 2000000000", 0, 2),
         ]);
         let obs = observations_from_counts(None, &chrono_from_hms_nano(), &raw, Some(3));
-        assert_eq!(obs.len(), 1);
-        assert!(obs[0].ambiguous);
+        let p = [
+            ("hour >= 24", false),
+            ("min >= 60", false),
+            ("sec >= 60", false),
+        ];
+        let with = |rest: &[(&'static str, bool)]| -> Vec<(&'static str, bool)> {
+            p.iter().chain(rest).copied().collect()
+        };
+        assert_eq!(
+            resolved(&obs),
+            [
+                flow_vector(
+                    &with(&[("nano >= 1000000000", true), ("sec != 59", true)]),
+                    true,
+                    1
+                ),
+                flow_vector(
+                    &with(&[
+                        ("nano >= 1000000000", true),
+                        ("sec != 59", false),
+                        ("nano >= 2000000000", false)
+                    ]),
+                    false,
+                    1
+                ),
+                flow_vector(
+                    &with(&[("nano >= 1000000000", false), ("nano >= 2000000000", false)]),
+                    false,
+                    1
+                ),
+            ]
+        );
+    }
+
+    /// The chrono decision's six conditions, all false: the row
+    /// every `hour/min/sec >= ..` pair needs, which many
+    /// single-evaluation tests take.
+    fn chrono_all_false() -> Vec<(&'static str, bool)> {
+        vec![
+            ("hour >= 24", false),
+            ("min >= 60", false),
+            ("sec >= 60", false),
+            ("nano >= 1000000000", false),
+            ("nano >= 2000000000", false),
+        ]
+    }
+
+    #[test]
+    fn chrono_test_rfc3339_counts_resolve_by_flow_decomposition() {
+        // `format::parse::tests::test_rfc3339`'s counters in its
+        // llvm-cov export (chrono 6adaa52): 53 evaluations, three
+        // conditions two-sided, so rules 4 (not a tree) and 5 decline.
+        // `sec != 59` was never reached (0/0), so no walk through it
+        // happened, and `nano >= 1000000000` / `nano >= 2000000000`
+        // were never true: what is left is a chain, and the counters
+        // determine it.
+        let raw = counts(&[
+            ("hour >= 24", 1, 52),
+            ("min >= 60", 1, 51),
+            ("sec >= 60", 1, 50),
+            ("nano >= 1000000000", 0, 50),
+            ("sec != 59", 0, 0),
+            ("nano >= 2000000000", 0, 50),
+        ]);
+        let decision = chrono_from_hms_nano();
+        let obs = observations_from_counts(
+            Some("format::parse::tests::test_rfc3339".into()),
+            &decision,
+            &raw,
+            Some(53),
+        );
+        assert_eq!(
+            resolved(&obs),
+            [
+                flow_vector(&[("hour >= 24", true)], true, 1),
+                flow_vector(&[("hour >= 24", false), ("min >= 60", true)], true, 1),
+                flow_vector(
+                    &[
+                        ("hour >= 24", false),
+                        ("min >= 60", false),
+                        ("sec >= 60", true)
+                    ],
+                    true,
+                    1
+                ),
+                flow_vector(&chrono_all_false(), false, 50),
+            ]
+        );
+        // On its own the test demonstrates the three conditions that
+        // were UNKNOWN in chrono's report.
+        let tree = DecisionTree {
+            decisions: vec![decision],
+            ..Default::default()
+        };
+        let r = crate::masking::analyze_with_runtime(&tree, &obs, crate::masking::Variant::Masking);
+        for c in ["hour >= 24", "min >= 60", "sec >= 60"] {
+            assert!(
+                matches!(
+                    r.condition_status[c],
+                    crate::masking::ConditionStatus::Exercised(_)
+                ),
+                "{c}: {:?}",
+                r.condition_status[c]
+            );
+        }
+    }
+
+    #[test]
+    fn chrono_test_time_from_hms_micro_resolves_only_the_walks_every_decomposition_takes() {
+        // `naive::time::tests::test_time_from_hms_micro`'s counters
+        // (chrono 6adaa52): 9 evaluations. The walks left (call
+        // n1 = `nano >= 1000000000`, n2 = `nano >= 2000000000`, all
+        // with hour/min/sec false; `sec != 59` never true) are
+        //   A (n1 F, n2 T) -> T     B (n1 F, n2 F) -> F
+        //   D (n1 T, s59 F, n2 T) -> T   E (n1 T, s59 F, n2 F) -> F
+        // with A + B = 6, D + E = 3, A + D = 1, B + E = 8: either
+        // A = 1, B = 5, D = 0, E = 3 or A = 0, B = 6, D = 1, E = 2.
+        // B (>= 5 times) and E (>= 2 times) occurred; A and D are
+        // each taken by one decomposition only, so neither is
+        // credited and n2, whose pairs need A or D, stays UNKNOWN.
+        let raw = counts(&[
+            ("hour >= 24", 0, 9),
+            ("min >= 60", 0, 9),
+            ("sec >= 60", 0, 9),
+            ("nano >= 1000000000", 3, 6),
+            ("sec != 59", 0, 3),
+            ("nano >= 2000000000", 1, 8),
+        ]);
+        let decision = chrono_from_hms_nano();
+        let test = "naive::time::tests::test_time_from_hms_micro";
+        let obs = observations_from_counts(Some(test.into()), &decision, &raw, Some(9));
+        assert_eq!(obs.len(), 3, "{obs:?}");
+        let mut e = chrono_all_false();
+        e[3].1 = true;
+        e.insert(4, ("sec != 59", false));
+        assert_eq!(
+            resolved(&obs[..2]),
+            [
+                flow_vector(&e, false, 2),
+                flow_vector(&chrono_all_false(), false, 5),
+            ]
+        );
+        // The remainder: 2 evaluations, the raw counters minus the
+        // vectors' share.
+        let rest = &obs[2];
+        assert!(rest.ambiguous);
+        assert_eq!(rest.resolved_by, Some(Resolution::FlowDecomposition));
+        assert_eq!(rest.evaluations, Some(2));
+        assert_eq!(
+            rest.counts,
+            counts(&[
+                ("hour >= 24", 0, 2),
+                ("min >= 60", 0, 2),
+                ("sec >= 60", 0, 2),
+                ("nano >= 1000000000", 1, 1),
+                ("sec != 59", 0, 1),
+                ("nano >= 2000000000", 1, 1),
+            ])
+        );
+        let tree = DecisionTree {
+            decisions: vec![decision],
+            ..Default::default()
+        };
+        let r = crate::masking::analyze_with_runtime(&tree, &obs, crate::masking::Variant::Masking);
+        match &r.condition_status["nano >= 2000000000"] {
+            crate::masking::ConditionStatus::Ambiguous { tests } => assert_eq!(tests, &[test]),
+            other => panic!("expected UNKNOWN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chrono_test_time_from_hms_milli_resolves_only_the_walks_every_decomposition_takes() {
+        // `naive::time::tests::test_time_from_hms_milli` (7
+        // evaluations): the same shape, B >= 3 and E >= 2.
+        let raw = counts(&[
+            ("hour >= 24", 0, 7),
+            ("min >= 60", 0, 7),
+            ("sec >= 60", 0, 7),
+            ("nano >= 1000000000", 3, 4),
+            ("sec != 59", 0, 3),
+            ("nano >= 2000000000", 1, 6),
+        ]);
+        let obs = observations_from_counts(None, &chrono_from_hms_nano(), &raw, Some(7));
+        assert_eq!(obs.len(), 3, "{obs:?}");
+        assert_eq!(obs[0].evaluations, Some(2));
+        assert_eq!(obs[1].evaluations, Some(3));
+        assert_eq!(obs[1].inputs, inputs(&chrono_all_false()));
+        assert!(obs[2].ambiguous);
+        assert_eq!(obs[2].evaluations, Some(2));
     }
 
     #[test]

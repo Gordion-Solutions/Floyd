@@ -177,6 +177,8 @@ const EXPECTED: &[(&str, Expect)] = &[
     ("and_or_tree", measured(1, None)),
     ("dag_or_and", measured(1, Some("value_arms"))),
     ("dag_one_two_sided", measured(1, Some("value_arms"))),
+    ("dag_zero_inflow", measured(2, Some("value_arms"))),
+    ("dag_partial_flow", measured(1, Some("value_arms"))),
     ("single_and", measured(3, None)),
     // 2. Name-based correlation.
     ("impl_or", measured(3, None)),
@@ -598,6 +600,8 @@ fn multi_evaluation_tree_test_is_resolved_by_tree_counters() {
 #[test]
 #[ignore = "requires nightly Rust + llvm-tools-preview component"]
 fn multi_evaluation_dag_test_is_ambiguous_and_withholds_the_percentage() {
+    // The two decompositions of `dag_or_and_loop`'s counters share no
+    // walk, so the flow-decomposition rule credits nothing either.
     let run = floyd("json", &["--only=dag_or_and"]);
     assert_report_shape(&run, "dag_or_and");
     assert_eq!(str_field(&run.json, "verdict"), Some("analysed"));
@@ -629,6 +633,107 @@ fn multi_evaluation_dag_test_is_ambiguous_and_withholds_the_percentage() {
     assert_eq!(run.json["summary"]["unknown"].as_u64(), Some(1));
     assert_eq!(percentage(&run), None, "summary: {}", run.json["summary"]);
     assert_eq!(run.code, 2);
+}
+
+#[test]
+#[ignore = "requires nightly Rust + llvm-tools-preview component"]
+fn multi_evaluation_dag_test_with_a_zero_inflow_branch_is_resolved_by_flow_decomposition() {
+    // `dag_zero_inflow_loop`: three conditions two-sided on a DAG,
+    // so rules 4 and 5 decline; `b` was never true, which leaves one
+    // decomposition.
+    let run = floyd("json", &["--only=dag_zero_inflow"]);
+    assert_report_shape(&run, "dag_zero_inflow");
+    assert_eq!(conditions(&run), vec!["a", "b", "c"]);
+    let obs = observations(&run);
+    assert_eq!(obs.len(), 4, "{obs:?}");
+    assert!(
+        obs.iter().all(|o| o["ambiguous"].as_bool() == Some(false)),
+        "{obs:?}"
+    );
+    let looped: Vec<(Value, Option<bool>)> = obs
+        .iter()
+        .filter(|o| str_field(o, "test_name") == Some("observation::tests::dag_zero_inflow_loop"))
+        .map(|o| {
+            assert_eq!(o["evaluations"].as_u64(), Some(1), "{o}");
+            assert_eq!(
+                str_field(o, "resolved_by"),
+                Some("flow_decomposition"),
+                "{o}"
+            );
+            (o["inputs"].clone(), o["result"].as_bool())
+        })
+        .collect();
+    assert_eq!(
+        looped,
+        [
+            (serde_json::json!({"a": true, "c": true}), Some(true)),
+            (serde_json::json!({"a": true, "c": false}), Some(false)),
+            (serde_json::json!({"a": false, "b": false}), Some(false)),
+        ]
+    );
+    assert_eq!(
+        run.json["analysis"]["ambiguous_observations"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        percentage(&run),
+        Some(100.0),
+        "summary: {}",
+        run.json["summary"]
+    );
+    assert_eq!(run.code, 0);
+}
+
+#[test]
+#[ignore = "requires nightly Rust + llvm-tools-preview component"]
+fn multi_evaluation_dag_test_with_two_decompositions_keeps_its_conditions_unknown() {
+    // `dag_partial_flow_loop`: two decompositions; only (F,F,-) is in
+    // both. It is credited; the rest stays an ambiguous remainder and
+    // every condition stays UNKNOWN.
+    let run = floyd("json", &["--only=dag_partial_flow"]);
+    assert_report_shape(&run, "dag_partial_flow");
+    let obs = observations(&run);
+    assert_eq!(obs.len(), 2, "{obs:?}");
+    assert!(
+        obs.iter().all(
+            |o| str_field(o, "resolved_by") == Some("flow_decomposition")
+                && str_field(o, "test_name") == Some("observation::tests::dag_partial_flow_loop")
+        ),
+        "{obs:?}"
+    );
+    assert_eq!(obs[0]["ambiguous"].as_bool(), Some(false));
+    assert_eq!(
+        obs[0]["inputs"],
+        serde_json::json!({"a": false, "b": false})
+    );
+    assert_eq!(obs[0]["result"].as_bool(), Some(false));
+    assert_eq!(obs[0]["evaluations"].as_u64(), Some(1));
+    let rest = &obs[1];
+    assert_eq!(rest["ambiguous"].as_bool(), Some(true));
+    assert_eq!(rest["evaluations"].as_u64(), Some(2));
+    assert_eq!(rest["inputs"], serde_json::json!({}));
+    for (c, t, f) in [("a", 1, 1), ("b", 1, 0), ("c", 1, 1)] {
+        assert_eq!(rest["counts"][c]["true_count"].as_u64(), Some(t), "{c}");
+        assert_eq!(rest["counts"][c]["false_count"].as_u64(), Some(f), "{c}");
+    }
+    let status = &run.json["analysis"]["condition_status"];
+    for c in ["a", "b", "c"] {
+        assert!(status[c]["Ambiguous"].is_object(), "{c}: {status}");
+    }
+    assert_eq!(run.json["summary"]["unknown"].as_u64(), Some(3));
+    assert_eq!(percentage(&run), None, "summary: {}", run.json["summary"]);
+    assert_eq!(run.code, 2);
+
+    let text = floyd("text", &["--only=dag_partial_flow"]);
+    assert!(
+        text.stdout.contains("(at least 1 evaluation)")
+            && text.stdout.contains("2 evaluations not attributed:")
+            && text
+                .stdout
+                .contains("dag_partial_flow_loop (2 unattributed evaluations)"),
+        "{}",
+        text.stdout
+    );
 }
 
 #[test]
