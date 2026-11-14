@@ -65,6 +65,7 @@ pub mod masking;
 pub mod mir;
 pub mod profile;
 pub mod runner;
+pub mod scope;
 pub mod toolchain;
 
 pub use correlate::DecisionMap;

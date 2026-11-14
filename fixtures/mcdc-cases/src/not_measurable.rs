@@ -10,9 +10,10 @@
 /// instrument `#[automatically_derived]` bodies.
 ///
 /// Expected: never a measured candidate. The engine does not
-/// decompose the field projections, so `eq` is in `out_of_scope`; if
-/// it ever becomes a candidate it must be `not_measurable` with
-/// reason `uninstrumented`.
+/// decompose the field projections, so `eq` (and the derived `fmt`)
+/// is in `out_of_scope` with reason `no_decision`, detail
+/// `derived_impl`; if it ever becomes a candidate it must be
+/// `not_measurable` with reason `uninstrumented`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Reading {
     /// Whether the channel is armed.

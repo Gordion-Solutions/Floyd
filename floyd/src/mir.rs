@@ -156,13 +156,24 @@ pub struct MirFunction {
     /// `#[automatically_derived]` impls, `#[coverage(off)]` items and
     /// bodies whose code has no usable source span), so the function
     /// has no coverage record. Lower-case `coverage branch { .. }`
-    /// lines are branch markers, not mappings, and are not counted.
+    /// lines are branch markers, not mappings, and are not counted
+    /// here (see [`Self::branch_markers`]).
     pub coverage_mappings: usize,
     /// The source spans of those mappings, as printed. They are the
     /// spans of the code and branch regions `llvm-cov` reports for
     /// this body, so they locate its coverage record even when a
     /// decomposed condition's own span carries no region.
     pub coverage_spans: Vec<SourceSpan>,
+    /// The spans of the lower-case `coverage branch { true: ..,
+    /// false: .. } => <span>` markers, as printed. rustc records one
+    /// under `-Zcoverage-options=branch` for each Boolean condition
+    /// the source writes: an `if` / `while` condition, an `if let`
+    /// pattern test, a match guard, and each operand of `&&` / `||`.
+    /// A plain `match` arm, `?`, a `for` loop's `next()` test and a
+    /// drop flag get none, so a body whose markers all lie in other
+    /// crates' code (or that has none) contains no Boolean decision
+    /// the user wrote. Empty for MIR emitted without branch coverage.
+    pub branch_markers: Vec<SourceSpan>,
     /// `true` for the body rustc prints under a `// MIR FOR CTFE`
     /// line: the compile-time-evaluation rendering of a `const fn`,
     /// which follows its runtime body under the same name. CTFE MIR
@@ -979,6 +990,10 @@ pub fn parse_text(input: &str) -> Result<Mir, ParseError> {
                     if let Some(span) = coverage_mapping_span(code) {
                         f.coverage_spans.push(span);
                     }
+                } else if code.starts_with("coverage branch ") {
+                    if let Some(span) = coverage_mapping_span(code) {
+                        f.branch_markers.push(span);
+                    }
                 }
                 // Other fn-level lines (e.g. scope annotations) ignored.
             }
@@ -1062,7 +1077,7 @@ fn extract_span_from_comment(comment: &str) -> Option<SourceSpan> {
 /// The file path may contain colons (notably on Windows). We split
 /// from the right at the `": "` separator and then peel two trailing
 /// `:N` segments off the left half.
-fn parse_span_literal(s: &str) -> Option<SourceSpan> {
+pub(crate) fn parse_span_literal(s: &str) -> Option<SourceSpan> {
     // Split on ": " to separate the LHS (file:L1:C1) from RHS (L2:C2).
     let space_idx = s.rfind(": ")?;
     let lhs = &s[..space_idx];

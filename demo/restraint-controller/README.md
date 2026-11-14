@@ -73,7 +73,8 @@ Per-condition MC/DC status:
 
 MC/DC coverage: 4 of 4 conditions exercised (100%)
 
-Out of scope: 5 function(s) have a decision in a shape the engine's current patterns do not recognise. The engine declined them rather than report a wrong verdict. See --format=json's `out_of_scope` for the full list.
+Out of scope: 5 function(s) with a `switchInt` were not analysed. See --format=json's `out_of_scope` for the list.
+  5 with no Boolean decision the user wrote (assert only 5).
 ```
 
 Every condition has an independence pair: two condition vectors that
@@ -83,9 +84,11 @@ pair rows a condition the test short-circuited is shown with a value
 observations above show it as `-`. Each test evaluates the decision
 exactly once, so every observation is *used*.
 
-The "Out of scope" line is about the five `#[test]` functions
-themselves (their `assert!` expansions), which Floyd declines rather
-than analyse; it does not affect the verdict or the exit code.
+The "Out of scope" lines are about the five `#[test]` functions
+themselves: their only `switchInt`s are `assert!` conditions, so
+Floyd lists them as having no Boolean decision (`no_decision`,
+`assert_only`) rather than analyse them. They do not affect the
+verdict or the exit code.
 
 The same run in the other formats (both exit 0):
 
@@ -122,6 +125,10 @@ cargo floyd test --format=junit
       <property name="floyd.toolchain.host" value="x86_64-apple-darwin"/>
       <property name="floyd.toolchain.channel" value="nightly"/>
       <property name="floyd.toolchain.rustc_bootstrap" value="false"/>
+      <property name="floyd.out_of_scope" value="5"/>
+      <property name="floyd.out_of_scope.no_decision" value="5"/>
+      <property name="floyd.out_of_scope.no_decision.assert_only" value="5"/>
+      <property name="floyd.ctfe_bodies_skipped" value="0"/>
     </properties>
     <testcase name="occupant_present" classname="floyd.mcdc"/>
     <testcase name="crash_detected" classname="floyd.mcdc"/>
@@ -171,7 +178,8 @@ Per-condition MC/DC status:
 
 MC/DC coverage: 2 of 4 conditions exercised (50%)
 
-Out of scope: 3 function(s) have a decision in a shape the engine's current patterns do not recognise. The engine declined them rather than report a wrong verdict. See --format=json's `out_of_scope` for the full list.
+Out of scope: 3 function(s) with a `switchInt` were not analysed. See --format=json's `out_of_scope` for the list.
+  3 with no Boolean decision the user wrote (assert only 3).
 ```
 
 Exit code 2 means a decision was analysed but MC/DC was not

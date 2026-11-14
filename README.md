@@ -35,7 +35,8 @@ Per-condition MC/DC status:
 
 MC/DC coverage: 4 of 4 conditions exercised (100%)
 
-Out of scope: 5 function(s) have a decision in a shape the engine's current patterns do not recognise. The engine declined them rather than report a wrong verdict. See --format=json's `out_of_scope` for the full list.
+Out of scope: 5 function(s) with a `switchInt` were not analysed. See --format=json's `out_of_scope` for the list.
+  5 with no Boolean decision the user wrote (assert only 5).
 $ echo $?
 0
 ```
@@ -50,9 +51,11 @@ prints no percentage; the summary line then reads
 `MC/DC coverage: N exercised, N not exercised, N unknown of N
 conditions ...`. See
 [Tests that evaluate a decision more than once](#tests-that-evaluate-a-decision-more-than-once).
-The "Out of scope" line lists functions (here the `#[test]` functions'
-own `assert!` expansions) whose decisions Floyd declines rather than
-analyse; it does not affect the verdict.
+The "Out of scope" lines count functions with a `switchInt` that Floyd
+does not analyse, by reason. Here they are the `#[test]` functions,
+whose only `switchInt`s are `assert!` conditions, so they have no
+Boolean decision to analyse (`no_decision`, `assert_only`). They do
+not affect the verdict.
 
 The exit code is 0 when every condition is exercised, 2 when a
 decision was analysed but MC/DC was not demonstrated (a condition is
@@ -224,7 +227,24 @@ independence pairs do not depend on which outcome is called true.
 Several shapes that appear regularly in real safety code are
 still declined; the engine-correctness milestone (see
 [ADR-0004](architecture/decisions/0004-engine-correctness-oss-boundary.md))
-closed the biggest gaps. The current declines:
+closed the biggest gaps.
+
+Most functions Floyd lists as out of scope have no decision to
+decline. In a 19-crate validation sweep, roughly 70% of them contain
+no Boolean decision the user wrote: only `assert_eq!`-style standard
+library macro code, derived impls, plain enum `match`es, `?` and
+`for` loops, assertions or drop flags. Floyd reports these as
+`no_decision` with a `detail`, separately from real declines (see
+[JSON summary](#json-summary)). Of the functions with a real
+decision, the main shapes still declined, from a hand-classified
+sample (a function often shows several) are: conditions that are
+call results (`if self.low.get() && ..`, `==` on non-primitive types,
+about 60%); decisions whose arms do not produce the function's
+return value (guards, `if` without `else`, about 50%); more than one
+decision in a function, including `else if` (about 50%); patterns
+with bindings or guards (about 25%); a decision after an unrelated
+straight-line prefix (about 25%); and loop conditions (about 20%).
+The current declines:
 
 | Shape | Workaround / status |
 |-------|---------------------|
@@ -233,6 +253,7 @@ closed the biggest gaps. The current declines:
 | Pattern destructuring beyond a single bound value (`if let Some((a, b)) = ...`) | Not in MVP scope. |
 | `async` desugaring, macro-expansion provenance | Not in MVP scope. |
 | FnMut closures with internal mutation | The Fn / move-closure capture forms recover; closures that mutate captured state internally (`b = b && x`) produce a different MIR shape that's not yet handled. |
+| Decisions with more than 12 conditions, or whose tree would grow past the engine's step budget (a 40-alternative `matches!` over `char` ranges) | Declined quickly as `too_many_conditions`, with the condition count: the analysis enumerates all `2^n` rows of the truth table. |
 
 Most bool-returning safety-critical Rust functions recover
 correctly. The remaining gaps in the "what doesn't" table are
@@ -651,16 +672,42 @@ recognise, or an item whose closing brace it never found) is listed
 in `mir_parse_problems` (`path`, `problem`) and on stderr. Functions
 in the unparsed part are neither candidates nor `out_of_scope`.
 
-Functions that have a decision the engine declined are listed in
-`out_of_scope`, each with a `reason`: `non_bool_leaf` when an arm's
-value is a named local that is not `bool` (for example a branch that
-returns a struct or an integer, which is not a Boolean condition)
-and the arms are not a lifted shape (see
-[Non-Boolean arms](#non-boolean-arms)),
-`no_conditions` when the recovered tree is a bare constant that
-tests no condition, `ctfe_body` for the `// MIR FOR CTFE` rendering
-of a `const fn` (never run at runtime; the function's runtime body
-is considered instead), otherwise `unsupported_shape`. A candidate
+Every function with a `switchInt` that is not a candidate is listed
+once in `out_of_scope`, each with a `reason`:
+
+- `no_decision`: none of its `switchInt`s is a Boolean decision the
+  user wrote. `detail` says what they are: `std_macro_only`
+  (`assert_eq!`, `assert_ne!` and other standard-library or
+  dependency macro code), `pattern_match_only` (an enum `match` or
+  `matches!` with no `if`, `&&` or `||`), `derived_impl` (a
+  `#[derive(..)]` body), `question_mark_or_loop_only` (`?` and `for`
+  loops), `assert_only` (`assert!`, `debug_assert!`, `ensure!`
+  conditions) or `drop_flags_only` (compiler drop flags). Floyd
+  assigns it only on positive evidence from the MIR (rustc's branch
+  markers, which mark every `if`, `while`, `&&` and `||` operand the
+  user wrote, the `switchInt` spans, and the derive attribute in the
+  source); anything it cannot account for keeps its decline reason.
+- `unsupported_shape`: a decision in a shape the engine does not
+  recognise yet.
+- `non_bool_leaf`: an arm's value is a named local that is not
+  `bool` (for example a branch that returns a struct or an integer,
+  which is not a Boolean condition) and the arms are not a lifted
+  shape (see [Non-Boolean arms](#non-boolean-arms)).
+- `no_conditions`: the recovered tree is a bare constant that tests
+  no condition.
+- `too_many_conditions`: the decision has more than 12 conditions,
+  or its tree would exceed the engine's step budget; `conditions`
+  gives the count.
+
+The `// MIR FOR CTFE` rendering of a `const fn` (never run at
+runtime) is not listed; its runtime body is. `out_of_scope_summary`
+counts the list by reason (`by_reason`), the `no_decision` entries by
+detail (`no_decision`), and the CTFE bodies skipped
+(`ctfe_bodies_skipped`); the text report prints the same counts and
+the JUnit suite carries them as `floyd.out_of_scope.*` and
+`floyd.ctfe_bodies_skipped` properties. A function whose decision is
+a user macro call expanding to standard-library code (a `matches!`)
+is located at the call in the user's file, not in `core`. A candidate
 whose outcome is the arm taken carries `lift` (`call_arms` or
 `value_arms`).
 

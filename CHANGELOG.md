@@ -75,6 +75,35 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `run_test_isolated_with_toolchain`, `run_with_toolchain`. The
   existing functions keep their signatures and behaviour (`nightly`,
   not probed).
+- **`no_decision` out-of-scope reason.** Most functions listed in
+  `out_of_scope` had no decision to decline: in a 19-crate sweep about
+  70% contain no Boolean decision the user wrote. They are now listed
+  with `reason: "no_decision"` and a `detail`: `std_macro_only`,
+  `pattern_match_only`, `derived_impl`, `question_mark_or_loop_only`,
+  `assert_only` or `drop_flags_only`. The classifier
+  (`floyd::scope`) labels a function only on positive evidence for
+  every `switchInt` it has: rustc's lower-case `coverage branch`
+  markers (now parsed into `MirFunction::branch_markers`), the
+  `switchInt` and discriminant spans, drop-flag writes, and the
+  `#[derive]` / `assert!` text in the source. Anything it cannot
+  account for keeps its decline reason. On the 255 hand-labelled
+  functions of the sweep's sample it agrees on 249: precision 100%,
+  recall 95%.
+- **`out_of_scope_summary`** in the JSON (`total`, `by_reason`,
+  `no_decision` by detail, `ctfe_bodies_skipped`), the matching
+  `floyd.out_of_scope.*` / `floyd.ctfe_bodies_skipped` JUnit
+  properties, and a text report that prints the counts by reason
+  ("N with no Boolean decision the user wrote", "M with a decision in
+  a shape the engine does not recognise yet").
+- **`too_many_conditions` reason** (with `conditions`): a decision with
+  more than 12 conditions (`floyd::decision::MAX_DECISION_CONDITIONS`),
+  or whose tree would take more than
+  `floyd::decision::MAX_DECOMPOSE_STEPS` handler steps, is declined
+  in milliseconds. rust-url's 40-alternative `is_url_code_point`
+  `matches!` used to take minutes and over a gigabyte of memory to
+  decompose, because the tree copies each shared tail once per path.
+  `floyd::decision::try_decompose_candidate_detailed` returns the
+  count.
 
 ### Changed
 
@@ -86,9 +115,28 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   vector(s), 2 not attributable to a vector`). The JUnit failure
   message uses the same text. The fixture `dag_or_and`'s `c` is now
   exercised without an identifiable pair (was unknown).
+- **CTFE bodies are not listed.** The `// MIR FOR CTFE` body of a
+  `const fn` no longer has its own `ctfe_body` entry in
+  `out_of_scope`; its runtime body is listed, and the CTFE bodies are
+  counted in `out_of_scope_summary.ctfe_bodies_skipped`. The list has
+  one entry per function.
 
 ### Fixed
 
+- **User `matches!` predicates were silently dropped.** A function
+  whose decision is a user `matches!` (rust-url `Url::has_host`,
+  `SchemeType::is_special`; time `Context::is_component`) decomposed,
+  but its earliest condition span is the `matches!` arm in `core`, and
+  a filter meant for `assert_eq!` bodies dropped it from both
+  `candidates` and `out_of_scope` (20 functions in the sweep). The
+  filter now drops nothing: a decision whose `switchInt`s and
+  discriminants all lie in standard-library code is listed as
+  `no_decision` (`std_macro_only`) when the classifier accounts for
+  it, and otherwise stays a candidate (which the coverage join
+  classifies as `not_measurable`, `external_macro`). A user `matches!`
+  is a candidate located at the call in the user's file. Every
+  function with a `switchInt` is now exactly one of: a candidate, an
+  `out_of_scope` entry, a counted CTFE body, or left out by `--only`.
 - **Conditions are listed in source order.** A decision's conditions
   were listed sorted by name, so anyhow's `b == b' ' || b == b'\n'`
   printed `Conditions: b == 10, b == 32`. They now follow their

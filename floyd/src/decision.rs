@@ -74,9 +74,9 @@ use crate::Mir;
 /// Why the decomposer declined a function that has a `switchInt`.
 ///
 /// Serialised in snake case (`unsupported_shape`, `non_bool_leaf`,
-/// `no_conditions`, `ctfe_body`)
-/// as the `reason` of each `out_of_scope` entry in
-/// `cargo floyd test --format=json`.
+/// `no_conditions`, `ctfe_body`, `no_decision`,
+/// `too_many_conditions`) as the `reason` of each `out_of_scope`
+/// entry in `cargo floyd test --format=json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeclineReason {
@@ -98,8 +98,64 @@ pub enum DeclineReason {
     /// ([`MirFunction::is_ctfe`]). It is not decomposed: it never
     /// runs at runtime, and the function's runtime body, parsed
     /// separately under the same name, is the candidate.
+    /// `cargo floyd` does not list CTFE bodies; it counts them
+    /// (`ctfe_bodies_skipped`) beside their runtime twins.
     CtfeBody,
+    /// The function has a `switchInt`, but none of them is a Boolean
+    /// decision the user wrote: they come from a standard-library
+    /// macro expansion, a derived impl, `?` or a `for` loop, a plain
+    /// enum `match`, an assertion, or drop flags. Assigned only on
+    /// positive evidence from the MIR (see `crate::scope`), never as a
+    /// fallback; the classification is in the entry's `detail`.
+    NoDecision,
+    /// The decision has more conditions than the engine analyses
+    /// ([`MAX_DECISION_CONDITIONS`]), or expanding it into a tree
+    /// would exceed [`MAX_DECOMPOSE_STEPS`] steps (a large `matches!`
+    /// whose alternatives share their tails). Declined quickly
+    /// instead of building a tree, and a truth table, exponential in
+    /// the condition count.
+    TooManyConditions,
 }
+
+/// Why a decomposition was declined, with the condition count for
+/// [`DeclineReason::TooManyConditions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Decline {
+    /// The reason.
+    pub reason: DeclineReason,
+    /// For [`DeclineReason::TooManyConditions`]: the number of
+    /// conditions of the decision when its tree was built, otherwise
+    /// the number of distinct Boolean `switchInt` blocks reachable
+    /// from the entry (each a condition test). `None` for every other
+    /// reason.
+    pub conditions: Option<usize>,
+}
+
+impl From<DeclineReason> for Decline {
+    fn from(reason: DeclineReason) -> Self {
+        Decline {
+            reason,
+            conditions: None,
+        }
+    }
+}
+
+/// Most conditions one decision may have. The MC/DC analysis
+/// enumerates all `2^n` rows of a decision's truth table and searches
+/// them pairwise, so a wider decision is declined
+/// ([`DeclineReason::TooManyConditions`]) rather than analysed for
+/// minutes. No decision in the 19-crate validation sweep has more
+/// than 6.
+pub const MAX_DECISION_CONDITIONS: usize = 12;
+
+/// Most handler steps (calls of `build_decision_from_block`) one
+/// decomposition may take. The decision tree is built without
+/// sharing, so a chain whose alternatives share a tail (a
+/// `matches!(c, 'a'..='z' | 'A'..='Z' | ..)`: both edges of each
+/// range test lead to the next alternative) doubles per alternative.
+/// A tree over [`MAX_DECISION_CONDITIONS`] conditions needs at most
+/// `2^13` steps, well inside this budget.
+pub const MAX_DECOMPOSE_STEPS: usize = 20_000;
 
 /// Which lift turned a Boolean condition with non-Boolean arms into
 /// a decision whose outcome is the arm taken.
@@ -130,6 +186,27 @@ thread_local! {
     /// only when that call declines, to report
     /// [`DeclineReason::NonBoolLeaf`].
     static NON_BOOL_LEAF_SEEN: Cell<bool> = const { Cell::new(false) };
+    /// Handler steps left in the current [`decompose_from_block`]
+    /// call (see [`MAX_DECOMPOSE_STEPS`]). Once it reaches zero,
+    /// every further step declines.
+    static STEPS_LEFT: Cell<usize> = const { Cell::new(MAX_DECOMPOSE_STEPS) };
+    /// Set when the current [`decompose_from_block`] call ran out of
+    /// steps. Its result is then discarded.
+    static STEPS_EXHAUSTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Take one handler step; `false` once the budget is spent.
+fn take_step() -> bool {
+    STEPS_LEFT.with(|left| match left.get() {
+        0 => {
+            STEPS_EXHAUSTED.with(|e| e.set(true));
+            false
+        }
+        n => {
+            left.set(n - 1);
+            true
+        }
+    })
 }
 
 /// Record that a leaf was declined because its local is not `bool`.
@@ -376,8 +453,15 @@ fn decompose_from_block_lifted(f: &MirFunction, block_id: BlockId) -> Option<(No
         return None;
     }
     CALL_ARMS_LIFT_SEEN.with(|seen| seen.set(false));
+    STEPS_LEFT.with(|left| left.set(MAX_DECOMPOSE_STEPS));
+    STEPS_EXHAUSTED.with(|e| e.set(false));
     let node = build_decision_from_block(block_id, f);
     let call_arms = CALL_ARMS_LIFT_SEEN.with(|seen| seen.replace(false));
+    if STEPS_EXHAUSTED.with(|e| e.get()) {
+        // A partial tree is never a decision; the caller reads the
+        // flag to report `too_many_conditions`.
+        return None;
+    }
     match node {
         Some(node) => Some((node, call_arms.then_some(Lift::CallArms))),
         None => lift_value_arms(block_id, f).map(|node| (node, Some(Lift::ValueArms))),
@@ -430,17 +514,74 @@ pub fn try_decompose_candidate(f: &MirFunction) -> Result<Node, DeclineReason> {
 pub fn try_decompose_candidate_lifted(
     f: &MirFunction,
 ) -> Result<(Node, Option<Lift>), DeclineReason> {
+    try_decompose_candidate_detailed(f).map_err(|d| d.reason)
+}
+
+/// [`try_decompose_candidate_lifted`], with the condition count of a
+/// [`DeclineReason::TooManyConditions`] decline.
+pub fn try_decompose_candidate_detailed(f: &MirFunction) -> Result<(Node, Option<Lift>), Decline> {
     if f.is_ctfe {
-        return Err(DeclineReason::CtfeBody);
+        return Err(DeclineReason::CtfeBody.into());
     }
     let Some(entry) = f.blocks.first() else {
-        return Err(DeclineReason::UnsupportedShape);
+        return Err(DeclineReason::UnsupportedShape.into());
     };
-    let (node, lift) = try_decompose_from_block_lifted(f, entry.id)?;
-    if crate::masking::collect_conditions(&node).is_empty() {
-        return Err(DeclineReason::NoConditions);
+    let decomposed = try_decompose_from_block_lifted(f, entry.id);
+    if STEPS_EXHAUSTED.with(|e| e.replace(false)) {
+        return Err(Decline {
+            reason: DeclineReason::TooManyConditions,
+            conditions: Some(reachable_bool_switches(f, entry.id)),
+        });
+    }
+    let (node, lift) = decomposed?;
+    let conditions = crate::masking::collect_conditions(&node).len();
+    if conditions == 0 {
+        return Err(DeclineReason::NoConditions.into());
+    }
+    if conditions > MAX_DECISION_CONDITIONS {
+        return Err(Decline {
+            reason: DeclineReason::TooManyConditions,
+            conditions: Some(conditions),
+        });
     }
     Ok((node, lift))
+}
+
+/// Number of distinct blocks ending in a `switchInt` on a `bool`
+/// that are reachable from `root` along `goto`, `switchInt`, call
+/// return and assert success edges.
+fn reachable_bool_switches(f: &MirFunction, root: BlockId) -> usize {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = vec![root];
+    let mut count = 0;
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(block) = f.blocks.iter().find(|b| b.id == id) else {
+            continue;
+        };
+        match &block.terminator {
+            MirTerminator::SwitchInt {
+                discr,
+                targets,
+                otherwise,
+                ..
+            } => {
+                if local_type(f, *discr) == Some("bool") {
+                    count += 1;
+                }
+                stack.extend(targets.iter().map(|(_, t)| *t));
+                stack.push(*otherwise);
+            }
+            MirTerminator::Goto { target, .. } | MirTerminator::Call { target, .. } => {
+                stack.push(*target)
+            }
+            MirTerminator::Assert { success, .. } => stack.push(*success),
+            _ => {}
+        }
+    }
+    count
 }
 
 /// Guard for the branch-taken-as-result lift: both arms of a
@@ -898,6 +1039,9 @@ fn handle_try(expr: &TryExpr, f: &MirFunction) -> Option<Node> {
 /// engine conservative when corpus patterns exercise new shapes
 /// before the engine learns them.
 fn build_decision_from_block(block_id: BlockId, f: &MirFunction) -> Option<Node> {
+    if !take_step() {
+        return None;
+    }
     let block = f.blocks.iter().find(|b| b.id == block_id)?;
 
     // `?` operator: skip the `Try::branch` + `discriminant` prefix
@@ -7105,5 +7249,682 @@ fn ensure::<impl at src/ensure.rs:58:1: 58:19>::write_str::{closure#0}(_1: &mut 
         };
         assert_eq!(tree.conditions(0), names(&["d", "b", "a", "c"]));
         assert!(tree.conditions(1).is_empty());
+    }
+
+    /// A 40-alternative `matches!` over `char` ranges (url's
+    /// `is_url_code_point` shape), from `rustc +nightly --emit=mir
+    /// -Zmir-include-spans -Cinstrument-coverage
+    /// -Zcoverage-options=branch,condition` on:
+    ///
+    /// ```text
+    /// pub fn is_code_point(c: char) -> bool {
+    ///     matches!(c, 'a'..='b' | 'c'..='d' | .. | '\u{60000}'..='\u{6FFFD}')
+    /// }
+    /// ```
+    ///
+    /// Both edges of each range's first test lead to the next
+    /// alternative, so an unshared tree doubles per alternative.
+    const FORTY_RANGE_MATCHES_MIR: &str = r#"
+fn is_code_point(_1: char) -> bool {
+    debug c => _1;                       // in scope 0 at lib.rs:1:22: 1:23
+    let mut _0: bool;                    // return place in scope 0 at lib.rs:1:34: 1:38
+    let mut _2: bool;                    // in scope 0 at lib.rs:11:15: 11:40
+    let mut _3: bool;                    // in scope 0 at lib.rs:11:15: 11:40
+    let mut _4: bool;                    // in scope 0 at lib.rs:10:71: 10:96
+    let mut _5: bool;                    // in scope 0 at lib.rs:10:71: 10:96
+    let mut _6: bool;                    // in scope 0 at lib.rs:10:43: 10:68
+    let mut _7: bool;                    // in scope 0 at lib.rs:10:43: 10:68
+    let mut _8: bool;                    // in scope 0 at lib.rs:10:15: 10:40
+    let mut _9: bool;                    // in scope 0 at lib.rs:10:15: 10:40
+    let mut _10: bool;                   // in scope 0 at lib.rs:9:69: 9:94
+    let mut _11: bool;                   // in scope 0 at lib.rs:9:69: 9:94
+    let mut _12: bool;                   // in scope 0 at lib.rs:9:41: 9:66
+    let mut _13: bool;                   // in scope 0 at lib.rs:9:41: 9:66
+    let mut _14: bool;                   // in scope 0 at lib.rs:9:15: 9:38
+    let mut _15: bool;                   // in scope 0 at lib.rs:9:15: 9:38
+    let mut _16: bool;                   // in scope 0 at lib.rs:8:63: 8:86
+    let mut _17: bool;                   // in scope 0 at lib.rs:8:63: 8:86
+    let mut _18: bool;                   // in scope 0 at lib.rs:8:39: 8:60
+    let mut _19: bool;                   // in scope 0 at lib.rs:8:39: 8:60
+    let mut _20: bool;                   // in scope 0 at lib.rs:8:27: 8:36
+    let mut _21: bool;                   // in scope 0 at lib.rs:8:27: 8:36
+    let mut _22: bool;                   // in scope 0 at lib.rs:8:15: 8:24
+    let mut _23: bool;                   // in scope 0 at lib.rs:8:15: 8:24
+    let mut _24: bool;                   // in scope 0 at lib.rs:7:87: 7:96
+    let mut _25: bool;                   // in scope 0 at lib.rs:7:87: 7:96
+    let mut _26: bool;                   // in scope 0 at lib.rs:7:75: 7:84
+    let mut _27: bool;                   // in scope 0 at lib.rs:7:75: 7:84
+    let mut _28: bool;                   // in scope 0 at lib.rs:7:63: 7:72
+    let mut _29: bool;                   // in scope 0 at lib.rs:7:63: 7:72
+    let mut _30: bool;                   // in scope 0 at lib.rs:7:51: 7:60
+    let mut _31: bool;                   // in scope 0 at lib.rs:7:51: 7:60
+    let mut _32: bool;                   // in scope 0 at lib.rs:7:39: 7:48
+    let mut _33: bool;                   // in scope 0 at lib.rs:7:39: 7:48
+    let mut _34: bool;                   // in scope 0 at lib.rs:7:27: 7:36
+    let mut _35: bool;                   // in scope 0 at lib.rs:7:27: 7:36
+    let mut _36: bool;                   // in scope 0 at lib.rs:7:15: 7:24
+    let mut _37: bool;                   // in scope 0 at lib.rs:7:15: 7:24
+    let mut _38: bool;                   // in scope 0 at lib.rs:6:87: 6:96
+    let mut _39: bool;                   // in scope 0 at lib.rs:6:87: 6:96
+    let mut _40: bool;                   // in scope 0 at lib.rs:6:75: 6:84
+    let mut _41: bool;                   // in scope 0 at lib.rs:6:75: 6:84
+    let mut _42: bool;                   // in scope 0 at lib.rs:6:63: 6:72
+    let mut _43: bool;                   // in scope 0 at lib.rs:6:63: 6:72
+    let mut _44: bool;                   // in scope 0 at lib.rs:6:51: 6:60
+    let mut _45: bool;                   // in scope 0 at lib.rs:6:51: 6:60
+    let mut _46: bool;                   // in scope 0 at lib.rs:6:39: 6:48
+    let mut _47: bool;                   // in scope 0 at lib.rs:6:39: 6:48
+    let mut _48: bool;                   // in scope 0 at lib.rs:6:27: 6:36
+    let mut _49: bool;                   // in scope 0 at lib.rs:6:27: 6:36
+    let mut _50: bool;                   // in scope 0 at lib.rs:6:15: 6:24
+    let mut _51: bool;                   // in scope 0 at lib.rs:6:15: 6:24
+    let mut _52: bool;                   // in scope 0 at lib.rs:5:87: 5:96
+    let mut _53: bool;                   // in scope 0 at lib.rs:5:87: 5:96
+    let mut _54: bool;                   // in scope 0 at lib.rs:5:75: 5:84
+    let mut _55: bool;                   // in scope 0 at lib.rs:5:75: 5:84
+    let mut _56: bool;                   // in scope 0 at lib.rs:5:63: 5:72
+    let mut _57: bool;                   // in scope 0 at lib.rs:5:63: 5:72
+    let mut _58: bool;                   // in scope 0 at lib.rs:5:51: 5:60
+    let mut _59: bool;                   // in scope 0 at lib.rs:5:51: 5:60
+    let mut _60: bool;                   // in scope 0 at lib.rs:5:39: 5:48
+    let mut _61: bool;                   // in scope 0 at lib.rs:5:39: 5:48
+    let mut _62: bool;                   // in scope 0 at lib.rs:5:27: 5:36
+    let mut _63: bool;                   // in scope 0 at lib.rs:5:27: 5:36
+    let mut _64: bool;                   // in scope 0 at lib.rs:5:15: 5:24
+    let mut _65: bool;                   // in scope 0 at lib.rs:5:15: 5:24
+    let mut _66: bool;                   // in scope 0 at lib.rs:4:93: 4:102
+    let mut _67: bool;                   // in scope 0 at lib.rs:4:93: 4:102
+    let mut _68: bool;                   // in scope 0 at lib.rs:4:81: 4:90
+    let mut _69: bool;                   // in scope 0 at lib.rs:4:81: 4:90
+    let mut _70: bool;                   // in scope 0 at lib.rs:4:69: 4:78
+    let mut _71: bool;                   // in scope 0 at lib.rs:4:69: 4:78
+    let mut _72: bool;                   // in scope 0 at lib.rs:4:57: 4:66
+    let mut _73: bool;                   // in scope 0 at lib.rs:4:57: 4:66
+    let mut _74: bool;                   // in scope 0 at lib.rs:4:45: 4:54
+    let mut _75: bool;                   // in scope 0 at lib.rs:4:45: 4:54
+    let mut _76: bool;                   // in scope 0 at lib.rs:4:33: 4:42
+    let mut _77: bool;                   // in scope 0 at lib.rs:4:33: 4:42
+    let mut _78: bool;                   // in scope 0 at lib.rs:4:21: 4:30
+    let mut _79: bool;                   // in scope 0 at lib.rs:4:21: 4:30
+    let mut _80: bool;                   // in scope 0 at lib.rs:4:9: 4:18
+    let mut _81: bool;                   // in scope 0 at lib.rs:4:9: 4:18
+    scope 1 {
+    }
+
+    coverage Code { bcb: bcb0 } => lib.rs:1:1: 1:38 (#0);
+    coverage Code { bcb: bcb0 } => lib.rs:2:5: 2:13 (#0);
+    coverage Code { bcb: bcb0 } => lib.rs:3:9: 3:10 (#0);
+    coverage Code { bcb: bcb3 } => lib.rs:13:1: 13:2 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 1 at lib.rs:4:9: 4:18
+        _80 = Le(const 'a', copy _1);    // scope 1 at lib.rs:4:9: 4:18
+        switchInt(move _80) -> [0: bb2, otherwise: bb80]; // scope 1 at lib.rs:4:9: 4:18
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb82); // scope 1 at /rustc/1c3a6506966e21845b31de0b075d2527660db132/library/core/src/macros/mod.rs:436:18: 436:23
+        _0 = const false;                // scope 1 at /rustc/1c3a6506966e21845b31de0b075d2527660db132/library/core/src/macros/mod.rs:436:18: 436:23
+        goto -> bb82;                    // scope 1 at /rustc/1c3a6506966e21845b31de0b075d2527660db132/library/core/src/macros/mod.rs:436:18: 436:23
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb4);  // scope 1 at lib.rs:4:21: 4:30
+        _78 = Le(const 'c', copy _1);    // scope 1 at lib.rs:4:21: 4:30
+        switchInt(move _78) -> [0: bb3, otherwise: bb79]; // scope 1 at lib.rs:4:21: 4:30
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb6);  // scope 1 at lib.rs:4:33: 4:42
+        _76 = Le(const 'e', copy _1);    // scope 1 at lib.rs:4:33: 4:42
+        switchInt(move _76) -> [0: bb4, otherwise: bb78]; // scope 1 at lib.rs:4:33: 4:42
+    }
+
+    bb4: {
+        Coverage::VirtualCounter(bcb8);  // scope 1 at lib.rs:4:45: 4:54
+        _74 = Le(const 'g', copy _1);    // scope 1 at lib.rs:4:45: 4:54
+        switchInt(move _74) -> [0: bb5, otherwise: bb77]; // scope 1 at lib.rs:4:45: 4:54
+    }
+
+    bb5: {
+        Coverage::VirtualCounter(bcb10); // scope 1 at lib.rs:4:57: 4:66
+        _72 = Le(const 'i', copy _1);    // scope 1 at lib.rs:4:57: 4:66
+        switchInt(move _72) -> [0: bb6, otherwise: bb76]; // scope 1 at lib.rs:4:57: 4:66
+    }
+
+    bb6: {
+        Coverage::VirtualCounter(bcb12); // scope 1 at lib.rs:4:69: 4:78
+        _70 = Le(const 'k', copy _1);    // scope 1 at lib.rs:4:69: 4:78
+        switchInt(move _70) -> [0: bb7, otherwise: bb75]; // scope 1 at lib.rs:4:69: 4:78
+    }
+
+    bb7: {
+        Coverage::VirtualCounter(bcb14); // scope 1 at lib.rs:4:81: 4:90
+        _68 = Le(const 'm', copy _1);    // scope 1 at lib.rs:4:81: 4:90
+        switchInt(move _68) -> [0: bb8, otherwise: bb74]; // scope 1 at lib.rs:4:81: 4:90
+    }
+
+    bb8: {
+        Coverage::VirtualCounter(bcb16); // scope 1 at lib.rs:4:93: 4:102
+        _66 = Le(const 'o', copy _1);    // scope 1 at lib.rs:4:93: 4:102
+        switchInt(move _66) -> [0: bb9, otherwise: bb73]; // scope 1 at lib.rs:4:93: 4:102
+    }
+
+    bb9: {
+        Coverage::VirtualCounter(bcb18); // scope 1 at lib.rs:5:15: 5:24
+        _64 = Le(const 'q', copy _1);    // scope 1 at lib.rs:5:15: 5:24
+        switchInt(move _64) -> [0: bb10, otherwise: bb72]; // scope 1 at lib.rs:5:15: 5:24
+    }
+
+    bb10: {
+        Coverage::VirtualCounter(bcb20); // scope 1 at lib.rs:5:27: 5:36
+        _62 = Le(const 's', copy _1);    // scope 1 at lib.rs:5:27: 5:36
+        switchInt(move _62) -> [0: bb11, otherwise: bb71]; // scope 1 at lib.rs:5:27: 5:36
+    }
+
+    bb11: {
+        Coverage::VirtualCounter(bcb22); // scope 1 at lib.rs:5:39: 5:48
+        _60 = Le(const 'u', copy _1);    // scope 1 at lib.rs:5:39: 5:48
+        switchInt(move _60) -> [0: bb12, otherwise: bb70]; // scope 1 at lib.rs:5:39: 5:48
+    }
+
+    bb12: {
+        Coverage::VirtualCounter(bcb24); // scope 1 at lib.rs:5:51: 5:60
+        _58 = Le(const 'w', copy _1);    // scope 1 at lib.rs:5:51: 5:60
+        switchInt(move _58) -> [0: bb13, otherwise: bb69]; // scope 1 at lib.rs:5:51: 5:60
+    }
+
+    bb13: {
+        Coverage::VirtualCounter(bcb26); // scope 1 at lib.rs:5:63: 5:72
+        _56 = Le(const 'y', copy _1);    // scope 1 at lib.rs:5:63: 5:72
+        switchInt(move _56) -> [0: bb14, otherwise: bb68]; // scope 1 at lib.rs:5:63: 5:72
+    }
+
+    bb14: {
+        Coverage::VirtualCounter(bcb28); // scope 1 at lib.rs:5:75: 5:84
+        _54 = Le(const 'A', copy _1);    // scope 1 at lib.rs:5:75: 5:84
+        switchInt(move _54) -> [0: bb15, otherwise: bb67]; // scope 1 at lib.rs:5:75: 5:84
+    }
+
+    bb15: {
+        Coverage::VirtualCounter(bcb30); // scope 1 at lib.rs:5:87: 5:96
+        _52 = Le(const 'C', copy _1);    // scope 1 at lib.rs:5:87: 5:96
+        switchInt(move _52) -> [0: bb16, otherwise: bb66]; // scope 1 at lib.rs:5:87: 5:96
+    }
+
+    bb16: {
+        Coverage::VirtualCounter(bcb32); // scope 1 at lib.rs:6:15: 6:24
+        _50 = Le(const 'E', copy _1);    // scope 1 at lib.rs:6:15: 6:24
+        switchInt(move _50) -> [0: bb17, otherwise: bb65]; // scope 1 at lib.rs:6:15: 6:24
+    }
+
+    bb17: {
+        Coverage::VirtualCounter(bcb34); // scope 1 at lib.rs:6:27: 6:36
+        _48 = Le(const 'G', copy _1);    // scope 1 at lib.rs:6:27: 6:36
+        switchInt(move _48) -> [0: bb18, otherwise: bb64]; // scope 1 at lib.rs:6:27: 6:36
+    }
+
+    bb18: {
+        Coverage::VirtualCounter(bcb36); // scope 1 at lib.rs:6:39: 6:48
+        _46 = Le(const 'I', copy _1);    // scope 1 at lib.rs:6:39: 6:48
+        switchInt(move _46) -> [0: bb19, otherwise: bb63]; // scope 1 at lib.rs:6:39: 6:48
+    }
+
+    bb19: {
+        Coverage::VirtualCounter(bcb38); // scope 1 at lib.rs:6:51: 6:60
+        _44 = Le(const 'K', copy _1);    // scope 1 at lib.rs:6:51: 6:60
+        switchInt(move _44) -> [0: bb20, otherwise: bb62]; // scope 1 at lib.rs:6:51: 6:60
+    }
+
+    bb20: {
+        Coverage::VirtualCounter(bcb40); // scope 1 at lib.rs:6:63: 6:72
+        _42 = Le(const 'M', copy _1);    // scope 1 at lib.rs:6:63: 6:72
+        switchInt(move _42) -> [0: bb21, otherwise: bb61]; // scope 1 at lib.rs:6:63: 6:72
+    }
+
+    bb21: {
+        Coverage::VirtualCounter(bcb42); // scope 1 at lib.rs:6:75: 6:84
+        _40 = Le(const 'O', copy _1);    // scope 1 at lib.rs:6:75: 6:84
+        switchInt(move _40) -> [0: bb22, otherwise: bb60]; // scope 1 at lib.rs:6:75: 6:84
+    }
+
+    bb22: {
+        Coverage::VirtualCounter(bcb44); // scope 1 at lib.rs:6:87: 6:96
+        _38 = Le(const 'Q', copy _1);    // scope 1 at lib.rs:6:87: 6:96
+        switchInt(move _38) -> [0: bb23, otherwise: bb59]; // scope 1 at lib.rs:6:87: 6:96
+    }
+
+    bb23: {
+        Coverage::VirtualCounter(bcb46); // scope 1 at lib.rs:7:15: 7:24
+        _36 = Le(const 'S', copy _1);    // scope 1 at lib.rs:7:15: 7:24
+        switchInt(move _36) -> [0: bb24, otherwise: bb58]; // scope 1 at lib.rs:7:15: 7:24
+    }
+
+    bb24: {
+        Coverage::VirtualCounter(bcb48); // scope 1 at lib.rs:7:27: 7:36
+        _34 = Le(const 'U', copy _1);    // scope 1 at lib.rs:7:27: 7:36
+        switchInt(move _34) -> [0: bb25, otherwise: bb57]; // scope 1 at lib.rs:7:27: 7:36
+    }
+
+    bb25: {
+        Coverage::VirtualCounter(bcb50); // scope 1 at lib.rs:7:39: 7:48
+        _32 = Le(const 'W', copy _1);    // scope 1 at lib.rs:7:39: 7:48
+        switchInt(move _32) -> [0: bb26, otherwise: bb56]; // scope 1 at lib.rs:7:39: 7:48
+    }
+
+    bb26: {
+        Coverage::VirtualCounter(bcb52); // scope 1 at lib.rs:7:51: 7:60
+        _30 = Le(const 'Y', copy _1);    // scope 1 at lib.rs:7:51: 7:60
+        switchInt(move _30) -> [0: bb27, otherwise: bb55]; // scope 1 at lib.rs:7:51: 7:60
+    }
+
+    bb27: {
+        Coverage::VirtualCounter(bcb54); // scope 1 at lib.rs:7:63: 7:72
+        _28 = Le(const '0', copy _1);    // scope 1 at lib.rs:7:63: 7:72
+        switchInt(move _28) -> [0: bb28, otherwise: bb54]; // scope 1 at lib.rs:7:63: 7:72
+    }
+
+    bb28: {
+        Coverage::VirtualCounter(bcb56); // scope 1 at lib.rs:7:75: 7:84
+        _26 = Le(const '2', copy _1);    // scope 1 at lib.rs:7:75: 7:84
+        switchInt(move _26) -> [0: bb29, otherwise: bb53]; // scope 1 at lib.rs:7:75: 7:84
+    }
+
+    bb29: {
+        Coverage::VirtualCounter(bcb58); // scope 1 at lib.rs:7:87: 7:96
+        _24 = Le(const '4', copy _1);    // scope 1 at lib.rs:7:87: 7:96
+        switchInt(move _24) -> [0: bb30, otherwise: bb52]; // scope 1 at lib.rs:7:87: 7:96
+    }
+
+    bb30: {
+        Coverage::VirtualCounter(bcb60); // scope 1 at lib.rs:8:15: 8:24
+        _22 = Le(const '6', copy _1);    // scope 1 at lib.rs:8:15: 8:24
+        switchInt(move _22) -> [0: bb31, otherwise: bb51]; // scope 1 at lib.rs:8:15: 8:24
+    }
+
+    bb31: {
+        Coverage::VirtualCounter(bcb62); // scope 1 at lib.rs:8:27: 8:36
+        _20 = Le(const '8', copy _1);    // scope 1 at lib.rs:8:27: 8:36
+        switchInt(move _20) -> [0: bb32, otherwise: bb50]; // scope 1 at lib.rs:8:27: 8:36
+    }
+
+    bb32: {
+        Coverage::VirtualCounter(bcb64); // scope 1 at lib.rs:8:39: 8:60
+        _18 = Le(const '\u{a0}', copy _1); // scope 1 at lib.rs:8:39: 8:60
+        switchInt(move _18) -> [0: bb33, otherwise: bb49]; // scope 1 at lib.rs:8:39: 8:60
+    }
+
+    bb33: {
+        Coverage::VirtualCounter(bcb66); // scope 1 at lib.rs:8:63: 8:86
+        _16 = Le(const '\u{e000}', copy _1); // scope 1 at lib.rs:8:63: 8:86
+        switchInt(move _16) -> [0: bb34, otherwise: bb48]; // scope 1 at lib.rs:8:63: 8:86
+    }
+
+    bb34: {
+        Coverage::VirtualCounter(bcb68); // scope 1 at lib.rs:9:15: 9:38
+        _14 = Le(const 'ﷰ', copy _1);    // scope 1 at lib.rs:9:15: 9:38
+        switchInt(move _14) -> [0: bb35, otherwise: bb47]; // scope 1 at lib.rs:9:15: 9:38
+    }
+
+    bb35: {
+        Coverage::VirtualCounter(bcb70); // scope 1 at lib.rs:9:41: 9:66
+        _12 = Le(const '𐀀', copy _1);    // scope 1 at lib.rs:9:41: 9:66
+        switchInt(move _12) -> [0: bb36, otherwise: bb46]; // scope 1 at lib.rs:9:41: 9:66
+    }
+
+    bb36: {
+        Coverage::VirtualCounter(bcb72); // scope 1 at lib.rs:9:69: 9:94
+        _10 = Le(const '𠀀', copy _1);    // scope 1 at lib.rs:9:69: 9:94
+        switchInt(move _10) -> [0: bb37, otherwise: bb45]; // scope 1 at lib.rs:9:69: 9:94
+    }
+
+    bb37: {
+        Coverage::VirtualCounter(bcb74); // scope 1 at lib.rs:10:15: 10:40
+        _8 = Le(const '𰀀', copy _1);     // scope 1 at lib.rs:10:15: 10:40
+        switchInt(move _8) -> [0: bb38, otherwise: bb44]; // scope 1 at lib.rs:10:15: 10:40
+    }
+
+    bb38: {
+        Coverage::VirtualCounter(bcb76); // scope 1 at lib.rs:10:43: 10:68
+        _6 = Le(const '\u{40000}', copy _1); // scope 1 at lib.rs:10:43: 10:68
+        switchInt(move _6) -> [0: bb39, otherwise: bb43]; // scope 1 at lib.rs:10:43: 10:68
+    }
+
+    bb39: {
+        Coverage::VirtualCounter(bcb78); // scope 1 at lib.rs:10:71: 10:96
+        _4 = Le(const '\u{50000}', copy _1); // scope 1 at lib.rs:10:71: 10:96
+        switchInt(move _4) -> [0: bb40, otherwise: bb42]; // scope 1 at lib.rs:10:71: 10:96
+    }
+
+    bb40: {
+        Coverage::VirtualCounter(bcb80); // scope 1 at lib.rs:11:15: 11:40
+        _2 = Le(const '\u{60000}', copy _1); // scope 1 at lib.rs:11:15: 11:40
+        switchInt(move _2) -> [0: bb1, otherwise: bb41]; // scope 1 at lib.rs:11:15: 11:40
+    }
+
+    bb41: {
+        Coverage::VirtualCounter(bcb81); // scope 1 at lib.rs:11:15: 11:40
+        _3 = Le(copy _1, const '\u{6fffd}'); // scope 1 at lib.rs:11:15: 11:40
+        switchInt(move _3) -> [0: bb1, otherwise: bb81]; // scope 1 at lib.rs:11:15: 11:40
+    }
+
+    bb42: {
+        Coverage::VirtualCounter(bcb79); // scope 1 at lib.rs:10:71: 10:96
+        _5 = Le(copy _1, const '\u{5fffd}'); // scope 1 at lib.rs:10:71: 10:96
+        switchInt(move _5) -> [0: bb40, otherwise: bb81]; // scope 1 at lib.rs:10:71: 10:96
+    }
+
+    bb43: {
+        Coverage::VirtualCounter(bcb77); // scope 1 at lib.rs:10:43: 10:68
+        _7 = Le(copy _1, const '\u{4fffd}'); // scope 1 at lib.rs:10:43: 10:68
+        switchInt(move _7) -> [0: bb39, otherwise: bb81]; // scope 1 at lib.rs:10:43: 10:68
+    }
+
+    bb44: {
+        Coverage::VirtualCounter(bcb75); // scope 1 at lib.rs:10:15: 10:40
+        _9 = Le(copy _1, const '\u{3fffd}'); // scope 1 at lib.rs:10:15: 10:40
+        switchInt(move _9) -> [0: bb38, otherwise: bb81]; // scope 1 at lib.rs:10:15: 10:40
+    }
+
+    bb45: {
+        Coverage::VirtualCounter(bcb73); // scope 1 at lib.rs:9:69: 9:94
+        _11 = Le(copy _1, const '\u{2fffd}'); // scope 1 at lib.rs:9:69: 9:94
+        switchInt(move _11) -> [0: bb37, otherwise: bb81]; // scope 1 at lib.rs:9:69: 9:94
+    }
+
+    bb46: {
+        Coverage::VirtualCounter(bcb71); // scope 1 at lib.rs:9:41: 9:66
+        _13 = Le(copy _1, const '\u{1fffd}'); // scope 1 at lib.rs:9:41: 9:66
+        switchInt(move _13) -> [0: bb36, otherwise: bb81]; // scope 1 at lib.rs:9:41: 9:66
+    }
+
+    bb47: {
+        Coverage::VirtualCounter(bcb69); // scope 1 at lib.rs:9:15: 9:38
+        _15 = Le(copy _1, const '�');    // scope 1 at lib.rs:9:15: 9:38
+        switchInt(move _15) -> [0: bb35, otherwise: bb81]; // scope 1 at lib.rs:9:15: 9:38
+    }
+
+    bb48: {
+        Coverage::VirtualCounter(bcb67); // scope 1 at lib.rs:8:63: 8:86
+        _17 = Le(copy _1, const '﷏');    // scope 1 at lib.rs:8:63: 8:86
+        switchInt(move _17) -> [0: bb34, otherwise: bb81]; // scope 1 at lib.rs:8:63: 8:86
+    }
+
+    bb49: {
+        Coverage::VirtualCounter(bcb65); // scope 1 at lib.rs:8:39: 8:60
+        _19 = Le(copy _1, const '\u{d7ff}'); // scope 1 at lib.rs:8:39: 8:60
+        switchInt(move _19) -> [0: bb33, otherwise: bb81]; // scope 1 at lib.rs:8:39: 8:60
+    }
+
+    bb50: {
+        Coverage::VirtualCounter(bcb63); // scope 1 at lib.rs:8:27: 8:36
+        _21 = Le(copy _1, const '9');    // scope 1 at lib.rs:8:27: 8:36
+        switchInt(move _21) -> [0: bb32, otherwise: bb81]; // scope 1 at lib.rs:8:27: 8:36
+    }
+
+    bb51: {
+        Coverage::VirtualCounter(bcb61); // scope 1 at lib.rs:8:15: 8:24
+        _23 = Le(copy _1, const '7');    // scope 1 at lib.rs:8:15: 8:24
+        switchInt(move _23) -> [0: bb31, otherwise: bb81]; // scope 1 at lib.rs:8:15: 8:24
+    }
+
+    bb52: {
+        Coverage::VirtualCounter(bcb59); // scope 1 at lib.rs:7:87: 7:96
+        _25 = Le(copy _1, const '5');    // scope 1 at lib.rs:7:87: 7:96
+        switchInt(move _25) -> [0: bb30, otherwise: bb81]; // scope 1 at lib.rs:7:87: 7:96
+    }
+
+    bb53: {
+        Coverage::VirtualCounter(bcb57); // scope 1 at lib.rs:7:75: 7:84
+        _27 = Le(copy _1, const '3');    // scope 1 at lib.rs:7:75: 7:84
+        switchInt(move _27) -> [0: bb29, otherwise: bb81]; // scope 1 at lib.rs:7:75: 7:84
+    }
+
+    bb54: {
+        Coverage::VirtualCounter(bcb55); // scope 1 at lib.rs:7:63: 7:72
+        _29 = Le(copy _1, const '1');    // scope 1 at lib.rs:7:63: 7:72
+        switchInt(move _29) -> [0: bb28, otherwise: bb81]; // scope 1 at lib.rs:7:63: 7:72
+    }
+
+    bb55: {
+        Coverage::VirtualCounter(bcb53); // scope 1 at lib.rs:7:51: 7:60
+        _31 = Le(copy _1, const 'Z');    // scope 1 at lib.rs:7:51: 7:60
+        switchInt(move _31) -> [0: bb27, otherwise: bb81]; // scope 1 at lib.rs:7:51: 7:60
+    }
+
+    bb56: {
+        Coverage::VirtualCounter(bcb51); // scope 1 at lib.rs:7:39: 7:48
+        _33 = Le(copy _1, const 'X');    // scope 1 at lib.rs:7:39: 7:48
+        switchInt(move _33) -> [0: bb26, otherwise: bb81]; // scope 1 at lib.rs:7:39: 7:48
+    }
+
+    bb57: {
+        Coverage::VirtualCounter(bcb49); // scope 1 at lib.rs:7:27: 7:36
+        _35 = Le(copy _1, const 'V');    // scope 1 at lib.rs:7:27: 7:36
+        switchInt(move _35) -> [0: bb25, otherwise: bb81]; // scope 1 at lib.rs:7:27: 7:36
+    }
+
+    bb58: {
+        Coverage::VirtualCounter(bcb47); // scope 1 at lib.rs:7:15: 7:24
+        _37 = Le(copy _1, const 'T');    // scope 1 at lib.rs:7:15: 7:24
+        switchInt(move _37) -> [0: bb24, otherwise: bb81]; // scope 1 at lib.rs:7:15: 7:24
+    }
+
+    bb59: {
+        Coverage::VirtualCounter(bcb45); // scope 1 at lib.rs:6:87: 6:96
+        _39 = Le(copy _1, const 'R');    // scope 1 at lib.rs:6:87: 6:96
+        switchInt(move _39) -> [0: bb23, otherwise: bb81]; // scope 1 at lib.rs:6:87: 6:96
+    }
+
+    bb60: {
+        Coverage::VirtualCounter(bcb43); // scope 1 at lib.rs:6:75: 6:84
+        _41 = Le(copy _1, const 'P');    // scope 1 at lib.rs:6:75: 6:84
+        switchInt(move _41) -> [0: bb22, otherwise: bb81]; // scope 1 at lib.rs:6:75: 6:84
+    }
+
+    bb61: {
+        Coverage::VirtualCounter(bcb41); // scope 1 at lib.rs:6:63: 6:72
+        _43 = Le(copy _1, const 'N');    // scope 1 at lib.rs:6:63: 6:72
+        switchInt(move _43) -> [0: bb21, otherwise: bb81]; // scope 1 at lib.rs:6:63: 6:72
+    }
+
+    bb62: {
+        Coverage::VirtualCounter(bcb39); // scope 1 at lib.rs:6:51: 6:60
+        _45 = Le(copy _1, const 'L');    // scope 1 at lib.rs:6:51: 6:60
+        switchInt(move _45) -> [0: bb20, otherwise: bb81]; // scope 1 at lib.rs:6:51: 6:60
+    }
+
+    bb63: {
+        Coverage::VirtualCounter(bcb37); // scope 1 at lib.rs:6:39: 6:48
+        _47 = Le(copy _1, const 'J');    // scope 1 at lib.rs:6:39: 6:48
+        switchInt(move _47) -> [0: bb19, otherwise: bb81]; // scope 1 at lib.rs:6:39: 6:48
+    }
+
+    bb64: {
+        Coverage::VirtualCounter(bcb35); // scope 1 at lib.rs:6:27: 6:36
+        _49 = Le(copy _1, const 'H');    // scope 1 at lib.rs:6:27: 6:36
+        switchInt(move _49) -> [0: bb18, otherwise: bb81]; // scope 1 at lib.rs:6:27: 6:36
+    }
+
+    bb65: {
+        Coverage::VirtualCounter(bcb33); // scope 1 at lib.rs:6:15: 6:24
+        _51 = Le(copy _1, const 'F');    // scope 1 at lib.rs:6:15: 6:24
+        switchInt(move _51) -> [0: bb17, otherwise: bb81]; // scope 1 at lib.rs:6:15: 6:24
+    }
+
+    bb66: {
+        Coverage::VirtualCounter(bcb31); // scope 1 at lib.rs:5:87: 5:96
+        _53 = Le(copy _1, const 'D');    // scope 1 at lib.rs:5:87: 5:96
+        switchInt(move _53) -> [0: bb16, otherwise: bb81]; // scope 1 at lib.rs:5:87: 5:96
+    }
+
+    bb67: {
+        Coverage::VirtualCounter(bcb29); // scope 1 at lib.rs:5:75: 5:84
+        _55 = Le(copy _1, const 'B');    // scope 1 at lib.rs:5:75: 5:84
+        switchInt(move _55) -> [0: bb15, otherwise: bb81]; // scope 1 at lib.rs:5:75: 5:84
+    }
+
+    bb68: {
+        Coverage::VirtualCounter(bcb27); // scope 1 at lib.rs:5:63: 5:72
+        _57 = Le(copy _1, const 'z');    // scope 1 at lib.rs:5:63: 5:72
+        switchInt(move _57) -> [0: bb14, otherwise: bb81]; // scope 1 at lib.rs:5:63: 5:72
+    }
+
+    bb69: {
+        Coverage::VirtualCounter(bcb25); // scope 1 at lib.rs:5:51: 5:60
+        _59 = Le(copy _1, const 'x');    // scope 1 at lib.rs:5:51: 5:60
+        switchInt(move _59) -> [0: bb13, otherwise: bb81]; // scope 1 at lib.rs:5:51: 5:60
+    }
+
+    bb70: {
+        Coverage::VirtualCounter(bcb23); // scope 1 at lib.rs:5:39: 5:48
+        _61 = Le(copy _1, const 'v');    // scope 1 at lib.rs:5:39: 5:48
+        switchInt(move _61) -> [0: bb12, otherwise: bb81]; // scope 1 at lib.rs:5:39: 5:48
+    }
+
+    bb71: {
+        Coverage::VirtualCounter(bcb21); // scope 1 at lib.rs:5:27: 5:36
+        _63 = Le(copy _1, const 't');    // scope 1 at lib.rs:5:27: 5:36
+        switchInt(move _63) -> [0: bb11, otherwise: bb81]; // scope 1 at lib.rs:5:27: 5:36
+    }
+
+    bb72: {
+        Coverage::VirtualCounter(bcb19); // scope 1 at lib.rs:5:15: 5:24
+        _65 = Le(copy _1, const 'r');    // scope 1 at lib.rs:5:15: 5:24
+        switchInt(move _65) -> [0: bb10, otherwise: bb81]; // scope 1 at lib.rs:5:15: 5:24
+    }
+
+    bb73: {
+        Coverage::VirtualCounter(bcb17); // scope 1 at lib.rs:4:93: 4:102
+        _67 = Le(copy _1, const 'p');    // scope 1 at lib.rs:4:93: 4:102
+        switchInt(move _67) -> [0: bb9, otherwise: bb81]; // scope 1 at lib.rs:4:93: 4:102
+    }
+
+    bb74: {
+        Coverage::VirtualCounter(bcb15); // scope 1 at lib.rs:4:81: 4:90
+        _69 = Le(copy _1, const 'n');    // scope 1 at lib.rs:4:81: 4:90
+        switchInt(move _69) -> [0: bb8, otherwise: bb81]; // scope 1 at lib.rs:4:81: 4:90
+    }
+
+    bb75: {
+        Coverage::VirtualCounter(bcb13); // scope 1 at lib.rs:4:69: 4:78
+        _71 = Le(copy _1, const 'l');    // scope 1 at lib.rs:4:69: 4:78
+        switchInt(move _71) -> [0: bb7, otherwise: bb81]; // scope 1 at lib.rs:4:69: 4:78
+    }
+
+    bb76: {
+        Coverage::VirtualCounter(bcb11); // scope 1 at lib.rs:4:57: 4:66
+        _73 = Le(copy _1, const 'j');    // scope 1 at lib.rs:4:57: 4:66
+        switchInt(move _73) -> [0: bb6, otherwise: bb81]; // scope 1 at lib.rs:4:57: 4:66
+    }
+
+    bb77: {
+        Coverage::VirtualCounter(bcb9);  // scope 1 at lib.rs:4:45: 4:54
+        _75 = Le(copy _1, const 'h');    // scope 1 at lib.rs:4:45: 4:54
+        switchInt(move _75) -> [0: bb5, otherwise: bb81]; // scope 1 at lib.rs:4:45: 4:54
+    }
+
+    bb78: {
+        Coverage::VirtualCounter(bcb7);  // scope 1 at lib.rs:4:33: 4:42
+        _77 = Le(copy _1, const 'f');    // scope 1 at lib.rs:4:33: 4:42
+        switchInt(move _77) -> [0: bb4, otherwise: bb81]; // scope 1 at lib.rs:4:33: 4:42
+    }
+
+    bb79: {
+        Coverage::VirtualCounter(bcb5);  // scope 1 at lib.rs:4:21: 4:30
+        _79 = Le(copy _1, const 'd');    // scope 1 at lib.rs:4:21: 4:30
+        switchInt(move _79) -> [0: bb3, otherwise: bb81]; // scope 1 at lib.rs:4:21: 4:30
+    }
+
+    bb80: {
+        Coverage::VirtualCounter(bcb1);  // scope 1 at lib.rs:4:9: 4:18
+        _81 = Le(copy _1, const 'b');    // scope 1 at lib.rs:4:9: 4:18
+        switchInt(move _81) -> [0: bb2, otherwise: bb81]; // scope 1 at lib.rs:4:9: 4:18
+    }
+
+    bb81: {
+        Coverage::VirtualCounter(bcb2);  // scope 1 at lib.rs:4:9: 11:40
+        _0 = const true;                 // scope 1 at /rustc/1c3a6506966e21845b31de0b075d2527660db132/library/core/src/macros/mod.rs:435:39: 435:43
+        goto -> bb82;                    // scope 1 at /rustc/1c3a6506966e21845b31de0b075d2527660db132/library/core/src/macros/mod.rs:435:39: 435:43
+    }
+
+    bb82: {
+        Coverage::VirtualCounter(bcb3);  // scope 0 at lib.rs:13:2: 13:2
+        return;                          // scope 0 at lib.rs:13:2: 13:2
+    }
+}
+"#;
+
+    #[test]
+    fn forty_alternative_matches_declines_fast_as_too_many_conditions() {
+        let mir = mir::parse_text(FORTY_RANGE_MATCHES_MIR).expect("MIR parses");
+        let f = &mir.functions[0];
+        assert_eq!(f.name, "is_code_point");
+        let started = std::time::Instant::now();
+        let declined = try_decompose_candidate_detailed(f).expect_err("declined");
+        let elapsed = started.elapsed();
+        assert_eq!(declined.reason, DeclineReason::TooManyConditions);
+        // Every range is two `Le` tests.
+        assert_eq!(declined.conditions, Some(80));
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "declined in {elapsed:?}"
+        );
+        assert_eq!(
+            try_decompose_candidate(f),
+            Err(DeclineReason::TooManyConditions)
+        );
+        assert_eq!(
+            serde_json::to_value(DeclineReason::TooManyConditions).unwrap(),
+            "too_many_conditions"
+        );
+        // The step budget does not leak into the next decomposition.
+        let small = mir::parse_text(&and_chain_mir(2)).expect("MIR parses");
+        assert!(try_decompose_candidate(&small.functions[0]).is_ok());
+    }
+
+    /// `fn wide(c1: bool, .., cn: bool) -> bool { c1 && .. && cn }`
+    /// as a chain of `switchInt`s.
+    fn and_chain_mir(n: usize) -> String {
+        let args: Vec<String> = (1..=n).map(|i| format!("_{i}: bool")).collect();
+        let mut text = format!("fn wide({}) -> bool {{\n", args.join(", "));
+        for i in 1..=n {
+            text.push_str(&format!("    debug c{i} => _{i};\n"));
+        }
+        text.push_str("    let mut _0: bool;\n\n");
+        let (no, yes) = (n, n + 1);
+        for i in 1..=n {
+            let next = if i == n { yes } else { i };
+            text.push_str(&format!(
+                "    bb{}: {{\n        switchInt(copy _{i}) -> [0: bb{no}, otherwise: bb{next}]; // scope 0 at src/lib.rs:1:{i}: 1:{}\n    }}\n\n",
+                i - 1,
+                i + 1
+            ));
+        }
+        for (id, value) in [(no, "false"), (yes, "true")] {
+            text.push_str(&format!(
+                "    bb{id}: {{\n        _0 = const {value};                // scope 0 at src/lib.rs:2:1: 2:2\n        return;                          // scope 0 at src/lib.rs:2:1: 2:2\n    }}\n\n"
+            ));
+        }
+        text.push_str("}\n");
+        text
+    }
+
+    /// A decision over more than [`MAX_DECISION_CONDITIONS`]
+    /// conditions that builds within the step budget is declined by
+    /// its condition count; one at the limit is decomposed.
+    #[test]
+    fn a_wide_and_chain_is_declined_by_its_condition_count() {
+        let at_limit = mir::parse_text(&and_chain_mir(MAX_DECISION_CONDITIONS)).expect("parses");
+        let node = try_decompose_candidate(&at_limit.functions[0]).expect("decomposes");
+        assert_eq!(
+            crate::masking::collect_conditions(&node).len(),
+            MAX_DECISION_CONDITIONS
+        );
+        let n = MAX_DECISION_CONDITIONS + 1;
+        let wide = mir::parse_text(&and_chain_mir(n)).expect("parses");
+        let declined = try_decompose_candidate_detailed(&wide.functions[0]).expect_err("declined");
+        assert_eq!(declined.reason, DeclineReason::TooManyConditions);
+        assert_eq!(declined.conditions, Some(n));
     }
 }
