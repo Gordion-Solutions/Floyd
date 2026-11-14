@@ -87,7 +87,7 @@ pub fn scan_functions(
             continue;
         }
         let declined = |reason, detail, conditions| {
-            let prov = locate_in_workspace(f, correlate::provenance_for(f));
+            let prov = correlate::provenance_for(f);
             DeclinedFunction {
                 name: prov.function_name.unwrap_or_default(),
                 source_file: prov.source_file,
@@ -115,7 +115,7 @@ pub fn scan_functions(
                 continue;
             }
         };
-        let mut prov = DecisionProvenance {
+        let prov = DecisionProvenance {
             lift,
             ..correlate::provenance_for(f)
         };
@@ -130,27 +130,20 @@ pub fn scan_functions(
                 continue;
             }
         }
-        if prov
-            .source_file
-            .as_deref()
-            .is_some_and(scope::is_std_library_path)
-        {
-            if !scope::has_user_switch(f) {
-                // The decision is wholly another crate's macro code:
-                // `assert_eq!`'s `left_val == right_val` in a test.
-                // Its "conditions" are the macro's own locals.
-                if let Some(detail) = scope::classify_no_decision(f, source) {
-                    scan.declined
-                        .push(declined(DeclineReason::NoDecision, Some(detail), None));
-                    continue;
-                }
-                // Not accounted for (`matches!(ch, '\t' | '\n')`
-                // switches on the parameter itself): keep it as a
-                // candidate; the coverage join classifies a decision
-                // whose spans all lie outside the workspace as not
-                // measurable.
+        if correlate::earliest_condition_span_is_std(f) && !scope::has_user_switch(f) {
+            // The decision is wholly another crate's macro code:
+            // `assert_eq!`'s `left_val == right_val` in a test.
+            // Its "conditions" are the macro's own locals.
+            if let Some(detail) = scope::classify_no_decision(f, source) {
+                scan.declined
+                    .push(declined(DeclineReason::NoDecision, Some(detail), None));
+                continue;
             }
-            prov = locate_in_workspace(f, prov);
+            // Not accounted for (`matches!(ch, '\t' | '\n')`
+            // switches on the parameter itself): keep it as a
+            // candidate; the coverage join classifies a decision
+            // whose spans all lie outside the workspace as not
+            // measurable.
         }
         scan.candidates.push(ScannedCandidate {
             fn_idx,
@@ -159,38 +152,6 @@ pub fn scan_functions(
         });
     }
     scan
-}
-
-/// `prov`, moved into the workspace when its earliest condition span
-/// is in the standard library: a user macro call expanding to `core`
-/// code (`matches!(self.host, HostInternal::None)`, `assert_eq!`)
-/// puts that span in `core`'s macro definition, but the user wrote
-/// the call in `f`. The new location is the first workspace span of
-/// `f`'s tests, else of its body; `prov` is unchanged when there is
-/// none.
-fn locate_in_workspace(
-    f: &floyd::mir::MirFunction,
-    mut prov: DecisionProvenance,
-) -> DecisionProvenance {
-    if !prov
-        .source_file
-        .as_deref()
-        .is_some_and(scope::is_std_library_path)
-    {
-        return prov;
-    }
-    let user = scope::user_switch_span(f).or_else(|| {
-        f.coverage_spans
-            .iter()
-            .filter(|s| !scope::is_external_path(&s.file))
-            .min_by_key(|s| (s.start_line, s.start_col))
-            .cloned()
-    });
-    if let Some(span) = user {
-        prov.source_file = Some(span.file);
-        prov.line = Some(span.start_line);
-    }
-    prov
 }
 
 /// Reads workspace source lines for [`scan_functions`], caching each

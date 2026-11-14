@@ -1602,19 +1602,55 @@ pub fn mark_shared_coverage(candidates: &mut [(&str, &mut CandidateCoverage)]) {
 /// the decision for reports and qualification artefacts.
 ///
 /// Source file and line are taken from the earliest condition span
-/// in the function's MIR, which the engine already collects for
-/// coverage correlation. The function name comes from
+/// in the function's MIR that lies in the workspace rather than the
+/// standard library. A user macro call that expands to `core` code
+/// (`matches!(self.host, HostInternal::None)`) has condition spans in
+/// `core`'s macro definition, but the user wrote the call in `f`:
+/// when every condition span is in the standard library, the location
+/// is the earliest workspace span of `f`'s `switchInt`s and their
+/// discriminant writes ([`crate::scope::user_switch_span`]), else of
+/// its body's coverage spans, else the earliest condition span. No
+/// condition span gives no location. The function name comes from
 /// [`MirFunction::name`] verbatim.
 pub fn provenance_for(f: &MirFunction) -> crate::masking::DecisionProvenance {
     let spans = collect_condition_spans(f);
-    let earliest = spans.values().min_by_key(|s| (s.start_line, s.start_col));
+    let by_position = |s: &&SourceSpan| (s.start_line, s.start_col);
+    let workspace = spans
+        .values()
+        .filter(|s| !crate::scope::is_std_library_path(&s.file))
+        .min_by_key(by_position);
+    let location = match workspace {
+        Some(span) => Some(span.clone()),
+        None => spans.values().min_by_key(by_position).map(|std_span| {
+            crate::scope::user_switch_span(f)
+                .or_else(|| {
+                    f.coverage_spans
+                        .iter()
+                        .filter(|s| !crate::scope::is_external_path(&s.file))
+                        .min_by_key(by_position)
+                        .cloned()
+                })
+                .unwrap_or_else(|| std_span.clone())
+        }),
+    };
     crate::masking::DecisionProvenance {
         function_name: Some(f.name.clone()),
-        source_file: earliest.map(|s| s.file.clone()),
-        line: earliest.map(|s| s.start_line),
+        source_file: location.as_ref().map(|s| s.file.clone()),
+        line: location.as_ref().map(|s| s.start_line),
         display_name: None,
         lift: None,
     }
+}
+
+/// Is the earliest condition span of `f` (by line, then column, as
+/// [`provenance_for`] ranked them before preferring workspace spans)
+/// in the standard library? True for an `assert_eq!` body and for a
+/// user `matches!` whose arms are in `core`.
+pub fn earliest_condition_span_is_std(f: &MirFunction) -> bool {
+    collect_condition_spans(f)
+        .values()
+        .min_by_key(|s| (s.start_line, s.start_col))
+        .is_some_and(|s| crate::scope::is_std_library_path(&s.file))
 }
 
 /// Collect a `name -> SourceSpan` map for every named condition that
@@ -4066,5 +4102,93 @@ fn offset::fixed::<impl at src/offset/fixed.rs:34:1: 34:17>::east_opt(_1: i32) -
                 ("secs < 86400".to_string(), false)
             ])
         );
+    }
+
+    /// A user `matches!` (url `Url::has_host`): the `switchInt` and
+    /// the arms are in `core`, the discriminant read in the user's
+    /// file. The location is the user's call, not `core`'s macro.
+    #[test]
+    fn provenance_of_a_user_matches_is_in_the_workspace() {
+        let mir = crate::mir::parse_text(
+            r#"
+fn <impl at url/src/lib.rs:317:1: 317:9>::has_host(_1: &Url) -> bool {
+    debug self => _1;
+    let mut _0: bool;
+    let mut _2: bool;
+    let mut _3: isize;
+
+    bb0: {
+        _3 = discriminant(((*_1).5: host::HostInternal)); // scope 1 at url/src/lib.rs:1122:19: 1122:28
+        switchInt(move _3) -> [0: bb2, otherwise: bb1]; // scope 1 at /rustc/h/library/core/src/macros/mod.rs:434:9: 434:9
+    }
+
+    bb1: {
+        _2 = const false;                // scope 1 at /rustc/h/library/core/src/macros/mod.rs:436:18: 436:23
+        goto -> bb3;                     // scope 1 at /rustc/h/library/core/src/macros/mod.rs:436:18: 436:23
+    }
+
+    bb2: {
+        _2 = const true;                 // scope 1 at /rustc/h/library/core/src/macros/mod.rs:435:39: 435:43
+        goto -> bb3;                     // scope 1 at /rustc/h/library/core/src/macros/mod.rs:435:39: 435:43
+    }
+
+    bb3: {
+        _0 = Not(move _2);               // scope 0 at url/src/lib.rs:1122:9: 1122:49
+        return;                          // scope 0 at url/src/lib.rs:1123:6: 1123:6
+    }
+}
+"#,
+        )
+        .expect("parses");
+        let f = &mir.functions[0];
+        assert!(earliest_condition_span_is_std(f));
+        let prov = provenance_for(f);
+        assert_eq!(prov.source_file.as_deref(), Some("url/src/lib.rs"));
+        assert_eq!(prov.line, Some(1122));
+    }
+
+    /// `a && matches!(e, E::A)`: the `a` test is in the user's file at
+    /// a later line than the `matches!` arm in `core`; the workspace
+    /// span wins although it does not sort first.
+    #[test]
+    fn provenance_prefers_a_workspace_condition_span_over_core() {
+        let mir = crate::mir::parse_text(
+            r#"
+fn f(_1: bool, _2: &E) -> bool {
+    debug a => _1;
+    debug e => _2;
+    let mut _0: bool;
+    let mut _3: isize;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb3, otherwise: bb1]; // scope 0 at src/lib.rs:1200:5: 1200:6
+    }
+
+    bb1: {
+        _3 = discriminant((*_2));        // scope 0 at src/lib.rs:1200:19: 1200:20
+        switchInt(move _3) -> [0: bb2, otherwise: bb3]; // scope 0 at /rustc/h/library/core/src/macros/mod.rs:434:9: 434:9
+    }
+
+    bb2: {
+        _0 = const true;                 // scope 0 at /rustc/h/library/core/src/macros/mod.rs:435:39: 435:43
+        goto -> bb4;                     // scope 0 at /rustc/h/library/core/src/macros/mod.rs:435:39: 435:43
+    }
+
+    bb3: {
+        _0 = const false;                // scope 0 at src/lib.rs:1200:5: 1200:40
+        goto -> bb4;                     // scope 0 at src/lib.rs:1200:5: 1200:40
+    }
+
+    bb4: {
+        return;                          // scope 0 at src/lib.rs:1201:2: 1201:2
+    }
+}
+"#,
+        )
+        .expect("parses");
+        let f = &mir.functions[0];
+        let prov = provenance_for(f);
+        assert_eq!(prov.source_file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(prov.line, Some(1200));
     }
 }
