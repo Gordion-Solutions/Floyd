@@ -5,148 +5,115 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: a minor bump marks a breaking change).
 
-## Unreleased
+## 0.4.0 - 2026-11-14
+
+### Breaking
+
+- **`floyd` library API.** `DecisionTree` has a new public field
+  `condition_order` (struct literals must set it; `DecisionTree::from_function`
+  fills it), `ConditionStatus` a new variant `ExercisedUnidentified`,
+  `RuledOut` a new field `remainder`, `ConditionObservation` new fields
+  `attributed_evaluations` and `decompositions`, `MirFunction` a new
+  field `branch_markers`, and `DeclineReason` new variants `NoDecision`
+  and `TooManyConditions`. New public modules `floyd::toolchain` and
+  `floyd::scope`; new `decision::try_decompose_candidate_detailed`
+  (with `Decline`, `MAX_DECISION_CONDITIONS`, `MAX_DECOMPOSE_STEPS`),
+  `DecisionTree::from_function` / `conditions`, and
+  `correlate::earliest_condition_span_is_std`. Exhaustive matches and
+  struct literals need updating; existing function signatures are
+  unchanged.
+- **`out_of_scope` reasons.** A function with no Boolean decision the
+  user wrote is listed as `no_decision` with a `detail` (most were
+  `unsupported_shape`); a decision with more than 12 conditions, or
+  past the decomposer's step budget, as `too_many_conditions` with
+  `conditions`. CTFE bodies of `const fn`s are no longer listed (no
+  more `ctfe_body` entries): they are counted in
+  `out_of_scope_summary.ctfe_bodies_skipped`, and the list has one
+  entry per function. No JSON field was renamed or removed.
 
 ### Added
 
-- **Flow-decomposition rule for multi-evaluation tests.** A test
-  that evaluated a decision several times, with two or more
-  conditions both true and false on a decision that is not a tree,
-  was always ambiguous. Floyd now treats the test's branch counters
-  as linear equations on how many evaluations took each path
-  through the decision, enumerates every whole-number solution, and
-  credits a condition vector only for a path that every solution
-  takes (a condition never reached, or never true or never false,
-  excludes every path through that edge). A unique solution gives
-  every vector its exact count; otherwise the paths common to all
-  solutions are credited with their least count and the rest of the
-  test stays an ambiguous remainder with the counters the vectors do
-  not account for. Both carry `"resolved_by": "flow_decomposition"`;
-  the text report marks lower-bound counts `at least N evaluations`
-  and the remainder `M evaluations not attributable to a vector (N
-  attributed to the vectors above)`; the remainder carries
-  `attributed_evaluations` in JSON, and a `ruled_out` entry computed
-  from a remainder has `"remainder": true`. An ambiguous observation
-  the rule enumerated lists its possible splits as `decompositions`.
-- **Exercised without an identifiable pair.** When every
-  decomposition of one multi-evaluation test, together with all
-  condition vectors, completes some independence pair for a
-  condition, but not the same pair, the condition is EXERCISED: a
-  pair provably occurred, though which one is unknown. JSON status
-  `ExercisedUnidentified` (`pair_candidates`, `pair_identifiable:
-  false`, `test`, `decompositions`); text `EXERCISED via one of:
-  (pair) | (pair)  [pair not uniquely identifiable: N decompositions
-  ...]`; JUnit a passing testcase with that text in `<system-out>`
-  and a `floyd.pair_identifiable=false` property. It counts as
-  exercised in the summary, percentage and exit code.
-- On chrono 0.4, `NaiveTime::from_hms_nano_opt` goes from 2 exercised
-  and 4 unknown to 6 of 6 exercised: `test_rfc3339` (53 evaluations)
-  now resolves to four vectors, and `nano >= 2000000000` is exercised
-  without an identifiable pair (`test_time_from_hms_micro`'s counters
-  admit two decompositions, each completing a different pair).
-- **Toolchain selection: `--toolchain=<name>|env|path:<dir>`** (also
-  `FLOYD_TOOLCHAIN`; default `nightly`, the previous behaviour).
-  `<name>` is a rustup toolchain, run as `cargo +<name>` / `rustc
-  +<name>`. `env` uses `$CARGO` / `$RUSTC` when set, else the `cargo`
-  and `rustc` on `PATH`, with no `+<name>` (for a compiler outside
-  rustup, such as Ferrocene installed with criticalup; untested);
-  `path:<dir>` uses `<dir>/cargo` and `<dir>/rustc`. Floyd reads the
-  channel from `rustc --version --verbose`; for a stable or beta
-  compiler it prints one line to stderr and sets `RUSTC_BOOTSTRAP=1`
-  for the instrumented build only: `floyd-rustc-shim` sets it on the
-  `rustc` processes when the build passes `FLOYD_RUSTC_BOOTSTRAP=1`,
-  so cargo, build scripts and the tests Floyd runs never see it.
-  `llvm-profdata` / `llvm-cov` are looked up in the chosen
-  toolchain's sysroot, and the missing-tools error names that
-  toolchain's install command. The `fixtures/mcdc-cases` verdicts are
-  identical on stable 1.99.1 and nightly 1.101.
-- **The toolchain is recorded in every report:** a `Toolchain:` line
-  in the text header, a JSON `toolchain` object (`name`, `version`,
-  `release`, `host`, `channel`, `rustc_bootstrap`; `null` when the
-  toolchain could not be probed, verdict `setup_failed` with `error.stage`
-  `toolchain`), and JUnit `floyd.toolchain*` properties, error
-  documents included.
-- **Library:** `floyd::toolchain` (`ToolchainSpec`, `Toolchain::detect`,
-  `Channel`, `ToolchainSummary`), and toolchain-taking variants of the
-  build and run functions: `instrument::compile_cargo_project_with_toolchain`,
-  `emit_mir_with_toolchain`, `compile_test_target_with_toolchain`,
-  `compile_with_coverage_with_toolchain`, and
-  `runner::llvm_tool_with_toolchain`, `list_tests_with_toolchain`,
-  `run_test_isolated_with_toolchain`, `run_with_toolchain`. The
-  existing functions keep their signatures and behaviour (`nightly`,
-  not probed).
-- **`no_decision` out-of-scope reason.** Most functions listed in
-  `out_of_scope` had no decision to decline: in a 19-crate sweep about
-  70% contain no Boolean decision the user wrote. They are now listed
-  with `reason: "no_decision"` and a `detail`: `std_macro_only`,
-  `pattern_match_only`, `derived_impl`, `question_mark_or_loop_only`,
-  `assert_only` or `drop_flags_only`. The classifier
-  (`floyd::scope`) labels a function only on positive evidence for
-  every `switchInt` it has: rustc's lower-case `coverage branch`
-  markers (now parsed into `MirFunction::branch_markers`), the
-  `switchInt` and discriminant spans, drop-flag writes, and the
-  `#[derive]` / `assert!` text in the source. Anything it cannot
-  account for keeps its decline reason. On the 255 hand-labelled
-  functions of the sweep's sample it agrees on 249: precision 100%,
-  recall 95%.
+- **`--toolchain=<name>|env|path:<dir>`** (or `FLOYD_TOOLCHAIN`;
+  default `nightly`, the previous behaviour). `<name>` is a rustup
+  toolchain (`cargo +<name>`); `env` uses `$CARGO` / `$RUSTC`, else
+  `cargo` / `rustc` on `PATH` (a compiler outside rustup, such as
+  Ferrocene; untested); `path:<dir>` uses `<dir>/cargo` and
+  `<dir>/rustc`. On a stable or beta compiler Floyd prints one line to
+  stderr and sets `RUSTC_BOOTSTRAP=1` for the instrumented `rustc`
+  only (through `floyd-rustc-shim`), never for cargo, build scripts or
+  the tests. `llvm-profdata` / `llvm-cov` come from the chosen
+  toolchain's sysroot. The `fixtures/mcdc-cases` verdicts are identical
+  on stable 1.99.1 and nightly 1.101.
+- **Toolchain in every report:** a `Toolchain:` line in the text
+  header, a JSON `toolchain` object (`name`, `version`, `release`,
+  `host`, `channel`, `rustc_bootstrap`; `null` when the toolchain
+  could not be probed, verdict `setup_failed`, `error.stage`
+  `toolchain`) and JUnit `floyd.toolchain*` properties. Library:
+  `floyd::toolchain` and `*_with_toolchain` variants of the build and
+  run functions in `instrument` and `runner`.
+- **Flow decomposition for multi-evaluation tests.** A test that
+  evaluated a non-tree decision several times was always ambiguous.
+  Floyd now solves the test's branch counters as linear equations on
+  how many evaluations took each path through the decision, enumerates
+  every non-negative integer solution, and credits a condition vector
+  only for a path every solution takes (a unique solution gives exact
+  counts; otherwise the least count, with the rest an ambiguous
+  remainder). Observations carry `"resolved_by": "flow_decomposition"`;
+  the text marks lower bounds `at least N evaluations`; the remainder
+  carries `attributed_evaluations` and `decompositions`, and a
+  `ruled_out` entry computed from it `"remainder": true`.
+- **Exercised without an identifiable pair.** When every decomposition
+  of one test, with all condition vectors, completes some independence
+  pair for a condition (not the same one), the condition is EXERCISED:
+  JSON `ExercisedUnidentified` (`pair_candidates`, `pair_identifiable:
+  false`, `test`, `decompositions`), text `EXERCISED via one of: ...`,
+  JUnit a passing testcase with `floyd.pair_identifiable=false`. It
+  counts as exercised in the summary, percentage and exit code. chrono
+  0.4 `NaiveTime::from_hms_nano_opt` goes from 2 of 6 exercised (exit 2)
+  to 6 of 6 (exit 0).
+- **`no_decision` classification** (`floyd::scope`), with `detail`
+  `std_macro_only`, `pattern_match_only`, `derived_impl`,
+  `question_mark_or_loop_only`, `assert_only` or `drop_flags_only`,
+  assigned only on positive evidence for every `switchInt` (rustc's
+  `coverage branch` markers, switch and discriminant spans, drop-flag
+  writes, `#[derive]` / `assert!` in the source); anything else keeps
+  its decline reason. 249 of 255 hand-labelled sweep functions agree
+  (precision 100%, recall 95%).
 - **`out_of_scope_summary`** in the JSON (`total`, `by_reason`,
-  `no_decision` by detail, `ctfe_bodies_skipped`), the matching
-  `floyd.out_of_scope.*` / `floyd.ctfe_bodies_skipped` JUnit
-  properties, and a text report that prints the counts by reason
-  ("N with no Boolean decision the user wrote", "M with a decision in
-  a shape the engine does not recognise yet").
-- **`too_many_conditions` reason** (with `conditions`): a decision with
-  more than 12 conditions (`floyd::decision::MAX_DECISION_CONDITIONS`),
-  or whose tree would take more than
-  `floyd::decision::MAX_DECOMPOSE_STEPS` handler steps, is declined
-  in milliseconds. rust-url's 40-alternative `is_url_code_point`
-  `matches!` used to take minutes and over a gigabyte of memory to
-  decompose, because the tree copies each shared tail once per path.
-  `floyd::decision::try_decompose_candidate_detailed` returns the
-  count.
+  `no_decision` by detail, `ctfe_bodies_skipped`), `floyd.out_of_scope.*`
+  and `floyd.ctfe_bodies_skipped` JUnit properties, and out-of-scope
+  counts by reason in the text report.
 
 ### Changed
 
-- **UNKNOWN wording.** The reason now reads "the rows an independence
-  pair still needs are possible only in N test(s) that evaluated the
-  decision more than once, whose counters do not attribute those
-  rows to condition vectors", and a partly resolved test is named
-  with what was attributed (`9 evaluations: 7 attributed to 2
-  vector(s), 2 not attributable to a vector`). The JUnit failure
-  message uses the same text. The fixture `dag_or_and`'s `c` is now
-  exercised without an identifiable pair (was unknown).
-- **CTFE bodies are not listed.** The `// MIR FOR CTFE` body of a
-  `const fn` no longer has its own `ctfe_body` entry in
-  `out_of_scope`; its runtime body is listed, and the CTFE bodies are
-  counted in `out_of_scope_summary.ctfe_bodies_skipped`. The list has
-  one entry per function.
+- **Conditions are listed in source order** (line, then column;
+  conditions without a known span follow, by name) everywhere: the
+  `Conditions:` line, observations, pair and missing rows, JSON
+  `conditions` and truth table, JUnit testcases. They were sorted by
+  name (anyhow's `b == b' ' || b == b'\n'` printed `b == 10, b == 32`).
+  Verdicts are unchanged.
+- **UNKNOWN wording**: "the rows an independence pair still needs are
+  possible only in N test(s) that evaluated the decision more than
+  once, whose counters do not attribute those rows to condition
+  vectors", naming what a partly resolved test attributed; the JUnit
+  failure message uses the same text.
 
 ### Fixed
 
-- **User `matches!` predicates were silently dropped.** A function
-  whose decision is a user `matches!` (rust-url `Url::has_host`,
-  `SchemeType::is_special`; time `Context::is_component`) decomposed,
-  but its earliest condition span is the `matches!` arm in `core`, and
-  a filter meant for `assert_eq!` bodies dropped it from both
-  `candidates` and `out_of_scope` (20 functions in the sweep). The
-  filter now drops nothing: a decision whose `switchInt`s and
-  discriminants all lie in standard-library code is listed as
-  `no_decision` (`std_macro_only`) when the classifier accounts for
-  it, and otherwise stays a candidate (which the coverage join
-  classifies as `not_measurable`, `external_macro`). A user `matches!`
-  is a candidate located at the call in the user's file. Every
-  function with a `switchInt` is now exactly one of: a candidate, an
-  `out_of_scope` entry, a counted CTFE body, or left out by `--only`.
-- **Conditions are listed in source order.** A decision's conditions
-  were listed sorted by name, so anyhow's `b == b' ' || b == b'\n'`
-  printed `Conditions: b == 10, b == 32`. They now follow their
-  source spans (line, then column), everywhere a condition order
-  appears: the `Conditions:` line, per-test observations, pair and
-  missing rows, JSON `conditions` and truth table, and JUnit
-  testcases. Conditions without a known span follow, by name.
-  Verdicts and the rows a hint names are unchanged; only the order
-  differs. `floyd::DecisionTree` gains `condition_order`,
-  `from_function` and `conditions`.
+- **User `matches!` predicates were silently dropped.** A decision
+  whose condition spans lie in `core`'s `matches!` arms (rust-url
+  `Url::has_host`, `SchemeType::is_special`; time
+  `Context::is_component`) was dropped from both `candidates` and
+  `out_of_scope` by a filter meant for `assert_eq!` bodies (20
+  functions in the validation sweep). Every function with a
+  `switchInt` is now exactly one of: a candidate, an `out_of_scope`
+  entry, a counted CTFE body, or left out by `--only`.
+  `floyd::correlate::provenance_for` locates such a decision at the
+  user's call, not in `core`.
+- **Exponential decomposition.** rust-url's 40-alternative
+  `is_url_code_point` took minutes and over a gigabyte of memory to
+  decompose; it is now declined as `too_many_conditions` in
+  milliseconds.
 
 ## 0.3.0 - 2026-11-09
 

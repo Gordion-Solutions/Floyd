@@ -259,7 +259,7 @@ Most bool-returning safety-critical Rust functions recover
 correctly. The remaining gaps in the "what doesn't" table are
 either explicit Phase 2 deliverables or items that sit in the
 commercial tier per ADR-0004 — the OSS engine's surface on the
-0.3.x line is as listed in "what works" above.
+0.4.x line is as listed in "what works" above.
 
 ### Tests that evaluate a decision more than once
 
