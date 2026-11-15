@@ -23,16 +23,19 @@ use floyd::coverage_index::{CoverageIndex, PathNormaliser};
 use floyd::decision;
 use floyd::instrument;
 use floyd::masking::{
-    self, ConditionObservation, ConditionStatus, IndependencePair, RuntimeAnalysis, TruthTableRow,
-    Variant,
+    self, ConditionObservation, ConditionStatus, IndependencePair, Resolution, RuntimeAnalysis,
+    TruthTableRow, Variant,
 };
 use floyd::mir;
 use floyd::runner;
+use floyd::toolchain::{Toolchain, ToolchainSpec, ToolchainSummary};
 
 mod failure;
 mod harness;
+mod scan;
 mod selector;
 mod summary;
+use scan::{DeclinedFunction, OutOfScopeSummary};
 use std::path::Path;
 use std::process::ExitCode;
 use summary::CoverageSummary;
@@ -74,20 +77,6 @@ impl RuntimeVerdict {
             RuntimeVerdict::TestRunFailed => "test_run_failed",
         }
     }
-}
-
-/// A function with a `switchInt`-shaped decision that the engine's
-/// current patterns did not match.
-#[derive(serde::Serialize, Clone, Debug)]
-struct DeclinedFunction {
-    name: String,
-    source_file: Option<String>,
-    line: Option<u32>,
-    /// Why the decomposer declined it: `unsupported_shape`,
-    /// `non_bool_leaf` when an arm's value is a named local that is
-    /// not `bool`, `no_conditions` when the tree tests no condition,
-    /// or `ctfe_body` for a `const fn`'s `MIR FOR CTFE` body.
-    reason: decision::DeclineReason,
 }
 
 /// One decomposable candidate the engine considered, with whether
@@ -380,6 +369,11 @@ struct NoHarnessTarget {
 #[derive(serde::Serialize)]
 struct CargoRuntimeReport<'a> {
     manifest: String,
+    /// The toolchain that built the instrumented tests (name,
+    /// `rustc --version` line, release, host, channel, whether
+    /// `RUSTC_BOOTSTRAP=1` was used); `null` when it could not be
+    /// probed.
+    toolchain: Option<&'a ToolchainSummary>,
     /// `null` when the build failed before cargo reported it.
     workspace_root: Option<String>,
     test_targets: usize,
@@ -399,11 +393,17 @@ struct CargoRuntimeReport<'a> {
     /// measurable candidate, in `candidates` order. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     analyses: Option<&'a [CandidateAnalysis]>,
-    /// Functions with a `switchInt`-shaped decision that the
-    /// engine's current patterns did not match. The engine declined
-    /// them rather than report a wrong verdict — honest-scope
-    /// evidence for ISO 26262 / DO-178C qualification audits.
+    /// Every function with a `switchInt` that is not a candidate,
+    /// one entry per function (a `const fn`'s CTFE body is counted
+    /// in `out_of_scope_summary`, not listed), with its `reason`:
+    /// `no_decision` (no Boolean decision the user wrote; `detail`
+    /// says why) or a decision the engine declined rather than report
+    /// a wrong verdict — honest-scope evidence for ISO 26262 /
+    /// DO-178C qualification audits.
     out_of_scope: &'a [DeclinedFunction],
+    /// Counts of `out_of_scope` by `reason` (and `no_decision` by
+    /// `detail`), and the `const fn` CTFE bodies not listed.
+    out_of_scope_summary: OutOfScopeSummary,
     /// MIR files above the size guard that were not analysed.
     skipped_oversize_mirs: &'a [SkippedMir],
     /// The size guard in effect (`--max-mir-size`, default 50).
@@ -443,6 +443,8 @@ struct CandidateAnalysis {
 #[derive(serde::Serialize)]
 struct SingleRuntimeReport<'a> {
     source: String,
+    /// The toolchain that built the instrumented test binary.
+    toolchain: Option<&'a ToolchainSummary>,
     verdict: RuntimeVerdict,
     tests_discovered: &'a [String],
     observations: &'a [ConditionObservation],
@@ -503,8 +505,33 @@ fn main() -> ExitCode {
     // `--all-candidates`: analyse every measurable candidate, not
     // only the selected one (JSON `analyses`).
     let mut all_candidates = false;
+    // `--toolchain=<name|env|path:dir>`, else `FLOYD_TOOLCHAIN`, else
+    // `nightly`.
+    let mut toolchain_arg: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
+        if let Some(val) = args[i].strip_prefix("--toolchain=") {
+            toolchain_arg = Some(val.to_string());
+            args.remove(i);
+            continue;
+        }
+        if args[i] == "--toolchain" {
+            args.remove(i);
+            match args.get(i).copied() {
+                Some(v) if !v.starts_with('-') => {
+                    toolchain_arg = Some(v.to_string());
+                    args.remove(i);
+                }
+                _ => {
+                    eprintln!(
+                        "cargo-floyd: --toolchain requires a value (a rustup toolchain \
+                         name, env, or path:<dir>)"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+            continue;
+        }
         if args[i] == "--all-candidates" {
             all_candidates = true;
             args.remove(i);
@@ -637,6 +664,16 @@ fn main() -> ExitCode {
         }
     }
 
+    let toolchain_env = std::env::var(floyd::toolchain::TOOLCHAIN_ENV).ok();
+    let toolchain_spec =
+        match ToolchainSpec::select(toolchain_arg.as_deref(), toolchain_env.as_deref()) {
+            Ok(t) => t,
+            Err(msg) => {
+                eprintln!("cargo-floyd: {msg}");
+                return ExitCode::from(2);
+            }
+        };
+
     // Detect the optional `test` subcommand.
     let is_test_mode = args.first().copied() == Some("test");
     if is_test_mode {
@@ -688,6 +725,41 @@ fn main() -> ExitCode {
         Err(_) => t,
     });
 
+    // Probe the toolchain once: its channel decides whether the
+    // instrumented build needs `RUSTC_BOOTSTRAP=1`, and its version
+    // goes into every report.
+    let toolchain = match Toolchain::detect(toolchain_spec) {
+        Ok(t) => t,
+        Err(e) => {
+            let error = toolchain_error(&e);
+            eprintln!("cargo-floyd: {}", error.message);
+            if let (true, Source::Cargo(p)) = (is_test_mode, &source) {
+                return emit_run_error(
+                    format,
+                    &Partial {
+                        manifest: p,
+                        workspace_root: None,
+                        toolchain: None,
+                        test_targets: 0,
+                        tests_discovered: &[],
+                        out_of_scope: &[],
+                        ctfe_bodies_skipped: 0,
+                        skipped_oversize_mirs: &[],
+                        mir_parse_problems: &[],
+                        skipped_no_harness: &[],
+                        max_mir_mb: max_mir_mb.unwrap_or(DEFAULT_MAX_MIR_MB),
+                    },
+                    RuntimeVerdict::SetupFailed,
+                    &error,
+                );
+            }
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(note) = toolchain.bootstrap_note() {
+        eprintln!("cargo-floyd: {note}");
+    }
+
     match (is_test_mode, source) {
         (true, Source::Cargo(p)) => run_test_mode_cargo(
             &p,
@@ -698,16 +770,19 @@ fn main() -> ExitCode {
                 all_candidates,
             },
             max_mir_mb,
-            &cargo_args,
-            target_dir.as_deref(),
+            &BuildSettings {
+                toolchain: &toolchain,
+                cargo_args: &cargo_args,
+                target_dir: target_dir.as_deref(),
+            },
         ),
-        (true, Source::SingleFile(p)) => run_test_mode_single(&p, &workdir, format),
+        (true, Source::SingleFile(p)) => run_test_mode_single(&p, &workdir, &toolchain, format),
         (false, Source::Cargo(_)) => {
             eprintln!("cargo-floyd: static analysis on a cargo project is not supported yet;");
             eprintln!("  pass a single .rs file, or use `cargo floyd test` for runtime analysis.");
             ExitCode::from(2)
         }
-        (false, Source::SingleFile(p)) => run_static_mode(&p, &workdir, format),
+        (false, Source::SingleFile(p)) => run_static_mode(&p, &workdir, &toolchain, format),
     }
 }
 
@@ -754,8 +829,25 @@ fn resolve_source(arg: Option<&Path>) -> Result<Source, String> {
     ))
 }
 
-fn run_static_mode(source: &Path, workdir: &Path, format: Format) -> ExitCode {
-    let mir_path = match instrument::emit_mir(source, workdir) {
+/// The `error` object for a toolchain that could not be probed.
+fn toolchain_error(e: &floyd::toolchain::ToolchainError) -> failure::RunError {
+    let first = e.message.lines().next().unwrap_or("").trim();
+    failure::RunError {
+        stage: "toolchain".to_string(),
+        message: format!("toolchain {}: {first}", e.spec),
+        diagnostics: Vec::new(),
+        ice: None,
+        stderr: failure::trimmed_stderr(&e.message),
+    }
+}
+
+fn run_static_mode(
+    source: &Path,
+    workdir: &Path,
+    toolchain: &Toolchain,
+    format: Format,
+) -> ExitCode {
+    let mir_path = match instrument::emit_mir_with_toolchain(source, workdir, toolchain) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
@@ -784,7 +876,7 @@ fn run_static_mode(source: &Path, workdir: &Path, format: Format) -> ExitCode {
     let matrix = masking::analyze(&tree);
 
     match format {
-        Format::Text => print_static_report(source, &tree, &matrix),
+        Format::Text => print_static_report(source, toolchain, &tree, &matrix),
         Format::Json => match serde_json::to_string_pretty(&matrix) {
             Ok(s) => println!("{s}"),
             Err(e) => {
@@ -813,19 +905,33 @@ struct Selection {
     all_candidates: bool,
 }
 
+/// How a cargo runtime run builds the instrumented tests.
+struct BuildSettings<'a> {
+    /// `--toolchain` / `FLOYD_TOOLCHAIN`, probed.
+    toolchain: &'a Toolchain,
+    /// Feature selection passed to `cargo build --tests`.
+    cargo_args: &'a [String],
+    /// `--target-dir`.
+    target_dir: Option<&'a Path>,
+}
+
 fn run_test_mode_cargo(
     manifest: &Path,
     workdir: &Path,
     format: Format,
     selection: &Selection,
     max_mir_mb: Option<u64>,
-    cargo_args: &[String],
-    target_dir: Option<&Path>,
+    settings: &BuildSettings<'_>,
 ) -> ExitCode {
     let Selection {
         only_patterns,
         all_candidates,
     } = selection;
+    let BuildSettings {
+        toolchain,
+        cargo_args,
+        target_dir,
+    } = *settings;
     // Scope Floyd's `--emit=mir,link -Cinstrument-coverage
     // -Zcoverage-options=branch,condition -Zmir-include-spans` to
     // the primary package only, via a RUSTC_WRAPPER shim that
@@ -843,12 +949,15 @@ fn run_test_mode_cargo(
         .filter(|shim| shim.exists());
 
     let max_mir_mb = max_mir_mb.unwrap_or(DEFAULT_MAX_MIR_MB);
+    let toolchain_summary = toolchain.summary();
     let partial = |workspace_root| Partial {
         manifest,
         workspace_root,
+        toolchain: Some(&toolchain_summary),
         test_targets: 0,
         tests_discovered: &[],
         out_of_scope: &[],
+        ctfe_bodies_skipped: 0,
         skipped_oversize_mirs: &[],
         mir_parse_problems: &[],
         skipped_no_harness: &[],
@@ -857,11 +966,12 @@ fn run_test_mode_cargo(
 
     // Build all test artifacts in the cargo project.
     let build_started = std::time::SystemTime::now();
-    let build = match instrument::compile_cargo_project_wrapped(
+    let build = match instrument::compile_cargo_project_with_toolchain(
         manifest,
         cargo_args,
         target_dir,
         shim.as_deref(),
+        toolchain,
     ) {
         Ok(b) => b,
         Err(e) => {
@@ -870,8 +980,8 @@ fn run_test_mode_cargo(
         }
     };
 
-    let tools = runner::llvm_tool("llvm-profdata")
-        .and_then(|p| runner::llvm_tool("llvm-cov").map(|c| (p, c)));
+    let tools = runner::llvm_tool_with_toolchain("llvm-profdata", toolchain)
+        .and_then(|p| runner::llvm_tool_with_toolchain("llvm-cov", toolchain).map(|c| (p, c)));
     let (profdata_tool, cov_tool) = match tools {
         Ok(t) => t,
         Err(e) => {
@@ -918,6 +1028,9 @@ fn run_test_mode_cargo(
     let mut raw_candidates: Vec<RawCandidate> = Vec::new();
     let mut all_tests: Vec<String> = Vec::new();
     let mut declined: Vec<DeclinedFunction> = Vec::new();
+    let mut ctfe_bodies_skipped = 0usize;
+    // Workspace source lines for the `no_decision` classifier.
+    let sources = scan::SourceReader::new(&build.workspace_root);
     // Pragmatic scalability guard: rustc's `--emit=mir` on a test
     // binary that pulls in deep generic chains can produce MIR
     // files hundreds of megabytes in size (bytes'
@@ -988,7 +1101,7 @@ fn run_test_mode_cargo(
             }
         };
         mir_parse_problems.extend(mir.parse_problems().into_iter().map(problem));
-        let tests = match runner::list_tests(&artifact.binary_path) {
+        let tests = match runner::list_tests_with_toolchain(&artifact.binary_path, toolchain) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("cargo-floyd: {e}");
@@ -999,6 +1112,7 @@ fn run_test_mode_cargo(
                         test_targets: build.test_artifacts.len(),
                         tests_discovered: &all_tests,
                         out_of_scope: &declined,
+                        ctfe_bodies_skipped,
                         skipped_oversize_mirs: &skipped_oversize_mirs,
                         mir_parse_problems: &mir_parse_problems,
                         skipped_no_harness: &skipped_no_harness,
@@ -1013,88 +1127,19 @@ fn run_test_mode_cargo(
             all_tests.push(t.clone());
         }
         let art_idx = artifacts.len();
-        for (fn_idx, f) in mir.functions.iter().enumerate() {
-            // Require BOTH a successful decomposition AND the
-            // presence of at least one `switchInt` in the function.
-            // Without that `switchInt` gate, boolean-passthrough
-            // helpers like `fn f(x: bool) -> bool { x }` register
-            // as candidates — the decomposer produces a
-            // `Node::Condition { name: "x" }`, but the function has
-            // no actual decision in it (no branch), so llvm-cov
-            // emits zero branch regions for it, correlation can't
-            // produce an observation, and the candidate shows up
-            // under the "reached-but-unobserved" bucket as a
-            // false-positive correlation bug. It's not a bug —
-            // there is no decision to measure in the first place.
-            // These passthroughs are not out-of-scope either; they
-            // are "no boolean decision at all", so they do not
-            // belong in the OOS report.
-            if decision::has_switchint(f) {
-                let (node, lift) = match decision::try_decompose_candidate_lifted(f) {
-                    Ok(decomposed) => decomposed,
-                    Err(reason) => {
-                        // Has a switchInt (so some kind of decision)
-                        // but the decomposer did not match any
-                        // supported pattern. Honest-scope report entry.
-                        let prov = correlate::provenance_for(f);
-                        declined.push(DeclinedFunction {
-                            name: prov.function_name.unwrap_or_default(),
-                            source_file: prov.source_file,
-                            line: prov.line,
-                            reason,
-                        });
-                        continue;
-                    }
-                };
-                let prov = floyd::DecisionProvenance {
-                    lift,
-                    ..correlate::provenance_for(f)
-                };
-                // `--only=<pattern>` scopes Floyd to the
-                // functions the user named. On real embedded
-                // crates the whole-crate scan is both slow and
-                // noisy — a qualification engineer typically
-                // has a specific list of safety-critical gates
-                // they need to prove MC/DC on. If any --only
-                // pattern is present and this function's name
-                // doesn't contain any of them, drop it before
-                // scoring; it will not appear in the verdict
-                // or in the honest-scope report.
-                if !only_patterns.is_empty() {
-                    let fn_name = prov.function_name.as_deref().unwrap_or(&f.name);
-                    let hit = only_patterns
-                        .iter()
-                        .any(|pat| fn_name.contains(pat.as_str()));
-                    if !hit {
-                        continue;
-                    }
-                }
-                // Reject candidates whose decision spans come
-                // from inlined-stdlib macro expansions.
-                // Rustc paths of the form `/rustc/<hash>/library/
-                // core/src/macros/mod.rs` are the hygiene
-                // bindings of `assert_eq!`, `debug_assert!`,
-                // `panic!`, and friends — not user-written
-                // decisions. On blake3 and other
-                // test-heavy crates, every `#[test] fn x() {
-                // assert_eq!(a, b); }` was being flagged as a
-                // candidate whose "conditions" `left_val` and
-                // `right_val` are the macro's own locals,
-                // producing reached-but-unobserved false
-                // positives in the AllUnobserved verdict.
-                if is_stdlib_macro_span(prov.source_file.as_deref()) {
-                    continue;
-                }
-                raw_candidates.push(RawCandidate {
-                    tree: floyd::DecisionTree {
-                        decisions: vec![node],
-                    },
-                    prov,
-                    artifact_idx: art_idx,
-                    fn_idx,
-                });
-            }
-        }
+        // Every function with a `switchInt` becomes a candidate, an
+        // `out_of_scope` entry or a counted CTFE body (see `scan`).
+        let scanned = scan::scan_functions(&mir, only_patterns, &|file: &str, line| {
+            sources.line(file, line)
+        });
+        declined.extend(scanned.declined);
+        ctfe_bodies_skipped += scanned.ctfe_bodies_skipped;
+        raw_candidates.extend(scanned.candidates.into_iter().map(|c| RawCandidate {
+            tree: c.tree,
+            prov: c.prov,
+            artifact_idx: art_idx,
+            fn_idx: c.fn_idx,
+        }));
         artifacts.push(ArtifactInfo {
             mir,
             binary_path: artifact.binary_path.clone(),
@@ -1195,7 +1240,12 @@ fn run_test_mode_cargo(
                     "cov-{:03}-{:03}.profraw",
                     job.art_idx, job.test_idx
                 ));
-                runner::run_test_isolated(&job.binary_path, &job.test_name, &prof)?;
+                runner::run_test_isolated_with_toolchain(
+                    &job.binary_path,
+                    &job.test_name,
+                    &prof,
+                    toolchain,
+                )?;
                 let coverage = runner::profraw_to_coverage(
                     &prof,
                     &profdata_tool,
@@ -1231,6 +1281,7 @@ fn run_test_mode_cargo(
                     test_targets: build.test_artifacts.len(),
                     tests_discovered: &all_tests,
                     out_of_scope: &declined,
+                    ctfe_bodies_skipped,
                     skipped_oversize_mirs: &skipped_oversize_mirs,
                     mir_parse_problems: &mir_parse_problems,
                     skipped_no_harness: &skipped_no_harness,
@@ -1388,8 +1439,10 @@ fn run_test_mode_cargo(
     let manifest_str = manifest.display().to_string();
     let workspace_root_str = build.workspace_root.display().to_string();
     let test_targets = build.test_artifacts.len();
+    let out_of_scope_summary = OutOfScopeSummary::new(&declined, ctfe_bodies_skipped);
     let report = |verdict, observations, analysis, analyses| CargoRuntimeReport {
         manifest: manifest_str.clone(),
+        toolchain: Some(&toolchain_summary),
         workspace_root: Some(workspace_root_str.clone()),
         test_targets,
         verdict,
@@ -1401,6 +1454,7 @@ fn run_test_mode_cargo(
         candidates: &candidate_summaries,
         analyses,
         out_of_scope: &declined,
+        out_of_scope_summary: OutOfScopeSummary::new(&declined, ctfe_bodies_skipped),
         skipped_oversize_mirs: &skipped_mirs,
         max_mir_size_mb: max_mir_mb,
         mir_parse_problems: &mir_parse_problems,
@@ -1412,7 +1466,7 @@ fn run_test_mode_cargo(
         match format {
             Format::Text => print_out_of_scope_report(
                 &mut std::io::stdout(),
-                &declined,
+                &out_of_scope_summary,
                 &skipped_oversize_mirs,
                 max_mir_mb,
                 &mir_parse_problems,
@@ -1425,7 +1479,7 @@ fn run_test_mode_cargo(
             }
             Format::Junit => print_out_of_scope_report(
                 &mut std::io::stderr(),
-                &declined,
+                &out_of_scope_summary,
                 &skipped_oversize_mirs,
                 max_mir_mb,
                 &mir_parse_problems,
@@ -1469,12 +1523,13 @@ fn run_test_mode_cargo(
     match format {
         Format::Text => {
             println!("floyd  runtime MC/DC analysis of {}", manifest.display());
+            println!("Toolchain: {}", toolchain.describe());
             println!();
             println!("Test targets: {}", build.test_artifacts.len());
             print_runtime_report_body(&all_tests, &all_observations, &analysis, &not_measurable);
             print_out_of_scope_report(
                 &mut std::io::stdout(),
-                &declined,
+                &out_of_scope_summary,
                 &skipped_oversize_mirs,
                 max_mir_mb,
                 &mir_parse_problems,
@@ -1497,7 +1552,10 @@ fn run_test_mode_cargo(
                 render_runtime_junit(
                     &manifest.display().to_string(),
                     &analysis,
-                    not_measurable_count
+                    &all_observations,
+                    not_measurable_count,
+                    Some(&toolchain_summary),
+                    Some(&out_of_scope_summary),
                 )
             );
         }
@@ -1513,9 +1571,11 @@ const DEFAULT_MAX_MIR_MB: u64 = 50;
 struct Partial<'a> {
     manifest: &'a Path,
     workspace_root: Option<&'a Path>,
+    toolchain: Option<&'a ToolchainSummary>,
     test_targets: usize,
     tests_discovered: &'a [String],
     out_of_scope: &'a [DeclinedFunction],
+    ctfe_bodies_skipped: usize,
     skipped_oversize_mirs: &'a [(std::path::PathBuf, u64)],
     mir_parse_problems: &'a [MirParseProblem],
     skipped_no_harness: &'a [NoHarnessTarget],
@@ -1545,7 +1605,8 @@ fn emit_run_error(
             failure::render_error_junit(
                 &partial.manifest.display().to_string(),
                 verdict.as_str(),
-                error
+                error,
+                partial.toolchain,
             )
         ),
     }
@@ -1562,6 +1623,7 @@ fn error_report<'a>(
 ) -> CargoRuntimeReport<'a> {
     CargoRuntimeReport {
         manifest: partial.manifest.display().to_string(),
+        toolchain: partial.toolchain,
         workspace_root: partial.workspace_root.map(|p| p.display().to_string()),
         test_targets: partial.test_targets,
         verdict,
@@ -1573,6 +1635,10 @@ fn error_report<'a>(
         candidates: &[],
         analyses: None,
         out_of_scope: partial.out_of_scope,
+        out_of_scope_summary: OutOfScopeSummary::new(
+            partial.out_of_scope,
+            partial.ctfe_bodies_skipped,
+        ),
         skipped_oversize_mirs: skipped,
         max_mir_size_mb: partial.max_mir_mb,
         mir_parse_problems: partial.mir_parse_problems,
@@ -1739,9 +1805,16 @@ fn no_candidates_line(
     )
 }
 
-fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCode {
+fn run_test_mode_single(
+    source: &Path,
+    workdir: &Path,
+    toolchain: &Toolchain,
+    format: Format,
+) -> ExitCode {
+    let toolchain_summary = toolchain.summary();
     // 1. Build the file as a #[test]-enabled instrumented binary.
-    let compiled = match instrument::compile_test_target(source, workdir) {
+    let compiled = match instrument::compile_test_target_with_toolchain(source, workdir, toolchain)
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
@@ -1750,14 +1823,14 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     };
 
     // 2. Locate llvm-tools we need to ingest coverage per test.
-    let profdata_tool = match runner::llvm_tool("llvm-profdata") {
+    let profdata_tool = match runner::llvm_tool_with_toolchain("llvm-profdata", toolchain) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
             return ExitCode::from(1);
         }
     };
-    let cov_tool = match runner::llvm_tool("llvm-cov") {
+    let cov_tool = match runner::llvm_tool_with_toolchain("llvm-cov", toolchain) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
@@ -1784,7 +1857,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
         eprintln!("cargo-floyd: {}: {p}", compiled.mir_path.display());
     }
     // 4. Enumerate the binary's tests.
-    let tests = match runner::list_tests(&compiled.binary_path) {
+    let tests = match runner::list_tests_with_toolchain(&compiled.binary_path, toolchain) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("cargo-floyd: {e}");
@@ -1812,9 +1885,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     for (fn_idx, f) in mir.functions.iter().enumerate() {
         if let Ok((node, lift)) = decision::try_decompose_candidate_lifted(f) {
             artifact_candidates.push((
-                floyd::DecisionTree {
-                    decisions: vec![node],
-                },
+                floyd::DecisionTree::from_function(f, node),
                 floyd::DecisionProvenance {
                     lift,
                     ..correlate::provenance_for(f)
@@ -1832,7 +1903,12 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     let mut per_test_coverage: Vec<(String, CoverageIndex)> = Vec::with_capacity(tests.len());
     for (idx, test_name) in tests.iter().enumerate() {
         let prof = workdir.join(format!("cov-{idx:03}.profraw"));
-        if let Err(e) = runner::run_test_isolated(&compiled.binary_path, test_name, &prof) {
+        if let Err(e) = runner::run_test_isolated_with_toolchain(
+            &compiled.binary_path,
+            test_name,
+            &prof,
+            toolchain,
+        ) {
             eprintln!("cargo-floyd: {e}");
             return ExitCode::from(1);
         }
@@ -1889,6 +1965,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     // 6. Pick the best candidate, run the analysis.
     let report = |verdict, observations, analysis| SingleRuntimeReport {
         source: source.display().to_string(),
+        toolchain: Some(&toolchain_summary),
         verdict,
         tests_discovered: &tests,
         observations,
@@ -1931,7 +2008,7 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
     analysis.provenance = Some(chosen.provenance);
 
     match format {
-        Format::Text => print_runtime_report(source, &tests, &observations, &analysis),
+        Format::Text => print_runtime_report(source, toolchain, &tests, &observations, &analysis),
         Format::Json => {
             if let Err(code) = print_json(&report(
                 RuntimeVerdict::Analysed,
@@ -1944,7 +2021,14 @@ fn run_test_mode_single(source: &Path, workdir: &Path, format: Format) -> ExitCo
         Format::Junit => {
             print!(
                 "{}",
-                render_runtime_junit(&source.display().to_string(), &analysis, 0)
+                render_runtime_junit(
+                    &source.display().to_string(),
+                    &analysis,
+                    &observations,
+                    0,
+                    Some(&toolchain_summary),
+                    None,
+                )
             );
         }
     }
@@ -1969,7 +2053,8 @@ fn print_usage() {
     eprintln!("    cargo floyd test [--format=text|json|junit] [--only=<pat>]...");
     eprintln!("                     [--max-mir-size=<MB>] [--features=<list>]");
     eprintln!("                     [--all-features] [--no-default-features]");
-    eprintln!("                     [--target-dir=<dir>] [--all-candidates] [<path>]");
+    eprintln!("                     [--target-dir=<dir>] [--all-candidates]");
+    eprintln!("                     [--toolchain=<name>|env|path:<dir>] [<path>]");
     eprintln!("        Runtime MC/DC analysis: builds the project as a test");
     eprintln!("        crate with coverage instrumentation, runs each #[test]");
     eprintln!("        function individually, and reports which conditions the");
@@ -2019,7 +2104,15 @@ fn print_usage() {
     eprintln!("        --format=junit is not valid in static mode (no test");
     eprintln!("        verdicts to render).");
     eprintln!();
-    eprintln!("Requires nightly Rust + the llvm-tools-preview component:");
+    eprintln!("Toolchain (both modes): --toolchain=<name> (or FLOYD_TOOLCHAIN) selects");
+    eprintln!("the compiler; default nightly. <name> is a rustup toolchain, run as");
+    eprintln!("`cargo +<name>` / `rustc +<name>`. `env` uses $CARGO / $RUSTC, else the");
+    eprintln!("cargo and rustc on PATH, with no +<name> (e.g. Ferrocene via criticalup);");
+    eprintln!("`path:<dir>` uses <dir>/cargo and <dir>/rustc. A stable or beta compiler");
+    eprintln!("gets RUSTC_BOOTSTRAP=1 for the instrumented build only (Floyd needs");
+    eprintln!("-Z flags); the toolchain is recorded in every report.");
+    eprintln!();
+    eprintln!("Requires the toolchain's LLVM tools, e.g. for rustup:");
     eprintln!("    rustup component add llvm-tools-preview --toolchain nightly");
 }
 
@@ -2029,10 +2122,12 @@ fn print_usage() {
 
 fn print_static_report(
     source: &Path,
+    toolchain: &Toolchain,
     tree: &floyd::DecisionTree,
     matrix: &floyd::IndependenceMatrix,
 ) {
     println!("floyd  static MC/DC analysis of {}", source.display());
+    println!("Toolchain: {}", toolchain.describe());
     println!();
     println!("Decisions recovered: {}", tree.decisions.len());
     if !matrix.conditions.is_empty() {
@@ -2073,11 +2168,13 @@ fn print_static_report(
 
 fn print_runtime_report(
     source: &Path,
+    toolchain: &Toolchain,
     tests: &[String],
     observations: &[ConditionObservation],
     analysis: &RuntimeAnalysis,
 ) {
     println!("floyd  runtime MC/DC analysis of {}", source.display());
+    println!("Toolchain: {}", toolchain.describe());
     println!();
     print_runtime_report_body(tests, observations, analysis, &[]);
 }
@@ -2135,6 +2232,7 @@ fn print_runtime_report_body(
                 );
                 continue;
             }
+            let at_least = is_lower_bound(obs, observations);
             let mut parts: Vec<String> = analysis
                 .matrix
                 .conditions
@@ -2146,8 +2244,11 @@ fn print_runtime_report_body(
                 })
                 .collect();
             parts.push(format!("result={}", obs.result.map_or("?", bool_glyph)));
-            if let Some(n) = obs.evaluations.filter(|n| *n > 1) {
-                parts.push(format!("({n} evaluations)"));
+            match obs.evaluations {
+                Some(1) if at_least => parts.push("(at least 1 evaluation)".to_string()),
+                Some(n) if at_least => parts.push(format!("(at least {n} evaluations)")),
+                Some(n) if n > 1 => parts.push(format!("({n} evaluations)")),
+                _ => {}
             }
             println!("  {label:30}  {}", parts.join("  "));
         }
@@ -2164,6 +2265,22 @@ fn print_runtime_report_body(
                     "  ✓ {cond}: EXERCISED  via ({t1}) -> {}   vs   ({t2}) -> {}",
                     bool_glyph(pair.test_1.result),
                     bool_glyph(pair.test_2.result),
+                );
+            }
+            Some(ConditionStatus::ExercisedUnidentified {
+                pair_candidates,
+                test,
+                decompositions,
+                ..
+            }) => {
+                println!(
+                    "  ✓ {cond}: {}",
+                    unidentified_text(
+                        &analysis.matrix.conditions,
+                        pair_candidates,
+                        test,
+                        *decompositions
+                    )
                 );
             }
             Some(ConditionStatus::Ambiguous { tests }) => {
@@ -2195,14 +2312,61 @@ fn print_runtime_report_body(
     }
 }
 
-/// The status text after `? {cond}: ` for a condition whose only
-/// evidence is ambiguous: `UNKNOWN`, why, and the tests (at most
-/// [`summary::TESTS_SHOWN`] named, with their evaluation counts).
+/// True for a vector of a test [`Resolution::FlowDecomposition`] only
+/// partly resolved (the test also has a remainder observation): its
+/// `evaluations` is then a lower bound, not an exact count.
+fn is_lower_bound(obs: &ConditionObservation, observations: &[ConditionObservation]) -> bool {
+    obs.resolved_by == Some(Resolution::FlowDecomposition)
+        && observations
+            .iter()
+            .any(|o| is_remainder(o) && o.test_name == obs.test_name)
+}
+
+/// True for the ambiguous remainder of a test
+/// [`Resolution::FlowDecomposition`] only partly resolved.
+fn is_remainder(obs: &ConditionObservation) -> bool {
+    obs.ambiguous && obs.resolved_by == Some(Resolution::FlowDecomposition)
+}
+
+/// The status text after `✓ {cond}: ` (text) or the JUnit
+/// `system-out` of a [`ConditionStatus::ExercisedUnidentified`]
+/// condition: the candidate pairs, and that which one occurred is not
+/// determined.
+fn unidentified_text(
+    conditions: &[String],
+    candidates: &[IndependencePair],
+    test: &str,
+    decompositions: usize,
+) -> String {
+    let pairs: Vec<String> = candidates
+        .iter()
+        .map(|p| {
+            format!(
+                "({}) -> {} vs ({}) -> {}",
+                format_inputs(conditions, &p.test_1),
+                bool_glyph(p.test_1.result),
+                format_inputs(conditions, &p.test_2),
+                bool_glyph(p.test_2.result),
+            )
+        })
+        .collect();
+    format!(
+        "EXERCISED via one of: {}  [pair not uniquely identifiable: {decompositions} \
+         decompositions of {test}'s counters, each completing one of these pairs]",
+        pairs.join(" | ")
+    )
+}
+
+/// The status text after `? {cond}: ` (text) and the JUnit failure
+/// message for a condition whose only evidence is ambiguous:
+/// `UNKNOWN`, why, and the tests (at most [`summary::TESTS_SHOWN`]
+/// named, each with what its counters attributed and what they did
+/// not).
 fn unknown_reason(tests: &[String], observations: &[ConditionObservation]) -> String {
     format!(
-        "UNKNOWN — the outcomes an independence pair still needs were taken only in {} \
-         test(s) that evaluated the decision more than once, so no condition vector can be \
-         attributed: {}",
+        "UNKNOWN — the rows an independence pair still needs are possible only in {} \
+         test(s) that evaluated the decision more than once, whose counters do not attribute \
+         those rows to condition vectors: {}",
         tests.len(),
         format_ambiguous_tests(tests, observations)
     )
@@ -2219,9 +2383,11 @@ fn ruled_out_note(analysis: &RuntimeAnalysis, cond: &str) -> Option<String> {
     let labels: Vec<String> = why
         .iter()
         .map(|r| {
-            let evals = r
-                .evaluations
-                .map_or_else(String::new, |n| format!(" ({n} evaluations)"));
+            let evals = match (r.evaluations, r.remainder) {
+                (Some(n), true) => format!(" ({n} evaluations not attributable to a vector)"),
+                (Some(n), false) => format!(" ({n} evaluations)"),
+                (None, _) => String::new(),
+            };
             format!(
                 "{}{evals} never took {}={} ({}T/{}F) as ({}) -> {} needs",
                 r.test,
@@ -2301,7 +2467,17 @@ fn format_ambiguous_counts(conditions: &[String], obs: &ConditionObservation) ->
     let evals = obs
         .evaluations
         .map_or_else(|| "?".to_string(), |n| n.to_string());
-    format!("evaluated {evals}x: {}", counts.join("  "))
+    if is_remainder(obs) {
+        let attributed = obs.attributed_evaluations.map_or_else(String::new, |a| {
+            format!(" ({a} attributed to the vectors above)")
+        });
+        format!(
+            "{evals} evaluations not attributable to a vector{attributed}: {}",
+            counts.join("  ")
+        )
+    } else {
+        format!("evaluated {evals}x: {}", counts.join("  "))
+    }
 }
 
 /// `t1 (256 evaluations), t2 (3 evaluations)` for the tests behind a
@@ -2310,12 +2486,23 @@ fn format_ambiguous_counts(conditions: &[String], obs: &ConditionObservation) ->
 /// `(+N more)` (all of them are in the per-test listing).
 fn format_ambiguous_tests(tests: &[String], observations: &[ConditionObservation]) -> String {
     summary::cap_tests(tests, |t| {
-        let evals = observations
+        let found = observations
             .iter()
-            .find(|o| o.ambiguous && o.test_name.as_deref() == Some(t))
-            .and_then(|o| o.evaluations);
-        match evals {
-            Some(n) => format!("{t} ({n} evaluations)"),
+            .find(|o| o.ambiguous && o.test_name.as_deref() == Some(t));
+        match found.and_then(|o| o.evaluations.map(|n| (o, n))) {
+            Some((o, n)) if is_remainder(o) => {
+                let a = o.attributed_evaluations.unwrap_or(0);
+                let vectors = observations
+                    .iter()
+                    .filter(|v| !v.ambiguous && v.test_name.as_deref() == Some(t))
+                    .count();
+                format!(
+                    "{t} ({} evaluations: {a} attributed to {vectors} vector(s), {n} not \
+                     attributable to a vector)",
+                    a + n
+                )
+            }
+            Some((_, n)) => format!("{t} ({n} evaluations)"),
             None => t.to_string(),
         }
     })
@@ -2354,31 +2541,9 @@ fn format_inputs(conditions: &[String], row: &TruthTableRow) -> String {
         .join(", ")
 }
 
-/// Does this source-file path belong to the standard-library
-/// macro expansion namespace that rustc stamps at compile time?
-///
-/// The canonical shape is `/rustc/<hash>/library/<crate>/src/...`
-/// where `<crate>` is `core`, `std`, `alloc`, `proc_macro`, or a
-/// test-harness crate. Also catches cargo-registry proc-macro
-/// expansions whose spans point back to the macro definition
-/// site rather than the user call site. Candidates whose
-/// decision lives in those paths are macro hygiene bindings
-/// (`left_val` / `right_val` from `assert_eq!`, etc.), not
-/// user-written decisions, and should not be surfaced as MC/DC
-/// candidates.
-fn is_stdlib_macro_span(file: Option<&str>) -> bool {
-    let Some(f) = file else {
-        return false;
-    };
-    f.starts_with("/rustc/")
-        || f.contains("/library/core/")
-        || f.contains("/library/std/")
-        || f.contains("/library/alloc/")
-}
-
 fn print_out_of_scope_report(
     out: &mut dyn std::io::Write,
-    declined: &[impl std::fmt::Debug],
+    out_of_scope: &OutOfScopeSummary,
     skipped_oversize_mirs: &[(std::path::PathBuf, u64)],
     max_mir_mb: u64,
     mir_parse_problems: &[MirParseProblem],
@@ -2400,16 +2565,12 @@ fn print_out_of_scope_report(
             let _ = writeln!(out, "  {} ({})", t.target, t.package);
         }
     }
-    if !declined.is_empty() {
+    let lines = out_of_scope.text();
+    if !lines.is_empty() {
         let _ = writeln!(out);
-        let _ = writeln!(
-            out,
-            "Out of scope: {} function(s) have a decision in a shape \
-             the engine's current patterns do not recognise. The engine \
-             declined them rather than report a wrong verdict. See \
-             --format=json's `out_of_scope` for the full list.",
-            declined.len()
-        );
+        for line in lines {
+            let _ = writeln!(out, "{line}");
+        }
     }
     if !skipped_oversize_mirs.is_empty() {
         let _ = writeln!(out);
@@ -2467,7 +2628,14 @@ fn bool_glyph(v: bool) -> &'static str {
 /// The format is the de-facto JUnit XML that Jenkins, GitLab CI,
 /// GitHub Actions, Bazel/Buck2, and the other CIs the automotive
 /// industry already deploys render natively.
-fn render_runtime_junit(source: &str, analysis: &RuntimeAnalysis, not_measurable: usize) -> String {
+fn render_runtime_junit(
+    source: &str,
+    analysis: &RuntimeAnalysis,
+    observations: &[ConditionObservation],
+    not_measurable: usize,
+    toolchain: Option<&ToolchainSummary>,
+    out_of_scope: Option<&OutOfScopeSummary>,
+) -> String {
     use std::fmt::Write as _;
     let conditions = &analysis.matrix.conditions;
     let summary = CoverageSummary::new(Some(analysis), not_measurable);
@@ -2496,6 +2664,28 @@ fn render_runtime_junit(source: &str, analysis: &RuntimeAnalysis, not_measurable
     if let Some(pct) = summary.percentage {
         props.push(("floyd.percentage", format!("{pct:.0}")));
     }
+    props.extend(toolchain_properties(toolchain));
+    let mut oos_props: Vec<(String, String)> = Vec::new();
+    if let Some(oos) = out_of_scope {
+        oos_props.push(("floyd.out_of_scope".into(), oos.total.to_string()));
+        for (reason, n) in &oos.by_reason {
+            oos_props.push((format!("floyd.out_of_scope.{reason}"), n.to_string()));
+        }
+        for (detail, n) in &oos.no_decision {
+            oos_props.push((
+                format!("floyd.out_of_scope.no_decision.{detail}"),
+                n.to_string(),
+            ));
+        }
+        oos_props.push((
+            "floyd.ctfe_bodies_skipped".into(),
+            oos.ctfe_bodies_skipped.to_string(),
+        ));
+    }
+    let props = props
+        .into_iter()
+        .map(|(n, v)| (n.to_string(), v))
+        .chain(oos_props);
     for (name, value) in props {
         let _ = writeln!(
             out,
@@ -2514,15 +2704,41 @@ fn render_runtime_junit(source: &str, analysis: &RuntimeAnalysis, not_measurable
                 );
                 continue;
             }
+            Some(ConditionStatus::ExercisedUnidentified {
+                pair_candidates,
+                test,
+                decompositions,
+                ..
+            }) => {
+                // A pass: an independence pair is proven to exist.
+                let _ = writeln!(
+                    out,
+                    r#"    <testcase name="{case_name}" classname="floyd.mcdc">"#
+                );
+                let _ = writeln!(out, "      <properties>");
+                let _ = writeln!(
+                    out,
+                    r#"        <property name="floyd.pair_identifiable" value="false"/>"#
+                );
+                let _ = writeln!(out, "      </properties>");
+                let _ = writeln!(
+                    out,
+                    "      <system-out>{}</system-out>",
+                    xml_escape(&unidentified_text(
+                        conditions,
+                        pair_candidates,
+                        test,
+                        *decompositions
+                    ))
+                );
+                let _ = writeln!(out, r#"    </testcase>"#);
+                continue;
+            }
             Some(ConditionStatus::Ambiguous { tests }) => (
                 "AmbiguousCondition",
                 format!(
-                    "UNKNOWN: the outcomes an independence pair still needs were taken only \
-                     in {} test(s) that evaluated the decision more than once ({}); aggregate \
-                     counters cannot attribute a condition vector to them. Add tests that \
-                     each evaluate the decision once.",
-                    tests.len(),
-                    summary::cap_tests(tests, str::to_string)
+                    "{}. Add tests that each evaluate the decision once.",
+                    unknown_reason(tests, observations)
                 ),
             ),
             Some(ConditionStatus::Unexercised) | None => (
@@ -2553,6 +2769,32 @@ fn render_runtime_junit(source: &str, analysis: &RuntimeAnalysis, not_measurable
     out
 }
 
+/// The JUnit `<properties>` recording the toolchain:
+/// `floyd.toolchain` (the selection), `floyd.toolchain.version`
+/// (`rustc --version`), `.release`, `.host`, `.channel` and
+/// `.rustc_bootstrap`. Fields that were not probed are omitted.
+fn toolchain_properties(toolchain: Option<&ToolchainSummary>) -> Vec<(&'static str, String)> {
+    let Some(tc) = toolchain else {
+        return Vec::new();
+    };
+    let mut props = vec![("floyd.toolchain", tc.name.clone())];
+    if let Some(v) = &tc.version {
+        props.push(("floyd.toolchain.version", v.clone()));
+    }
+    if let Some(r) = &tc.release {
+        props.push(("floyd.toolchain.release", r.clone()));
+    }
+    if let Some(h) = &tc.host {
+        props.push(("floyd.toolchain.host", h.clone()));
+    }
+    props.push(("floyd.toolchain.channel", tc.channel.as_str().to_string()));
+    props.push((
+        "floyd.toolchain.rustc_bootstrap",
+        tc.rustc_bootstrap.to_string(),
+    ));
+    props
+}
+
 /// Escape the five XML special characters so condition names like
 /// `speed > 50` survive intact in attribute and text positions.
 /// The `&` replacement runs first so the subsequent escapes don't
@@ -2581,12 +2823,32 @@ mod tests {
 
     #[test]
     fn decline_json_report_carries_out_of_scope_and_candidates() {
-        let declined = vec![DeclinedFunction {
-            name: "crate::f".to_string(),
-            source_file: Some("src/lib.rs".to_string()),
-            line: Some(7),
-            reason: decision::DeclineReason::NonBoolLeaf,
-        }];
+        let declined = vec![
+            DeclinedFunction {
+                name: "crate::f".to_string(),
+                source_file: Some("src/lib.rs".to_string()),
+                line: Some(7),
+                reason: decision::DeclineReason::NonBoolLeaf,
+                detail: None,
+                conditions: None,
+            },
+            DeclinedFunction {
+                name: "crate::tests::t".to_string(),
+                source_file: Some("src/lib.rs".to_string()),
+                line: Some(40),
+                reason: decision::DeclineReason::NoDecision,
+                detail: Some(floyd::scope::NoDecisionDetail::StdMacroOnly),
+                conditions: None,
+            },
+            DeclinedFunction {
+                name: "crate::is_code_point".to_string(),
+                source_file: Some("src/lib.rs".to_string()),
+                line: Some(90),
+                reason: decision::DeclineReason::TooManyConditions,
+                detail: None,
+                conditions: Some(41),
+            },
+        ];
         let candidates = vec![
             CandidateSummary {
                 function_name: Some("crate::g".to_string()),
@@ -2627,6 +2889,7 @@ mod tests {
             bytes: 1,
         }];
         let report = CargoRuntimeReport {
+            toolchain: None,
             manifest: "Cargo.toml".to_string(),
             workspace_root: Some(".".to_string()),
             test_targets: 1,
@@ -2639,6 +2902,7 @@ mod tests {
             candidates: &candidates,
             analyses: None,
             out_of_scope: &declined,
+            out_of_scope_summary: OutOfScopeSummary::new(&declined, 2),
             skipped_oversize_mirs: &skipped,
             max_mir_size_mb: 50,
             mir_parse_problems: &[],
@@ -2652,6 +2916,21 @@ mod tests {
         assert_eq!(v["out_of_scope"][0]["name"], "crate::f");
         assert_eq!(v["out_of_scope"][0]["line"], 7);
         assert_eq!(v["out_of_scope"][0]["reason"], "non_bool_leaf");
+        assert!(v["out_of_scope"][0].get("detail").is_none());
+        assert!(v["out_of_scope"][0].get("conditions").is_none());
+        assert_eq!(v["out_of_scope"][1]["reason"], "no_decision");
+        assert_eq!(v["out_of_scope"][1]["detail"], "std_macro_only");
+        assert_eq!(v["out_of_scope"][2]["reason"], "too_many_conditions");
+        assert_eq!(v["out_of_scope"][2]["conditions"], 41);
+        assert_eq!(
+            v["out_of_scope_summary"],
+            serde_json::json!({
+                "total": 3,
+                "by_reason": {"no_decision": 1, "non_bool_leaf": 1, "too_many_conditions": 1},
+                "no_decision": {"std_macro_only": 1},
+                "ctfe_bodies_skipped": 2
+            })
+        );
         assert_eq!(v["candidates"][0]["function_name"], "crate::g");
         assert_eq!(v["candidates"][0]["invoked"], false);
         assert_eq!(v["candidates"][0]["display_name"], "crate::g");
@@ -2832,6 +3111,7 @@ mod tests {
         );
         let observations = [vector, ambiguous];
         let report = SingleRuntimeReport {
+            toolchain: None,
             source: "lib.rs".to_string(),
             verdict: RuntimeVerdict::Analysed,
             tests_discovered: &[],
@@ -2870,6 +3150,52 @@ mod tests {
         assert_eq!(format_ambiguous_tests(&many, &[]), "t0, t1, t2 (+2 more)");
     }
 
+    #[test]
+    fn flow_decomposition_remainder_is_labelled_as_unattributed() {
+        // chrono `test_time_from_hms_micro`: rule 6 credits two
+        // vectors (lower bounds) and keeps 2 of the 9 evaluations as
+        // the remainder.
+        let raw = |t, f| floyd::BranchCounts {
+            true_count: t,
+            false_count: f,
+        };
+        let mut vector = ConditionObservation::vector(
+            Some("micro".to_string()),
+            [("n2".to_string(), false)].into_iter().collect(),
+            false,
+        );
+        vector.evaluations = Some(5);
+        vector.resolved_by = Some(Resolution::FlowDecomposition);
+        let mut rest = ConditionObservation::ambiguous(
+            Some("micro".to_string()),
+            2,
+            [("n2".to_string(), raw(1, 1))].into_iter().collect(),
+        );
+        rest.resolved_by = Some(Resolution::FlowDecomposition);
+        rest.attributed_evaluations = Some(7);
+        let observations = [vector, rest];
+        assert!(is_lower_bound(&observations[0], &observations));
+        let conditions = ["n2".to_string()];
+        assert_eq!(
+            format_ambiguous_counts(&conditions, &observations[1]),
+            "2 evaluations not attributable to a vector (7 attributed to the vectors above): \
+             n2=1T/1F"
+        );
+        assert_eq!(
+            format_ambiguous_tests(&["micro".to_string()], &observations),
+            "micro (9 evaluations: 7 attributed to 1 vector(s), 2 not attributable to a vector)"
+        );
+        let v = serde_json::to_value(&observations).unwrap();
+        assert_eq!(v[0]["resolved_by"], "flow_decomposition");
+        assert_eq!(v[1]["resolved_by"], "flow_decomposition");
+        assert_eq!(v[1]["ambiguous"], true);
+        assert_eq!(v[1]["attributed_evaluations"], 7);
+        assert_eq!(v[1]["evaluations"], 2);
+
+        // A unique decomposition has no remainder: exact counts.
+        assert!(!is_lower_bound(&observations[0], &observations[..1]));
+    }
+
     fn ambiguous_analysis(ambiguous_tests: usize) -> RuntimeAnalysis {
         let tree = floyd::DecisionTree {
             // a && b
@@ -2882,6 +3208,7 @@ mod tests {
                 }),
                 else_branch: Box::new(decision::Node::Const { value: false }),
             }],
+            ..Default::default()
         };
         let vec_obs = |name: &str, a: bool, b: Option<bool>, result: bool| {
             let mut inputs: std::collections::BTreeMap<String, bool> =
@@ -2931,9 +3258,12 @@ mod tests {
             analysis.condition_status.get("b"),
             Some(ConditionStatus::Ambiguous { tests }) if tests.len() == 5
         ));
-        let xml = render_runtime_junit("lib.rs", &analysis, 2);
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 2, None, None);
         assert!(xml.contains(r#"type="AmbiguousCondition""#), "{xml}");
-        assert!(xml.contains("(loop_0, loop_1, loop_2 (+2 more))"), "{xml}");
+        assert!(
+            xml.contains("vectors: loop_0, loop_1, loop_2 (+2 more). Add tests"),
+            "{xml}"
+        );
         assert!(!xml.contains("loop_3"), "{xml}");
         assert!(xml.contains(r#"<testsuite name="lib.rs" tests="2" failures="1">"#));
         assert!(xml.contains(r#"<property name="floyd.unknown" value="1"/>"#));
@@ -2947,22 +3277,88 @@ mod tests {
     }
 
     #[test]
+    fn junit_records_the_toolchain_as_properties() {
+        let tc = ToolchainSummary {
+            name: "stable".into(),
+            version: Some("rustc 1.99.1 (58cf8f9c3 2026-10-13)".into()),
+            release: Some("1.99.1".into()),
+            host: Some("x86_64-apple-darwin".into()),
+            channel: floyd::toolchain::Channel::Stable,
+            rustc_bootstrap: true,
+        };
+        let xml = render_runtime_junit("lib.rs", &ambiguous_analysis(0), &[], 0, Some(&tc), None);
+        for prop in [
+            r#"<property name="floyd.toolchain" value="stable"/>"#,
+            r#"<property name="floyd.toolchain.version" value="rustc 1.99.1 (58cf8f9c3 2026-10-13)"/>"#,
+            r#"<property name="floyd.toolchain.release" value="1.99.1"/>"#,
+            r#"<property name="floyd.toolchain.channel" value="stable"/>"#,
+            r#"<property name="floyd.toolchain.rustc_bootstrap" value="true"/>"#,
+        ] {
+            assert!(xml.contains(prop), "{prop} missing:\n{xml}");
+        }
+        let error = failure::RunError::default();
+        let xml = failure::render_error_junit("/p/Cargo.toml", "build_failed", &error, Some(&tc));
+        assert!(xml.contains(r#"<property name="floyd.toolchain.channel" value="stable"/>"#));
+        assert!(
+            !render_runtime_junit("lib.rs", &ambiguous_analysis(0), &[], 0, None, None)
+                .contains("floyd.toolchain")
+        );
+    }
+
+    #[test]
     fn junit_carries_the_percentage_when_nothing_is_unknown() {
         let analysis = ambiguous_analysis(0);
         assert!(matches!(
             analysis.condition_status.get("b"),
             Some(ConditionStatus::Unexercised)
         ));
-        let xml = render_runtime_junit("lib.rs", &analysis, 0);
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0, None, None);
         assert!(xml.contains(r#"type="UnexercisedCondition""#), "{xml}");
         assert!(xml.contains(r#"<property name="floyd.percentage" value="50"/>"#));
         assert!(xml.contains(r#"<property name="floyd.unknown" value="0"/>"#));
     }
 
     #[test]
+    fn junit_properties_count_out_of_scope_by_reason() {
+        let analysis = ambiguous_analysis(0);
+        let declined = [
+            decision::DeclineReason::NoDecision,
+            decision::DeclineReason::UnsupportedShape,
+        ]
+        .into_iter()
+        .map(|reason| DeclinedFunction {
+            name: "f".into(),
+            source_file: None,
+            line: None,
+            reason,
+            detail: (reason == decision::DeclineReason::NoDecision)
+                .then_some(floyd::scope::NoDecisionDetail::DerivedImpl),
+            conditions: None,
+        })
+        .collect::<Vec<_>>();
+        let oos = OutOfScopeSummary::new(&declined, 3);
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0, None, Some(&oos));
+        for (name, value) in [
+            ("floyd.out_of_scope", "2"),
+            ("floyd.out_of_scope.no_decision", "1"),
+            ("floyd.out_of_scope.unsupported_shape", "1"),
+            ("floyd.out_of_scope.no_decision.derived_impl", "1"),
+            ("floyd.ctfe_bodies_skipped", "3"),
+        ] {
+            assert!(
+                xml.contains(&format!(r#"<property name="{name}" value="{value}"/>"#)),
+                "{name}: {xml}"
+            );
+        }
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0, None, None);
+        assert!(!xml.contains("floyd.out_of_scope"));
+    }
+
+    #[test]
     fn json_summary_reports_null_percentage_for_an_analysed_unknown() {
         let analysis = ambiguous_analysis(1);
         let report = SingleRuntimeReport {
+            toolchain: None,
             source: "lib.rs".to_string(),
             verdict: RuntimeVerdict::Analysed,
             tests_discovered: &[],
@@ -2990,6 +3386,7 @@ mod tests {
                     name: "b == 10".to_string(),
                 }),
             }],
+            ..Default::default()
         };
         let counts = |t, f| floyd::BranchCounts {
             true_count: t,
@@ -3025,7 +3422,7 @@ mod tests {
         );
         assert!(ruled_out_note(&analysis, "b == 32").is_none());
 
-        let xml = render_runtime_junit("lib.rs", &analysis, 0);
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0, None, None);
         assert!(xml.contains(r#"type="UnexercisedCondition""#), "{xml}");
         assert!(xml.contains("never took b == 10=T (0T/8F)"), "{xml}");
 
@@ -3048,6 +3445,7 @@ mod tests {
                 }),
                 else_branch: Box::new(decision::Node::Const { value: false }),
             }],
+            ..Default::default()
         }
     }
 
@@ -3068,7 +3466,7 @@ mod tests {
                  [the matching row (a=T, b=T) -> T is already covered]"
             )
         );
-        let xml = render_runtime_junit("lib.rs", &analysis, 0);
+        let xml = render_runtime_junit("lib.rs", &analysis, &[], 0, None, None);
         assert!(
             xml.contains(
                 "needs a test where (a=T, b=F) -&gt; F [the matching row (a=T, b=T) -&gt; T \
@@ -3095,7 +3493,7 @@ mod tests {
         let line = unknown_reason(&tests, &[]);
         assert!(
             line.starts_with(
-                "UNKNOWN — the outcomes an independence pair still needs were taken only in 4 \
+                "UNKNOWN — the rows an independence pair still needs are possible only in 4 \
                  test(s)"
             ),
             "{line}"
@@ -3112,9 +3510,11 @@ mod tests {
         Partial {
             manifest: Path::new("/w/Cargo.toml"),
             workspace_root: Some(Path::new("/w")),
+            toolchain: None,
             test_targets: 2,
             tests_discovered: tests,
             out_of_scope: &[],
+            ctfe_bodies_skipped: 0,
             skipped_oversize_mirs: skipped,
             mir_parse_problems: &[],
             skipped_no_harness: no_harness,
@@ -3193,7 +3593,14 @@ mod tests {
         assert!(!no_candidates_line(&[], 3, 50).contains("max-mir-size"));
 
         let mut out = Vec::new();
-        print_out_of_scope_report(&mut out, &[] as &[DeclinedFunction], &skipped, 80, &[], &[]);
+        print_out_of_scope_report(
+            &mut out,
+            &OutOfScopeSummary::default(),
+            &skipped,
+            80,
+            &[],
+            &[],
+        );
         let out = String::from_utf8(out).unwrap();
         assert!(
             out.contains("above the 80 MB scalability threshold"),
@@ -3233,7 +3640,7 @@ mod tests {
         let mut out = Vec::new();
         print_out_of_scope_report(
             &mut out,
-            &[] as &[DeclinedFunction],
+            &OutOfScopeSummary::default(),
             &[],
             50,
             &problems,

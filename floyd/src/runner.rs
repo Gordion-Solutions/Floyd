@@ -18,6 +18,7 @@
 //! follow-up.
 
 use crate::profile;
+use crate::toolchain::{Toolchain, ToolchainSpec};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -40,35 +41,34 @@ impl std::fmt::Display for RunnerError {
 
 impl std::error::Error for RunnerError {}
 
-/// Locate a binary in the active nightly toolchain's
-/// `llvm-tools-preview` component.
-///
-/// Probes `rustc +nightly --print=sysroot` and walks
-/// `<sysroot>/lib/rustlib/<triple>/bin/<name>`. Returns an error if
-/// no candidate exists (typically because `llvm-tools-preview` is
-/// not installed: `rustup component add llvm-tools-preview --toolchain nightly`).
+/// Locate a binary in the default (`nightly`) toolchain's
+/// `llvm-tools-preview` component; see [`llvm_tool_with_toolchain`].
 pub fn llvm_tool(name: &str) -> Result<PathBuf, RunnerError> {
-    let out = Command::new("rustc")
-        .args(["+nightly", "--print=sysroot"])
-        .output()
-        .map_err(|e| RunnerError {
-            stage: "rustc --print=sysroot",
-            message: format!("could not exec: {e}"),
-        })?;
-    if !out.status.success() {
-        return Err(RunnerError {
-            stage: "rustc --print=sysroot",
-            message: format!("exit status {}", out.status),
-        });
-    }
-    let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let rustlib = Path::new(&sysroot).join("lib").join("rustlib");
+    llvm_tool_with_toolchain(name, default_toolchain())
+}
+
+/// Locate a binary in `toolchain`'s LLVM tools.
+///
+/// Probes `rustc --print=sysroot` through the toolchain (`rustc
+/// +<name>`, or the `env` / `path:` rustc) and walks
+/// `<sysroot>/lib/rustlib/<triple>/bin/<name>`. Returns an error if
+/// no candidate exists (typically because the LLVM tools are not
+/// installed); the message names the install command for the
+/// toolchain ([`ToolchainSpec::llvm_tools_hint`]).
+pub fn llvm_tool_with_toolchain(name: &str, toolchain: &Toolchain) -> Result<PathBuf, RunnerError> {
+    let sysroot = toolchain.sysroot().map_err(|message| RunnerError {
+        stage: "rustc --print=sysroot",
+        message: format!("toolchain {}: {message}", toolchain.spec),
+    })?;
+    let rustlib = sysroot.join("lib").join("rustlib");
+    let hint = toolchain.spec.llvm_tools_hint();
     let entries = std::fs::read_dir(&rustlib).map_err(|e| RunnerError {
         stage: "find_llvm_tool",
-        message: format!("read {}: {e}", rustlib.display()),
+        message: format!("read {}: {e}; install with: {hint}", rustlib.display()),
     })?;
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     for entry in entries.flatten() {
-        let candidate = entry.path().join("bin").join(name);
+        let candidate = entry.path().join("bin").join(&file);
         if candidate.exists() {
             return Ok(candidate);
         }
@@ -76,10 +76,17 @@ pub fn llvm_tool(name: &str) -> Result<PathBuf, RunnerError> {
     Err(RunnerError {
         stage: "find_llvm_tool",
         message: format!(
-            "{name} not found under {}; install with: rustup component add llvm-tools-preview --toolchain nightly",
-            rustlib.display()
+            "{name} not found under {} (toolchain {}); install with: {hint}",
+            rustlib.display(),
+            toolchain.spec
         ),
     })
+}
+
+/// The toolchain of the functions that predate toolchain selection.
+fn default_toolchain() -> &'static Toolchain {
+    static DEFAULT: OnceLock<Toolchain> = OnceLock::new();
+    DEFAULT.get_or_init(|| Toolchain::assumed(ToolchainSpec::default()))
 }
 
 /// The environment variable the platform's dynamic loader searches
@@ -93,38 +100,6 @@ pub fn dylib_path_var() -> &'static str {
     } else {
         "LD_LIBRARY_PATH"
     }
-}
-
-/// The nightly toolchain's shared-library directories: the host
-/// target libdir (`rustc +nightly --print target-libdir`, which holds
-/// `libstd-*.dylib`/`.so`) and `<sysroot>/lib` (which holds
-/// `librustc_driver-*`). Computed once; empty when `rustc` cannot be
-/// queried, in which case binaries are spawned with the inherited
-/// environment.
-fn toolchain_lib_dirs() -> &'static [PathBuf] {
-    static DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
-    DIRS.get_or_init(|| {
-        let print = |what: &str| -> Option<PathBuf> {
-            let out = Command::new("rustc")
-                .args(["+nightly", "--print", what])
-                .output()
-                .ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            (!s.is_empty()).then(|| PathBuf::from(s))
-        };
-        let mut dirs = Vec::new();
-        if let Some(libdir) = print("target-libdir") {
-            dirs.push(libdir);
-        }
-        if let Some(sysroot) = print("sysroot") {
-            dirs.push(sysroot.join("lib"));
-        }
-        dirs.retain(|d| d.is_dir());
-        dirs
-    })
 }
 
 /// `prepend` followed by the entries of `existing` (an inherited
@@ -149,9 +124,9 @@ fn join_dylib_path(prepend: &[PathBuf], existing: Option<&std::ffi::OsStr>) -> O
 /// does. Test binaries of proc-macro crates (and anything else built
 /// with `-C prefer-dynamic`) link `libstd` dynamically and do not
 /// start without it.
-fn test_binary_command(binary: &Path) -> Command {
+fn test_binary_command(binary: &Path, toolchain: &Toolchain) -> Command {
     let var = dylib_path_var();
-    let mut dirs: Vec<PathBuf> = toolchain_lib_dirs().to_vec();
+    let mut dirs: Vec<PathBuf> = toolchain.lib_dirs().to_vec();
     if let Some(parent) = binary.parent() {
         dirs.push(parent.to_path_buf());
     }
@@ -208,14 +183,25 @@ fn output_with_profile(mut cmd: Command, profraw: &Path) -> std::io::Result<Outp
 /// The instrumented binary writes a coverage profile even for
 /// `--list`; it goes to a temporary file that is removed afterwards,
 /// not to `default_*.profraw` in the current directory.
+///
+/// The binary's loader path gets the default (`nightly`) toolchain's
+/// library directories; see [`list_tests_with_toolchain`].
 pub fn list_tests(binary: &Path) -> Result<Vec<String>, RunnerError> {
+    list_tests_with_toolchain(binary, default_toolchain())
+}
+
+/// [`list_tests`] for a binary built by `toolchain`.
+pub fn list_tests_with_toolchain(
+    binary: &Path,
+    toolchain: &Toolchain,
+) -> Result<Vec<String>, RunnerError> {
     static LISTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let profraw = std::env::temp_dir().join(format!(
         "floyd-list-{}-{}.profraw",
         std::process::id(),
         LISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let mut cmd = test_binary_command(binary);
+    let mut cmd = test_binary_command(binary, toolchain);
     cmd.args(["--list", "--format=terse"]);
     let out = output_with_profile(cmd, &profraw);
     let _ = std::fs::remove_file(&profraw);
@@ -257,7 +243,17 @@ pub fn run_test_isolated(
     test_name: &str,
     profraw: &Path,
 ) -> Result<(), RunnerError> {
-    let mut cmd = test_binary_command(binary);
+    run_test_isolated_with_toolchain(binary, test_name, profraw, default_toolchain())
+}
+
+/// [`run_test_isolated`] for a binary built by `toolchain`.
+pub fn run_test_isolated_with_toolchain(
+    binary: &Path,
+    test_name: &str,
+    profraw: &Path,
+    toolchain: &Toolchain,
+) -> Result<(), RunnerError> {
+    let mut cmd = test_binary_command(binary, toolchain);
     cmd.args(["--exact", test_name]);
     let out = output_with_profile(cmd, profraw).map_err(|e| RunnerError {
         stage: "run_test_isolated",
@@ -284,7 +280,17 @@ pub fn run_test_isolated(
 /// producing a valid `profraw`. Errors out only if `profraw` is not
 /// created.
 pub fn run(binary: &Path, argv: &[&str], profraw: &Path) -> Result<(), RunnerError> {
-    let mut cmd = test_binary_command(binary);
+    run_with_toolchain(binary, argv, profraw, default_toolchain())
+}
+
+/// [`run`] for a binary built by `toolchain`.
+pub fn run_with_toolchain(
+    binary: &Path,
+    argv: &[&str],
+    profraw: &Path,
+    toolchain: &Toolchain,
+) -> Result<(), RunnerError> {
+    let mut cmd = test_binary_command(binary, toolchain);
     cmd.args(argv);
     let out = output_with_profile(cmd, profraw).map_err(|e| RunnerError {
         stage: "run binary",
@@ -433,7 +439,8 @@ mod tests {
     /// `libstd-*` lives) on the loader search path.
     #[test]
     fn test_binary_command_sets_the_loader_path() {
-        let cmd = test_binary_command(Path::new("/some/dir/bin"));
+        let toolchain = default_toolchain();
+        let cmd = test_binary_command(Path::new("/some/dir/bin"), toolchain);
         let value = cmd
             .get_envs()
             .find(|(k, _)| *k == dylib_path_var())
@@ -441,7 +448,7 @@ mod tests {
             .expect("loader path set");
         let parts: Vec<PathBuf> = std::env::split_paths(value).collect();
         assert!(parts.contains(&PathBuf::from("/some/dir")));
-        for d in toolchain_lib_dirs() {
+        for d in toolchain.lib_dirs() {
             assert!(parts.contains(d), "{} missing", d.display());
         }
     }

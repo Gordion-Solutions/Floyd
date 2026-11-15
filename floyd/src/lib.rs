@@ -20,7 +20,7 @@
 //!
 //! ## Status
 //!
-//! v0.3.0. The `cargo floyd test` workflow runs end-to-end on real
+//! v0.4.0. The `cargo floyd test` workflow runs end-to-end on real
 //! cargo projects, recovering boolean decisions built from `&&`,
 //! `||`, `!`, inline comparisons (`>`, `<`, `==`, `!=`, `>=`, `<=`),
 //! `if let` with a binding, the `?` operator (skip-through),
@@ -65,12 +65,14 @@ pub mod masking;
 pub mod mir;
 pub mod profile;
 pub mod runner;
+pub mod scope;
+pub mod toolchain;
 
 pub use correlate::DecisionMap;
 pub use decision::DecisionTree;
 pub use masking::{
     BranchCounts, ConditionObservation, ConditionStatus, DecisionProvenance, IndependenceMatrix,
-    Resolution, RuledOut, RuntimeAnalysis,
+    Resolution, RuledOut, RuntimeAnalysis, WalkVector,
 };
 pub use mir::Mir;
 pub use profile::CoverageReport;

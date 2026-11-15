@@ -13,28 +13,30 @@ Project page: <https://gordionsolutions.co.uk/software/#floyd>
 ```
 $ cd demo/restraint-controller && cargo floyd test
 floyd  runtime MC/DC analysis of /path/to/floyd/demo/restraint-controller/Cargo.toml
+Toolchain: nightly (rustc 1.101.0-nightly (708c94ef0 2026-11-03), nightly channel)
 
 Test targets: 3
 Tests discovered: 5
 Observations:     5 (5 used, 0 ambiguous)
-Conditions:       !seatbelt_fastened, crash_detected, occupant_present, speed_above_threshold
+Conditions:       occupant_present, crash_detected, speed_above_threshold, !seatbelt_fastened
 
 Per-test observations:
-  arms_at_high_speed_when_occupant_unbelted_and_no_crash  !seatbelt_fastened=T  crash_detected=F  occupant_present=T  speed_above_threshold=T  result=T
-  no_arm_at_high_speed_when_occupant_belted_and_no_crash  !seatbelt_fastened=F  crash_detected=F  occupant_present=T  speed_above_threshold=T  result=F
-  arms_when_crash_detected_with_occupant  !seatbelt_fastened=-  crash_detected=T  occupant_present=T  speed_above_threshold=-  result=T
-  no_arm_at_low_speed_without_crash  !seatbelt_fastened=-  crash_detected=F  occupant_present=T  speed_above_threshold=F  result=F
-  no_arm_without_occupant         !seatbelt_fastened=-  crash_detected=-  occupant_present=F  speed_above_threshold=-  result=F
+  arms_at_high_speed_when_occupant_unbelted_and_no_crash  occupant_present=T  crash_detected=F  speed_above_threshold=T  !seatbelt_fastened=T  result=T
+  no_arm_at_high_speed_when_occupant_belted_and_no_crash  occupant_present=T  crash_detected=F  speed_above_threshold=T  !seatbelt_fastened=F  result=F
+  arms_when_crash_detected_with_occupant  occupant_present=T  crash_detected=T  speed_above_threshold=-  !seatbelt_fastened=-  result=T
+  no_arm_at_low_speed_without_crash  occupant_present=T  crash_detected=F  speed_above_threshold=F  !seatbelt_fastened=-  result=F
+  no_arm_without_occupant         occupant_present=F  crash_detected=-  speed_above_threshold=-  !seatbelt_fastened=-  result=F
 
 Per-condition MC/DC status:
-  ✓ !seatbelt_fastened: EXERCISED  via (!seatbelt_fastened=F, crash_detected=F, occupant_present=T, speed_above_threshold=T) -> F   vs   (!seatbelt_fastened=T, crash_detected=F, occupant_present=T, speed_above_threshold=T) -> T
-  ✓ crash_detected: EXERCISED  via (!seatbelt_fastened=F, crash_detected=F, occupant_present=T, speed_above_threshold=F) -> F   vs   (!seatbelt_fastened=F, crash_detected=T, occupant_present=T, speed_above_threshold=F) -> T
-  ✓ occupant_present: EXERCISED  via (!seatbelt_fastened=F, crash_detected=F, occupant_present=F, speed_above_threshold=F) -> F   vs   (!seatbelt_fastened=T, crash_detected=T, occupant_present=T, speed_above_threshold=T) -> T
-  ✓ speed_above_threshold: EXERCISED  via (!seatbelt_fastened=T, crash_detected=F, occupant_present=T, speed_above_threshold=F) -> F   vs   (!seatbelt_fastened=T, crash_detected=F, occupant_present=T, speed_above_threshold=T) -> T
+  ✓ occupant_present: EXERCISED  via (occupant_present=F, crash_detected=F, speed_above_threshold=F, !seatbelt_fastened=F) -> F   vs   (occupant_present=T, crash_detected=T, speed_above_threshold=T, !seatbelt_fastened=T) -> T
+  ✓ crash_detected: EXERCISED  via (occupant_present=T, crash_detected=F, speed_above_threshold=F, !seatbelt_fastened=F) -> F   vs   (occupant_present=T, crash_detected=T, speed_above_threshold=F, !seatbelt_fastened=F) -> T
+  ✓ speed_above_threshold: EXERCISED  via (occupant_present=T, crash_detected=F, speed_above_threshold=F, !seatbelt_fastened=T) -> F   vs   (occupant_present=T, crash_detected=F, speed_above_threshold=T, !seatbelt_fastened=T) -> T
+  ✓ !seatbelt_fastened: EXERCISED  via (occupant_present=T, crash_detected=F, speed_above_threshold=T, !seatbelt_fastened=F) -> F   vs   (occupant_present=T, crash_detected=F, speed_above_threshold=T, !seatbelt_fastened=T) -> T
 
 MC/DC coverage: 4 of 4 conditions exercised (100%)
 
-Out of scope: 5 function(s) have a decision in a shape the engine's current patterns do not recognise. The engine declined them rather than report a wrong verdict. See --format=json's `out_of_scope` for the full list.
+Out of scope: 5 function(s) with a `switchInt` were not analysed. See --format=json's `out_of_scope` for the list.
+  5 with no Boolean decision the user wrote (assert only 5).
 $ echo $?
 0
 ```
@@ -49,9 +51,11 @@ prints no percentage; the summary line then reads
 `MC/DC coverage: N exercised, N not exercised, N unknown of N
 conditions ...`. See
 [Tests that evaluate a decision more than once](#tests-that-evaluate-a-decision-more-than-once).
-The "Out of scope" line lists functions (here the `#[test]` functions'
-own `assert!` expansions) whose decisions Floyd declines rather than
-analyse; it does not affect the verdict.
+The "Out of scope" lines count functions with a `switchInt` that Floyd
+does not analyse, by reason. Here they are the `#[test]` functions,
+whose only `switchInt`s are `assert!` conditions, so they have no
+Boolean decision to analyse (`no_decision`, `assert_only`). They do
+not affect the verdict.
 
 The exit code is 0 when every condition is exercised, 2 when a
 decision was analysed but MC/DC was not demonstrated (a condition is
@@ -78,9 +82,9 @@ never the newline; an `ensure!` test whose operand's `Debug` output has
 a newline before any space would close the gap.
 
 ```text
-Conditions:       b == 10, b == 32
-  ✗ b == 10: UNEXERCISED — needs a test where (b == 10=T, b == 32=F) -> T [the matching row (b == 10=F, b == 32=F) -> F is already covered]
-  ✓ b == 32: EXERCISED  via (b == 10=F, b == 32=F) -> F   vs   (b == 10=F, b == 32=T) -> T
+Conditions:       b == 32, b == 10
+  ✓ b == 32: EXERCISED  via (b == 32=F, b == 10=F) -> F   vs   (b == 32=T, b == 10=F) -> T
+  ✗ b == 10: UNEXERCISED — needs a test where (b == 32=F, b == 10=T) -> T [the matching row (b == 32=F, b == 10=F) -> F is already covered]
 MC/DC coverage: 1 of 2 conditions exercised (50%)
 ```
 
@@ -110,9 +114,11 @@ cargo floyd test
 ## Install
 
 ```sh
-# Nightly toolchain + LLVM coverage tools (one-time).
+# A toolchain with the LLVM coverage tools (one-time): nightly ...
 rustup install nightly
 rustup component add llvm-tools-preview --toolchain nightly
+# ... or stable.
+rustup component add llvm-tools-preview --toolchain stable
 
 # Floyd itself.
 cargo install cargo-floyd
@@ -121,8 +127,36 @@ cargo install cargo-floyd
 Then, inside any cargo project with `#[test]` functions:
 
 ```sh
-cargo floyd test
+cargo floyd test                       # nightly (the default)
+cargo floyd test --toolchain=stable    # or any rustup toolchain name
 ```
+
+Floyd needs two unstable compiler flags (`-Zcoverage-options` and
+`-Zmir-include-spans`). With a stable or beta compiler it sets
+`RUSTC_BOOTSTRAP=1` for the instrumented build only (on `rustc`
+itself, through Floyd's wrapper: not on cargo, build scripts or the
+tests it runs) and says so on stderr. The toolchain, its `rustc
+--version`, channel and whether `RUSTC_BOOTSTRAP` was used are
+recorded in the text report header, the JSON `toolchain` object and
+the JUnit `floyd.toolchain.*` properties. The `fixtures/mcdc-cases`
+regression suite gives identical verdicts on stable 1.99.1 and
+nightly 1.101. An older compiler can produce different MIR: on
+1.83.0 the engine declines three of the fixture's decisions it
+recognises on current compilers (they are listed in `out_of_scope`,
+not given a wrong verdict).
+
+**Ferrocene (untested).** Ferrocene, the ISO 26262-qualified Rust
+compiler, is installed with criticalup and has no rustup toolchain
+name. Floyd has not been tested with it. In principle: add the LLVM
+tools package to your `criticalup.toml` and run `criticalup install`,
+then run `cargo floyd test --toolchain=env`, which uses `$CARGO` /
+`$RUSTC` when set, otherwise the `cargo` and `rustc` on `PATH`, with
+no `+<name>` argument (`--toolchain=path:<dir>` names a directory
+holding `cargo` and `rustc` instead). Ferrocene reports a stable
+channel, so Floyd enables `RUSTC_BOOTSTRAP=1` for the instrumented
+build; whether that is acceptable under your qualification plan is
+for your safety case to decide, since the unstable flags are outside
+Ferrocene's qualified scope.
 
 Floyd builds the project's tests with `-Cinstrument-coverage
 -Zcoverage-options=branch,condition`, runs each test in isolation,
@@ -193,7 +227,25 @@ independence pairs do not depend on which outcome is called true.
 Several shapes that appear regularly in real safety code are
 still declined; the engine-correctness milestone (see
 [ADR-0004](architecture/decisions/0004-engine-correctness-oss-boundary.md))
-closed the biggest gaps. The current declines:
+closed the biggest gaps.
+
+Most functions Floyd lists as out of scope have no decision to
+decline. In a 19-crate validation sweep, roughly 70% of them contain
+no Boolean decision the user wrote: only `assert_eq!`-style standard
+library macro code, derived impls, plain enum `match`es, `?` and
+`for` loops, assertions or drop flags. Floyd reports these as
+`no_decision` with a `detail`, separately from real declines (see
+[JSON summary](#json-summary)). Per-crate counts from the latest
+sweep are in [YIELD.md](YIELD.md). Of the functions with a real
+decision, the main shapes still declined, from a hand-classified
+sample (a function often shows several) are: conditions that are
+call results (`if self.low.get() && ..`, `==` on non-primitive types,
+about 60%); decisions whose arms do not produce the function's
+return value (guards, `if` without `else`, about 50%); more than one
+decision in a function, including `else if` (about 50%); patterns
+with bindings or guards (about 25%); a decision after an unrelated
+straight-line prefix (about 25%); and loop conditions (about 20%).
+The current declines:
 
 | Shape | Workaround / status |
 |-------|---------------------|
@@ -202,12 +254,13 @@ closed the biggest gaps. The current declines:
 | Pattern destructuring beyond a single bound value (`if let Some((a, b)) = ...`) | Not in MVP scope. |
 | `async` desugaring, macro-expansion provenance | Not in MVP scope. |
 | FnMut closures with internal mutation | The Fn / move-closure capture forms recover; closures that mutate captured state internally (`b = b && x`) produce a different MIR shape that's not yet handled. |
+| Decisions with more than 12 conditions, or whose tree would grow past the engine's step budget (a 40-alternative `matches!` over `char` ranges) | Declined quickly as `too_many_conditions`, with the condition count: the analysis enumerates all `2^n` rows of the truth table. |
 
 Most bool-returning safety-critical Rust functions recover
 correctly. The remaining gaps in the "what doesn't" table are
 either explicit Phase 2 deliverables or items that sit in the
 commercial tier per ADR-0004 — the OSS engine's surface on the
-0.3.x line is as listed in "what works" above.
+0.4.x line is as listed in "what works" above.
 
 ### Tests that evaluate a decision more than once
 
@@ -277,9 +330,37 @@ vector from a test only when
   them. Where both this and the tree rule apply they give the same
   vectors, so Floyd tries the tree rule first for its exact
   per-vector counts.
+- otherwise, for any decision shape, the counters are linear
+  equations on how many evaluations took each path through the
+  decision (each condition's true count is the number of
+  evaluations on paths that test it true, and so on), and Floyd
+  enumerates every whole-number solution. A path is credited only
+  if *every* solution takes it. A condition that was never reached
+  (both counters 0), or never took a value, rules out every path
+  through that edge, which often leaves one solution. For example,
+  chrono's `hour >= 24 || min >= 60 || sec >= 60 || (nano >=
+  1_000_000_000 && sec != 59) || nano >= 2_000_000_000`, evaluated 53
+  times by `test_rfc3339` with `hour >= 24`, `min >= 60` and
+  `sec >= 60` each true once and `sec != 59` never reached, has one
+  solution: each of the three `true` paths once and the all-false
+  path 50 times. These vectors carry `"resolved_by":
+  "flow_decomposition"` and their own counts. When the solutions
+  differ, the paths every solution takes are still credited, with
+  the least count any solution gives them (the text report says
+  `at least N evaluations`), and what they do not account for stays
+  an ambiguous observation of the remaining evaluations and
+  counters, also tagged `flow_decomposition`, with
+  `attributed_evaluations` saying how many evaluations the vectors
+  account for (`M evaluations not attributable to a vector (N
+  attributed to the vectors above)` in the text report). Paths that
+  only some solutions take are never credited as vectors. The
+  ambiguous observation lists the possible splits of the remaining
+  evaluations as `decompositions` (one entry per distinct set of
+  paths some solution takes, at most 64; omitted when there are
+  more), used for the check below.
 
-Any other test, such as one where two or more conditions were both
-true and false in a decision that is not a tree, is reported as an
+Any other test, such as `(a || b) && c` evaluated as (T,-,T) and
+(F,T,F) (the same counters as (T,-,F) and (F,T,T)), is reported as an
 **ambiguous observation**: `--format=json` marks it `"ambiguous": true` with its
 `evaluations` count and raw per-condition `counts`, the text report
 lists it as `AMBIGUOUS`, and it is excluded from independence-pair
@@ -304,7 +385,34 @@ test took (a zero counter in every ambiguous test that evaluated the
 decision, and no vector), the condition is provably **UNEXERCISED**,
 and the report says why with the counters, for example
 `test_whitespace (9 evaluations) never took b == 10=T (0T/8F)`
-(text and JUnit; `ruled_out` in the JSON analysis).
+(text and JUnit; `ruled_out` in the JSON analysis). For a test the
+flow-decomposition rule resolved in part, the test is named with
+what was and was not attributed, for example
+`test_time_from_hms_micro (9 evaluations: 7 attributed to 2
+vector(s), 2 not attributable to a vector)`, in text and JUnit alike;
+the JSON remainder observation carries the same numbers
+(`attributed_evaluations`, `evaluations`).
+
+Before a condition is reported `UNKNOWN`, Floyd checks each ambiguous
+test's `decompositions` on its own: if *every* decomposition of that
+test, together with the condition vectors of all tests, covers both
+rows of *some* independence pair, then a pair occurred in the real
+run, whichever decomposition it was. The condition is then
+**EXERCISED** and counts as exercised in the summary and percentage,
+but the pair is not identifiable, and the report says so:
+
+```text
+  ✓ nano >= 2000000000: EXERCISED via one of: (..) -> T vs (..) -> F | (..) -> T vs (..) -> F  [pair not uniquely identifiable: 2 decompositions of naive::time::tests::test_time_from_hms_micro's counters, each completing one of these pairs]
+```
+
+In JSON the condition's status is `ExercisedUnidentified` with
+`pair_candidates` (one pair each decomposition completes),
+`pair_identifiable: false`, `test` and `decompositions`, instead of
+the `Exercised` pair; in JUnit the testcase passes, with the same
+text in `<system-out>` and a `floyd.pair_identifiable=false`
+property. Floyd claims only that some independence pair occurred,
+never which one. If any decomposition completes no pair, the
+condition stays `UNKNOWN`.
 
 An independence pair needs both of its rows, so for an unexercised
 condition the report names the rows still missing from one pair
@@ -371,6 +479,8 @@ jobs:
       - run: cargo install cargo-floyd
       - name: Run Floyd
         run: cargo floyd test --format=junit > floyd-mcdc.xml
+        # On stable instead: dtolnay/rust-toolchain@stable with the
+        # same component, and `cargo floyd test --toolchain=stable`.
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4
@@ -389,6 +499,8 @@ floyd-mcdc:
     - cargo install cargo-floyd
   script:
     - cargo floyd test --format=junit > floyd-mcdc.xml
+  # Stable: image rust:latest, the same component, and
+  # `cargo floyd test --toolchain=stable --format=junit`.
   artifacts:
     when: always
     reports:
@@ -419,6 +531,7 @@ upload floyd-mcdc.xml`).
 | `--all-features`, `--no-default-features` | Passed to the instrumented build, as for `cargo test`. Crates whose test suite expects `cargo test --all-features` (such as `time`) need it. |
 | `--target-dir=<dir>` | The project's target directory, as for cargo (default: `CARGO_TARGET_DIR`, `build.target-dir`, else `target/`). The instrumented build goes into `<dir>/floyd`. |
 | `--all-candidates` | With `--format=json`, also analyse every measurable candidate, not only the selected one, and add them as `analyses`; the selected decision's report and the exit code are unchanged. Cargo projects only. |
+| `--toolchain=<name>\|env\|path:<dir>` | The compiler to build and read coverage with (default `nightly`; also `FLOYD_TOOLCHAIN`). `<name>` is a rustup toolchain, run as `cargo +<name>` / `rustc +<name>`. `env` uses `$CARGO` / `$RUSTC` when set (cargo sets `CARGO` for `cargo floyd`, so it is the cargo that launched Floyd), else `cargo` / `rustc` on `PATH`, with no `+<name>`; `path:<dir>` uses `<dir>/cargo` and `<dir>/rustc`. A stable or beta compiler gets `RUSTC_BOOTSTRAP=1` for the instrumented build only. `llvm-profdata` / `llvm-cov` come from that toolchain's sysroot. Recorded in every report (see [Toolchain](#toolchain)). |
 
 ### Build directory
 
@@ -426,7 +539,7 @@ Floyd builds the instrumented tests in its own directory,
 `<target>/floyd` (for example `target/floyd/`), never in the
 directory `cargo test` uses. Cargo does not see the instrumentation
 Floyd adds per crate as a change, so in a shared directory it would
-reuse plain test binaries left by `cargo +nightly test`; a separate
+reuse plain test binaries left by `cargo test`; a separate
 directory also keeps Floyd's build and yours from invalidating each
 other. A second `cargo floyd test` reuses the instrumented build.
 `target/floyd` sits inside `target/`, so an ignore rule for `target/`
@@ -435,7 +548,42 @@ already covers it; to speed up CI, cache it with the rest of
 `-Zcoverage-options` and `-Zmir-include-spans` go through cargo's
 rustflags (appended to `RUSTFLAGS` or `CARGO_ENCODED_RUSTFLAGS` when
 you set one, otherwise to `build.rustflags`), so cargo rebuilds when
-they change.
+they change. Switching `--toolchain` also rebuilds, since cargo
+fingerprints the compiler version.
+
+### Toolchain
+
+The toolchain is recorded as qualification evidence. The text report
+header has a line such as
+
+```text
+Toolchain: stable (rustc 1.99.1 (58cf8f9c3 2026-10-13), stable channel, RUSTC_BOOTSTRAP=1 for the instrumented build)
+```
+
+the JSON report a `toolchain` object (`null` only when the toolchain
+could not be probed, a `setup_failed` run):
+
+```json
+"toolchain": {
+  "name": "stable",
+  "version": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "release": "1.99.1",
+  "host": "x86_64-apple-darwin",
+  "channel": "stable",
+  "rustc_bootstrap": true
+}
+```
+
+and the JUnit suite the properties `floyd.toolchain`,
+`floyd.toolchain.version`, `.release`, `.host`, `.channel` and
+`.rustc_bootstrap`. `channel` is read from `rustc --version
+--verbose` (`release:`): `nightly`, `dev`, `beta` or `stable`
+(Ferrocene included). `RUSTC_BOOTSTRAP=1` is set for stable and beta
+only, through the `floyd-rustc-shim` wrapper, on the `rustc`
+processes of the instrumented build; cargo, build scripts and the
+tests Floyd runs never see it. Library users:
+`floyd::toolchain::Toolchain::detect` and the `*_with_toolchain`
+functions of `floyd::instrument` and `floyd::runner`.
 
 ### Errors
 
@@ -525,16 +673,42 @@ recognise, or an item whose closing brace it never found) is listed
 in `mir_parse_problems` (`path`, `problem`) and on stderr. Functions
 in the unparsed part are neither candidates nor `out_of_scope`.
 
-Functions that have a decision the engine declined are listed in
-`out_of_scope`, each with a `reason`: `non_bool_leaf` when an arm's
-value is a named local that is not `bool` (for example a branch that
-returns a struct or an integer, which is not a Boolean condition)
-and the arms are not a lifted shape (see
-[Non-Boolean arms](#non-boolean-arms)),
-`no_conditions` when the recovered tree is a bare constant that
-tests no condition, `ctfe_body` for the `// MIR FOR CTFE` rendering
-of a `const fn` (never run at runtime; the function's runtime body
-is considered instead), otherwise `unsupported_shape`. A candidate
+Every function with a `switchInt` that is not a candidate is listed
+once in `out_of_scope`, each with a `reason`:
+
+- `no_decision`: none of its `switchInt`s is a Boolean decision the
+  user wrote. `detail` says what they are: `std_macro_only`
+  (`assert_eq!`, `assert_ne!` and other standard-library or
+  dependency macro code), `pattern_match_only` (an enum `match` or
+  `matches!` with no `if`, `&&` or `||`), `derived_impl` (a
+  `#[derive(..)]` body), `question_mark_or_loop_only` (`?` and `for`
+  loops), `assert_only` (`assert!`, `debug_assert!`, `ensure!`
+  conditions) or `drop_flags_only` (compiler drop flags). Floyd
+  assigns it only on positive evidence from the MIR (rustc's branch
+  markers, which mark every `if`, `while`, `&&` and `||` operand the
+  user wrote, the `switchInt` spans, and the derive attribute in the
+  source); anything it cannot account for keeps its decline reason.
+- `unsupported_shape`: a decision in a shape the engine does not
+  recognise yet.
+- `non_bool_leaf`: an arm's value is a named local that is not
+  `bool` (for example a branch that returns a struct or an integer,
+  which is not a Boolean condition) and the arms are not a lifted
+  shape (see [Non-Boolean arms](#non-boolean-arms)).
+- `no_conditions`: the recovered tree is a bare constant that tests
+  no condition.
+- `too_many_conditions`: the decision has more than 12 conditions,
+  or its tree would exceed the engine's step budget; `conditions`
+  gives the count.
+
+The `// MIR FOR CTFE` rendering of a `const fn` (never run at
+runtime) is not listed; its runtime body is. `out_of_scope_summary`
+counts the list by reason (`by_reason`), the `no_decision` entries by
+detail (`no_decision`), and the CTFE bodies skipped
+(`ctfe_bodies_skipped`); the text report prints the same counts and
+the JUnit suite carries them as `floyd.out_of_scope.*` and
+`floyd.ctfe_bodies_skipped` properties. A function whose decision is
+a user macro call expanding to standard-library code (a `matches!`)
+is located at the call in the user's file, not in `core`. A candidate
 whose outcome is the arm taken carries `lift` (`call_arms` or
 `value_arms`).
 
@@ -543,16 +717,19 @@ whose outcome is the arm taken carries `lift` (`call_arms` or
 DO-178C, ISO 26262, and IEC 61508 require MC/DC analysis at the
 highest safety levels. Until recently `rustc` shipped partial MC/DC
 instrumentation behind `-Zcoverage-options=mcdc`, but that
-implementation was removed in August 2025 (PR #144999). No
+implementation was removed in August 2025 (PR #144999). AdaCore
+now leads the 2026 Rust project goal to reinstate it. No
 cargo-native open-source MC/DC tool exists at the time of writing.
 Floyd fills that gap.
 
 The closest neighbouring tool is AdaCore's [gnatcov][gnatcov],
-which is qualified for DO-178C Level A and ISO 26262 ASIL-D — but
-only on Ada and SPARK, and via the AdaCore toolchain. Floyd takes
+qualified for DO-178C Level A and ISO 26262 ASIL-D on Ada and
+SPARK, and since November 2026 offering MC/DC for Rust through
+GNAT Pro for Rust and its own instrumenting compiler. Floyd takes
 the qualification-by-validation route on rustc's existing
-instrumentation, with the differential corpus in this repo as the
-load-bearing evidence artifact.
+instrumentation, on stable or nightly toolchains, with the
+differential corpus in this repo as the load-bearing evidence
+artifact.
 
 [gnatcov]: https://www.adacore.com/gnatpro/toolsuite/gnatcoverage
 

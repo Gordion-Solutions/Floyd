@@ -19,9 +19,11 @@ conditions are never demonstrated. Writing the tests Floyd asks for
 
 ## Setup
 
-Floyd needs a nightly toolchain with the LLVM tools. The walkthrough
-below was recorded with `cargo-floyd` built from this repository and
-nightly-2026-11-03:
+Floyd needs a toolchain with the LLVM tools, nightly by default. The
+walkthrough below was recorded with `cargo-floyd` built from this
+repository and nightly-2026-11-03 (`cargo floyd test
+--toolchain=stable` gives the same results on stable 1.99.1, apart
+from the `Toolchain:` line):
 
 ```sh
 rustup install nightly
@@ -38,7 +40,7 @@ below are shortened to `/path/to/floyd`.
 any toolchain: Floyd builds its instrumented test binaries in
 `target/floyd`, separate from the ones `cargo test` builds in
 `target/debug`. (Earlier versions shared `target/debug` and stopped
-with exit 1 after a `cargo +nightly test`; that is fixed.)
+with exit 1 after a `cargo test`; that is fixed.)
 
 ## Step 0: the clean state, 100% MC/DC
 
@@ -49,28 +51,30 @@ cargo floyd test    # exit code 0
 
 ```
 floyd  runtime MC/DC analysis of /path/to/floyd/demo/restraint-controller/Cargo.toml
+Toolchain: nightly (rustc 1.101.0-nightly (708c94ef0 2026-11-03), nightly channel)
 
 Test targets: 3
 Tests discovered: 5
 Observations:     5 (5 used, 0 ambiguous)
-Conditions:       !seatbelt_fastened, crash_detected, occupant_present, speed_above_threshold
+Conditions:       occupant_present, crash_detected, speed_above_threshold, !seatbelt_fastened
 
 Per-test observations:
-  arms_at_high_speed_when_occupant_unbelted_and_no_crash  !seatbelt_fastened=T  crash_detected=F  occupant_present=T  speed_above_threshold=T  result=T
-  no_arm_at_high_speed_when_occupant_belted_and_no_crash  !seatbelt_fastened=F  crash_detected=F  occupant_present=T  speed_above_threshold=T  result=F
-  arms_when_crash_detected_with_occupant  !seatbelt_fastened=-  crash_detected=T  occupant_present=T  speed_above_threshold=-  result=T
-  no_arm_at_low_speed_without_crash  !seatbelt_fastened=-  crash_detected=F  occupant_present=T  speed_above_threshold=F  result=F
-  no_arm_without_occupant         !seatbelt_fastened=-  crash_detected=-  occupant_present=F  speed_above_threshold=-  result=F
+  arms_at_high_speed_when_occupant_unbelted_and_no_crash  occupant_present=T  crash_detected=F  speed_above_threshold=T  !seatbelt_fastened=T  result=T
+  no_arm_at_high_speed_when_occupant_belted_and_no_crash  occupant_present=T  crash_detected=F  speed_above_threshold=T  !seatbelt_fastened=F  result=F
+  arms_when_crash_detected_with_occupant  occupant_present=T  crash_detected=T  speed_above_threshold=-  !seatbelt_fastened=-  result=T
+  no_arm_at_low_speed_without_crash  occupant_present=T  crash_detected=F  speed_above_threshold=F  !seatbelt_fastened=-  result=F
+  no_arm_without_occupant         occupant_present=F  crash_detected=-  speed_above_threshold=-  !seatbelt_fastened=-  result=F
 
 Per-condition MC/DC status:
-  ✓ !seatbelt_fastened: EXERCISED  via (!seatbelt_fastened=F, crash_detected=F, occupant_present=T, speed_above_threshold=T) -> F   vs   (!seatbelt_fastened=T, crash_detected=F, occupant_present=T, speed_above_threshold=T) -> T
-  ✓ crash_detected: EXERCISED  via (!seatbelt_fastened=F, crash_detected=F, occupant_present=T, speed_above_threshold=F) -> F   vs   (!seatbelt_fastened=F, crash_detected=T, occupant_present=T, speed_above_threshold=F) -> T
-  ✓ occupant_present: EXERCISED  via (!seatbelt_fastened=F, crash_detected=F, occupant_present=F, speed_above_threshold=F) -> F   vs   (!seatbelt_fastened=T, crash_detected=T, occupant_present=T, speed_above_threshold=T) -> T
-  ✓ speed_above_threshold: EXERCISED  via (!seatbelt_fastened=T, crash_detected=F, occupant_present=T, speed_above_threshold=F) -> F   vs   (!seatbelt_fastened=T, crash_detected=F, occupant_present=T, speed_above_threshold=T) -> T
+  ✓ occupant_present: EXERCISED  via (occupant_present=F, crash_detected=F, speed_above_threshold=F, !seatbelt_fastened=F) -> F   vs   (occupant_present=T, crash_detected=T, speed_above_threshold=T, !seatbelt_fastened=T) -> T
+  ✓ crash_detected: EXERCISED  via (occupant_present=T, crash_detected=F, speed_above_threshold=F, !seatbelt_fastened=F) -> F   vs   (occupant_present=T, crash_detected=T, speed_above_threshold=F, !seatbelt_fastened=F) -> T
+  ✓ speed_above_threshold: EXERCISED  via (occupant_present=T, crash_detected=F, speed_above_threshold=F, !seatbelt_fastened=T) -> F   vs   (occupant_present=T, crash_detected=F, speed_above_threshold=T, !seatbelt_fastened=T) -> T
+  ✓ !seatbelt_fastened: EXERCISED  via (occupant_present=T, crash_detected=F, speed_above_threshold=T, !seatbelt_fastened=F) -> F   vs   (occupant_present=T, crash_detected=F, speed_above_threshold=T, !seatbelt_fastened=T) -> T
 
 MC/DC coverage: 4 of 4 conditions exercised (100%)
 
-Out of scope: 5 function(s) have a decision in a shape the engine's current patterns do not recognise. The engine declined them rather than report a wrong verdict. See --format=json's `out_of_scope` for the full list.
+Out of scope: 5 function(s) with a `switchInt` were not analysed. See --format=json's `out_of_scope` for the list.
+  5 with no Boolean decision the user wrote (assert only 5).
 ```
 
 Every condition has an independence pair: two condition vectors that
@@ -80,9 +84,11 @@ pair rows a condition the test short-circuited is shown with a value
 observations above show it as `-`. Each test evaluates the decision
 exactly once, so every observation is *used*.
 
-The "Out of scope" line is about the five `#[test]` functions
-themselves (their `assert!` expansions), which Floyd declines rather
-than analyse; it does not affect the verdict or the exit code.
+The "Out of scope" lines are about the five `#[test]` functions
+themselves: their only `switchInt`s are `assert!` conditions, so
+Floyd lists them as having no Boolean decision (`no_decision`,
+`assert_only`) rather than analyse them. They do not affect the
+verdict or the exit code.
 
 The same run in the other formats (both exit 0):
 
@@ -113,11 +119,21 @@ cargo floyd test --format=junit
       <property name="floyd.unknown" value="0"/>
       <property name="floyd.not_measurable" value="0"/>
       <property name="floyd.percentage" value="100"/>
+      <property name="floyd.toolchain" value="nightly"/>
+      <property name="floyd.toolchain.version" value="rustc 1.101.0-nightly (708c94ef0 2026-11-03)"/>
+      <property name="floyd.toolchain.release" value="1.101.0-nightly"/>
+      <property name="floyd.toolchain.host" value="x86_64-apple-darwin"/>
+      <property name="floyd.toolchain.channel" value="nightly"/>
+      <property name="floyd.toolchain.rustc_bootstrap" value="false"/>
+      <property name="floyd.out_of_scope" value="5"/>
+      <property name="floyd.out_of_scope.no_decision" value="5"/>
+      <property name="floyd.out_of_scope.no_decision.assert_only" value="5"/>
+      <property name="floyd.ctfe_bodies_skipped" value="0"/>
     </properties>
-    <testcase name="!seatbelt_fastened" classname="floyd.mcdc"/>
-    <testcase name="crash_detected" classname="floyd.mcdc"/>
     <testcase name="occupant_present" classname="floyd.mcdc"/>
+    <testcase name="crash_detected" classname="floyd.mcdc"/>
     <testcase name="speed_above_threshold" classname="floyd.mcdc"/>
+    <testcase name="!seatbelt_fastened" classname="floyd.mcdc"/>
   </testsuite>
 </testsuites>
 ```
@@ -142,26 +158,28 @@ and `cargo test` is green. Floyd:
 
 ```
 floyd  runtime MC/DC analysis of /path/to/floyd/demo/restraint-controller/Cargo.toml
+Toolchain: nightly (rustc 1.101.0-nightly (708c94ef0 2026-11-03), nightly channel)
 
 Test targets: 2
 Tests discovered: 3
 Observations:     3 (3 used, 0 ambiguous)
-Conditions:       crash_detected, occupant_present, seatbelt_fastened, speed_above_threshold
+Conditions:       occupant_present, crash_detected, speed_above_threshold, seatbelt_fastened
 
 Per-test observations:
-  arms_when_crash_detected_with_occupant  crash_detected=T  occupant_present=T  seatbelt_fastened=-  speed_above_threshold=-  result=T
-  no_arm_at_low_speed_without_crash  crash_detected=F  occupant_present=T  seatbelt_fastened=-  speed_above_threshold=F  result=F
-  no_arm_without_occupant         crash_detected=-  occupant_present=F  seatbelt_fastened=-  speed_above_threshold=-  result=F
+  arms_when_crash_detected_with_occupant  occupant_present=T  crash_detected=T  speed_above_threshold=-  seatbelt_fastened=-  result=T
+  no_arm_at_low_speed_without_crash  occupant_present=T  crash_detected=F  speed_above_threshold=F  seatbelt_fastened=-  result=F
+  no_arm_without_occupant         occupant_present=F  crash_detected=-  speed_above_threshold=-  seatbelt_fastened=-  result=F
 
 Per-condition MC/DC status:
-  ✓ crash_detected: EXERCISED  via (crash_detected=F, occupant_present=T, seatbelt_fastened=F, speed_above_threshold=F) -> F   vs   (crash_detected=T, occupant_present=T, seatbelt_fastened=F, speed_above_threshold=F) -> T
-  ✓ occupant_present: EXERCISED  via (crash_detected=F, occupant_present=F, seatbelt_fastened=F, speed_above_threshold=F) -> F   vs   (crash_detected=T, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T) -> T
-  ✗ seatbelt_fastened: UNEXERCISED — needs tests for both (crash_detected=F, occupant_present=T, seatbelt_fastened=F, speed_above_threshold=T) -> F and (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T) -> T
-  ✗ speed_above_threshold: UNEXERCISED — needs a test where (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T) -> T [the matching row (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=F) -> F is already covered]
+  ✓ occupant_present: EXERCISED  via (occupant_present=F, crash_detected=F, speed_above_threshold=F, seatbelt_fastened=F) -> F   vs   (occupant_present=T, crash_detected=T, speed_above_threshold=T, seatbelt_fastened=T) -> T
+  ✓ crash_detected: EXERCISED  via (occupant_present=T, crash_detected=F, speed_above_threshold=F, seatbelt_fastened=F) -> F   vs   (occupant_present=T, crash_detected=T, speed_above_threshold=F, seatbelt_fastened=F) -> T
+  ✗ speed_above_threshold: UNEXERCISED — needs a test where (occupant_present=T, crash_detected=F, speed_above_threshold=T, seatbelt_fastened=T) -> T [the matching row (occupant_present=T, crash_detected=F, speed_above_threshold=F, seatbelt_fastened=T) -> F is already covered]
+  ✗ seatbelt_fastened: UNEXERCISED — needs tests for both (occupant_present=T, crash_detected=F, speed_above_threshold=T, seatbelt_fastened=F) -> F and (occupant_present=T, crash_detected=F, speed_above_threshold=T, seatbelt_fastened=T) -> T
 
 MC/DC coverage: 2 of 4 conditions exercised (50%)
 
-Out of scope: 3 function(s) have a decision in a shape the engine's current patterns do not recognise. The engine declined them rather than report a wrong verdict. See --format=json's `out_of_scope` for the full list.
+Out of scope: 3 function(s) with a `switchInt` were not analysed. See --format=json's `out_of_scope` for the list.
+  3 with no Boolean decision the user wrote (assert only 3).
 ```
 
 Exit code 2 means a decision was analysed but MC/DC was not
@@ -209,11 +227,11 @@ written.
 condition, with the same message as the text report:
 
 ```xml
-    <testcase name="seatbelt_fastened" classname="floyd.mcdc">
-      <failure message="needs tests for both (crash_detected=F, occupant_present=T, seatbelt_fastened=F, speed_above_threshold=T) -&gt; F and (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T) -&gt; T" type="UnexercisedCondition"/>
-    </testcase>
     <testcase name="speed_above_threshold" classname="floyd.mcdc">
-      <failure message="needs a test where (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=T) -&gt; T [the matching row (crash_detected=F, occupant_present=T, seatbelt_fastened=T, speed_above_threshold=F) -&gt; F is already covered]" type="UnexercisedCondition"/>
+      <failure message="needs a test where (occupant_present=T, crash_detected=F, speed_above_threshold=T, seatbelt_fastened=T) -&gt; T [the matching row (occupant_present=T, crash_detected=F, speed_above_threshold=F, seatbelt_fastened=T) -&gt; F is already covered]" type="UnexercisedCondition"/>
+    </testcase>
+    <testcase name="seatbelt_fastened" classname="floyd.mcdc">
+      <failure message="needs tests for both (occupant_present=T, crash_detected=F, speed_above_threshold=T, seatbelt_fastened=F) -&gt; F and (occupant_present=T, crash_detected=F, speed_above_threshold=T, seatbelt_fastened=T) -&gt; T" type="UnexercisedCondition"/>
     </testcase>
 ```
 
@@ -313,20 +331,20 @@ fn spec_table() {
 Test targets: 2
 Tests discovered: 1
 Observations:     5 (5 used, 0 ambiguous)
-Conditions:       !seatbelt_fastened, crash_detected, occupant_present, speed_above_threshold
+Conditions:       occupant_present, crash_detected, speed_above_threshold, !seatbelt_fastened
 
 Per-test observations:
-  spec_table                      !seatbelt_fastened=-  crash_detected=T  occupant_present=T  speed_above_threshold=-  result=T
-  spec_table                      !seatbelt_fastened=T  crash_detected=F  occupant_present=T  speed_above_threshold=T  result=T
-  spec_table                      !seatbelt_fastened=F  crash_detected=F  occupant_present=T  speed_above_threshold=T  result=F
-  spec_table                      !seatbelt_fastened=-  crash_detected=F  occupant_present=T  speed_above_threshold=F  result=F
-  spec_table                      !seatbelt_fastened=-  crash_detected=-  occupant_present=F  speed_above_threshold=-  result=F
+  spec_table                      occupant_present=T  crash_detected=T  speed_above_threshold=-  !seatbelt_fastened=-  result=T
+  spec_table                      occupant_present=T  crash_detected=F  speed_above_threshold=T  !seatbelt_fastened=T  result=T
+  spec_table                      occupant_present=T  crash_detected=F  speed_above_threshold=T  !seatbelt_fastened=F  result=F
+  spec_table                      occupant_present=T  crash_detected=F  speed_above_threshold=F  !seatbelt_fastened=-  result=F
+  spec_table                      occupant_present=F  crash_detected=-  speed_above_threshold=-  !seatbelt_fastened=-  result=F
 
 Per-condition MC/DC status:
-  ✓ !seatbelt_fastened: EXERCISED  via (!seatbelt_fastened=F, crash_detected=F, occupant_present=T, speed_above_threshold=T) -> F   vs   (!seatbelt_fastened=T, crash_detected=F, occupant_present=T, speed_above_threshold=T) -> T
-  ✓ crash_detected: EXERCISED  via (!seatbelt_fastened=F, crash_detected=F, occupant_present=T, speed_above_threshold=F) -> F   vs   (!seatbelt_fastened=F, crash_detected=T, occupant_present=T, speed_above_threshold=F) -> T
-  ✓ occupant_present: EXERCISED  via (!seatbelt_fastened=F, crash_detected=F, occupant_present=F, speed_above_threshold=F) -> F   vs   (!seatbelt_fastened=T, crash_detected=T, occupant_present=T, speed_above_threshold=T) -> T
-  ✓ speed_above_threshold: EXERCISED  via (!seatbelt_fastened=T, crash_detected=F, occupant_present=T, speed_above_threshold=F) -> F   vs   (!seatbelt_fastened=T, crash_detected=F, occupant_present=T, speed_above_threshold=T) -> T
+  ✓ occupant_present: EXERCISED  via (occupant_present=F, crash_detected=F, speed_above_threshold=F, !seatbelt_fastened=F) -> F   vs   (occupant_present=T, crash_detected=T, speed_above_threshold=T, !seatbelt_fastened=T) -> T
+  ✓ crash_detected: EXERCISED  via (occupant_present=T, crash_detected=F, speed_above_threshold=F, !seatbelt_fastened=F) -> F   vs   (occupant_present=T, crash_detected=T, speed_above_threshold=F, !seatbelt_fastened=F) -> T
+  ✓ speed_above_threshold: EXERCISED  via (occupant_present=T, crash_detected=F, speed_above_threshold=F, !seatbelt_fastened=T) -> F   vs   (occupant_present=T, crash_detected=F, speed_above_threshold=T, !seatbelt_fastened=T) -> T
+  ✓ !seatbelt_fastened: EXERCISED  via (occupant_present=T, crash_detected=F, speed_above_threshold=T, !seatbelt_fastened=F) -> F   vs   (occupant_present=T, crash_detected=F, speed_above_threshold=T, !seatbelt_fastened=T) -> T
 
 MC/DC coverage: 4 of 4 conditions exercised (100%)
 ```
