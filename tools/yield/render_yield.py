@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render YIELD.md (Floyd's per-crate yield table) from a sweep directory.
 
-Usage:
+Usage (from the repo root):
     python3 tools/yield/render_yield.py SWEEP_DIR [-o OUTPUT]
 
 SWEEP_DIR is the output of a sweep (see tools/yield/README.md):
@@ -15,25 +15,35 @@ SWEEP_DIR is the output of a sweep (see tools/yield/README.md):
     SWEEP_DIR/<crate>/out/git_rev       the crate's pinned commit
     SWEEP_DIR/<crate>/out/exit_code     exit code of the json run (optional)
 
-Definitions used in the table (also printed in YIELD.md):
+Counting unit: a source function. Floyd's JSON has one entry per MIR body,
+so a function compiled into both the library and a test harness, or
+instantiated several times, appears more than once. Every entry
+(`candidates`, `analyses`, `out_of_scope`, not-measurable candidates) is
+deduplicated within a crate by the key (source_file, line, function name);
+entries without a source file are keyed by name alone. Each key gets one
+class, by precedence:
 
-  functions with a decision
-      = len(candidates) + the number of `out_of_scope` entries whose reason
-        is NOT `no_decision`. Candidates are decisions Floyd recovered; the
-        other out_of_scope reasons (`unsupported_shape`,
-        `too_many_conditions`, `non_bool_leaf`) are functions that do
-        contain a decision Floyd declined. `no_decision` entries contain no
-        user-written Boolean decision and are left out of the denominator.
-        Entries are counted as Floyd reports them (one per MIR body), so
-        monomorphised or macro-stamped copies of one source function count
-        separately.
-  analysed
-      = len(analyses): recovered decisions with an MC/DC analysis.
-  conditions by status
-      = condition_status of every entry in `analyses` (all candidates, not
-        only the selected decision that `summary` describes).
+  recovered (some entry is a candidate)
+      analysed        some candidate with this key has an entry in `analyses`
+      not measurable  otherwise (its `not_measurable.reason`)
+  declined (some out_of_scope entry has a reason other than `no_decision`;
+      if several, the first of too_many_conditions, non_bool_leaf,
+      unsupported_shape, then any other reason alphabetically)
+  no decision (every entry is `no_decision`)
 
-Output is a pure function of SWEEP_DIR: no current date, no environment.
+  functions with a decision = recovered + declined
+  conditions by status      = condition_status of the analysed functions
+                              (all of them, not only the decision the
+                              text report selects)
+
+Raw MIR-body counts are kept in a separate, labelled table.
+
+A row whose keys (same commit) are all contained in another row's keys is
+marked "included in <other>" and left out of the totals.
+
+The header compares the sweep binary's commit with the engine sources of the
+checkout this script lives in (`git diff`, read-only). Otherwise the output is
+a pure function of SWEEP_DIR: no current date, no environment.
 Python 3 standard library only.
 """
 
@@ -42,6 +52,7 @@ import collections
 import json
 import os
 import re
+import subprocess
 import sys
 
 # Status order for the condition columns; any status not listed here is
@@ -54,7 +65,10 @@ STATUS_LABEL = {
     "Ambiguous": "UNKNOWN (multi-evaluation)",
 }
 DECLINE_ORDER = ["unsupported_shape", "too_many_conditions", "non_bool_leaf"]
+DECLINE_PRECEDENCE = ["too_many_conditions", "non_bool_leaf", "unsupported_shape"]
 NO_DECISION = "no_decision"
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ENGINE_PATHS = ["floyd", "cargo-floyd", "Cargo.toml", "Cargo.lock"]
 
 
 def read_text(path, default=None):
@@ -77,6 +91,20 @@ def fmt_breakdown(counter):
     return f"{sum(counter.values())} ({parts})"
 
 
+def key_of(entry, name_field):
+    f = entry.get("source_file")
+    if f is None:
+        return (None, None, entry.get(name_field))
+    return (f, entry.get("line"), entry.get(name_field))
+
+
+def pick_decline(reasons):
+    for r in DECLINE_PRECEDENCE:
+        if r in reasons:
+            return r
+    return sorted(reasons)[0]
+
+
 def load_crate(sweep, name):
     out = os.path.join(sweep, name, "out")
     with open(os.path.join(out, "span.json"), encoding="utf-8") as f:
@@ -86,51 +114,90 @@ def load_crate(sweep, name):
     oos = d.get("out_of_scope") or []
     oos_summary = d.get("out_of_scope_summary") or {}
 
-    analysed_idx = {a.get("candidate") for a in analyses}
-    nm = collections.Counter()
-    residual = 0
-    for i, c in enumerate(cands):
-        if c.get("not_measurable"):
-            nm[c["not_measurable"]["reason"]] += 1
-        elif i not in analysed_idx:
-            residual += 1
-
-    status = collections.Counter()
+    cand_keys = [key_of(c, "function_name") for c in cands]
+    analysed_by_key = collections.defaultdict(list)
     for a in analyses:
-        for st in (a.get("condition_status") or {}).values():
-            status[st if isinstance(st, str) else next(iter(st))] += 1
+        i = a.get("candidate")
+        if isinstance(i, int) and 0 <= i < len(cand_keys):
+            k = cand_keys[i]
+        else:
+            k = key_of(a.get("provenance") or {}, "function_name")
+        analysed_by_key[k].append(a.get("condition_status") or {})
+    nm_by_key = collections.defaultdict(set)
+    for c, k in zip(cands, cand_keys):
+        if c.get("not_measurable"):
+            nm_by_key[k].add(c["not_measurable"]["reason"])
+    oos_by_key = collections.defaultdict(set)
+    detail_by_key = collections.defaultdict(set)
+    for o in oos:
+        k = key_of(o, "name")
+        oos_by_key[k].add(o.get("reason"))
+        if o.get("reason") == NO_DECISION:
+            detail_by_key[k].add(o.get("detail") or "(none)")
 
-    oos_reason = collections.Counter(o.get("reason") for o in oos)
-    declined = collections.Counter(
-        {k: v for k, v in oos_reason.items() if k != NO_DECISION}
-    )
-    no_dec_detail = collections.Counter(
-        o.get("detail") or "(none)" for o in oos if o.get("reason") == NO_DECISION
-    )
-    flags = read_text(os.path.join(out, "flags"), "")
+    recovered = set(cand_keys)
+    analysed, nm, residual = set(), collections.Counter(), 0
+    status = collections.Counter()
+    status_conflicts = 0
+    for k in sorted(recovered, key=repr):
+        if k in analysed_by_key:
+            analysed.add(k)
+            copies = analysed_by_key[k]
+            first = copies[0]
+            if any(json.dumps(c, sort_keys=True) != json.dumps(first, sort_keys=True)
+                   for c in copies[1:]):
+                status_conflicts += 1
+            for st in first.values():
+                status[st if isinstance(st, str) else next(iter(st))] += 1
+        elif nm_by_key.get(k):
+            nm[sorted(nm_by_key[k])[0]] += 1
+        else:
+            residual += 1
+    declined = collections.Counter()
+    no_dec_detail = collections.Counter()
+    mixed_reason = 0
+    no_decision = 0
+    for k, reasons in oos_by_key.items():
+        if k in recovered:
+            continue
+        real = reasons - {NO_DECISION}
+        if real:
+            declined[pick_decline(real)] += 1
+            if len(reasons) > 1:
+                mixed_reason += 1
+        else:
+            no_decision += 1
+            no_dec_detail[sorted(detail_by_key[k])[0]] += 1
+
+    raw_oos = collections.Counter(o.get("reason") for o in oos)
     return {
         "name": name,
         "rev": read_text(os.path.join(out, "git_rev"), "?"),
-        "flags": flags,
+        "flags": read_text(os.path.join(out, "flags"), ""),
         "exit": read_text(os.path.join(out, "exit_code")),
         "verdict": d.get("verdict"),
         "error": d.get("error"),
         "toolchain": (d.get("toolchain") or {}).get("version"),
         "host": (d.get("toolchain") or {}).get("host"),
-        "candidates": len(cands),
-        "analysed": len(analyses),
+        "recovered": len(recovered),
+        "analysed": len(analysed),
         "nm": nm,
         "residual": residual,
         "status": status,
+        "status_conflicts": status_conflicts,
         "declined": declined,
-        "no_decision": oos_reason.get(NO_DECISION, 0),
+        "mixed_reason": mixed_reason,
+        "no_decision": no_decision,
         "no_dec_detail": no_dec_detail,
         "ctfe": oos_summary.get("ctfe_bodies_skipped", 0) or 0,
-        "with_decision": len(cands) + sum(declined.values()),
-        "oos_keys": collections.Counter(
-            (o.get("name"), o.get("source_file"), o.get("line"), o.get("reason"))
-            for o in oos
-        ),
+        "with_decision": len(recovered) + sum(declined.values()),
+        "keys": recovered | set(oos_by_key),
+        # raw MIR-body counts
+        "raw_candidates": len(cands),
+        "raw_analyses": len(analyses),
+        "raw_nm": sum(1 for c in cands if c.get("not_measurable")),
+        "raw_declined": sum(v for r, v in raw_oos.items() if r != NO_DECISION),
+        "raw_no_decision": raw_oos.get(NO_DECISION, 0),
     }
 
 
@@ -159,12 +226,58 @@ def machine(sweep, hosts):
     return ", ".join(parts)
 
 
-def display_path(path):
-    path = os.path.abspath(path)
-    home = os.path.expanduser("~")
-    if path == home or path.startswith(home + os.sep):
-        return "~" + path[len(home):]
-    return path
+def git(*args):
+    try:
+        r = subprocess.run(["git", "-C", REPO] + list(args), capture_output=True,
+                           text=True, check=True)
+        return r.stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def cargo_version():
+    toml = read_text(os.path.join(REPO, "cargo-floyd", "Cargo.toml"), "")
+    m = re.search(r'^version\s*=\s*"([^"]+)"', toml, re.M)
+    return m.group(1) if m else None
+
+
+def engine_equivalence(sweep_rev):
+    """Sentence on how the sweep binary's commit relates to this checkout's engine."""
+    ver = cargo_version()
+    this = f"this checkout (Floyd {ver})" if ver else "this checkout"
+    same = f"Floyd {ver} as checked in here" if ver else "this checkout"
+    if sweep_rev == "unknown":
+        return "The sweep did not record its Floyd commit."
+    diff = git("diff", "-U0", sweep_rev, "--", *ENGINE_PATHS)
+    if diff is None:
+        return f"Not compared with {this}: git or commit `{sweep_rev[:12]}` unavailable."
+    files, other = [], []
+    path = None
+    for line in diff.splitlines():
+        if line.startswith("+++ ") or line.startswith("--- "):
+            if line.startswith("+++ "):
+                path = line[6:] if line.startswith("+++ b/") else line[4:]
+                if path not in files:
+                    files.append(path)
+            continue
+        if not line[:1] in "+-" or line.startswith("@@"):
+            continue
+        body = line[1:].strip()
+        version_line = re.match(r'^(version\s*=\s*"[^"]*"|\S+\s*=\s*\{.*version\s*=\s*"[^"]*".*\})$', body)
+        comment = path and path.endswith(".rs") and body.startswith("//")
+        if not (version_line or comment or body == ""):
+            other.append(path)
+    if not files:
+        return (f"The engine sources (`floyd/`, `cargo-floyd/`, `Cargo.toml`, `Cargo.lock`) of"
+                f" {this} are identical to `{sweep_rev[:12]}`.")
+    listed = ", ".join(f"`{f}`" for f in files)
+    if not other:
+        return (f"Between `{sweep_rev[:12]}` and {this}, the engine sources (`floyd/`,"
+                f" `cargo-floyd/`, `Cargo.toml`, `Cargo.lock`) differ only in version numbers"
+                f" and comments ({listed}), so the sweep ran the same engine code as {same}.")
+    bad = ", ".join(f"`{f}`" for f in sorted(set(other)))
+    return (f"**The engine sources of {this} differ from `{sweep_rev[:12]}` in code** ({bad});"
+            " the table describes the older engine.")
 
 
 def render(sweep):
@@ -175,8 +288,26 @@ def render(sweep):
     if not names:
         sys.exit(f"no <crate>/out/span.json under {sweep}")
     crates = [load_crate(sweep, n) for n in names]
-    ok = [c for c in crates if c["verdict"] != "build_failed"]
     failed = [c for c in crates if c["verdict"] == "build_failed"]
+    built = [c for c in crates if c["verdict"] != "build_failed"]
+
+    # A row whose keys are contained in another row's keys (same commit) is
+    # covered by that row's workspace run: keep it, exclude it from totals.
+    included_in = {}
+    partial = []
+    for b in built:
+        for a in built:
+            if a is b or a["rev"] != b["rev"] or not b["keys"]:
+                continue
+            common = len(a["keys"] & b["keys"])
+            if common == len(b["keys"]) and len(a["keys"]) > len(b["keys"]):
+                included_in[b["name"]] = a["name"]
+            elif common and a["name"] < b["name"]:
+                partial.append((a, b, common))
+    partial = [(a, b, n) for a, b, n in partial
+               if included_in.get(a["name"]) != b["name"]
+               and included_in.get(b["name"]) != a["name"]]
+    ok = [c for c in built if c["name"] not in included_in]
 
     floyd_rev = read_text(os.path.join(sweep, "bin", "git_rev"), "unknown")
     tc_file = (read_text(os.path.join(sweep, "TOOLCHAIN"), "") or "").splitlines()
@@ -203,31 +334,34 @@ def render(sweep):
     w("What Floyd recovers, declines and analyses on real crates, one row per crate,")
     w("from a sweep of pinned open-source crates.")
     w("")
-    w(f"- **Floyd commit:** `{floyd_rev[:12]}` (the `cargo-floyd` binary the sweep ran)")
+    w(f"- **Floyd commit:** `{floyd_rev[:12]}` (the `cargo-floyd` binary the sweep ran)."
+      f" {engine_equivalence(floyd_rev)}")
     w(f"- **Toolchain:** `{toolchain}`{tc_note}")
     w(f"- **Sweep date:** {sweep_dates(sweep)}")
     w(f"- **Machine:** {machine(sweep, hosts)}")
     w(f"- **Crates:** {len(crates)} ({len(failed)} did not build: "
-      + (", ".join(f"{c['name']}" for c in failed) or "none") + ")")
+      + (", ".join(c["name"] for c in failed) or "none") + ")")
     w("- **Per crate:** `cargo floyd test --format=json --all-candidates <flags> .`"
       " at the pinned commit (crate list: [`tools/yield/crates.tsv`](tools/yield/crates.tsv))")
-    w("- **Regenerate this file:** `python3 tools/yield/render_yield.py "
-      f"{display_path(sweep)}` from the repo root (the sweep directory is the output of"
-      " [`tools/yield/sweep.sh`](tools/yield/sweep.sh); it is not checked in)")
+    w("- **Regenerate this file:** `python3 tools/yield/render_yield.py <sweep-dir>` from the"
+      " repo root, where `<sweep-dir>` is the output of"
+      " [`tools/yield/sweep.sh`](tools/yield/sweep.sh) (not checked in)")
     w("")
     w("## How to read this")
     w("")
-    w("*Functions with a decision* is the denominator: decisions Floyd recovered"
-      " (*recovered*, the JSON `candidates`) plus `out_of_scope` entries whose reason is"
-      " not `no_decision`, i.e. functions that contain a decision Floyd declined."
-      " Entries are counted as Floyd reports them, one per MIR body, so monomorphised or"
-      " macro-stamped copies of one source function count separately."
-      " `no_decision` entries (assert-only, derived impls, plain enum matches, `?`/loop"
-      " plumbing, drop flags) contain no user-written Boolean decision and are listed"
-      " separately below. A recovered decision is either *analysed* (MC/DC analysis"
-      " against the tests' coverage) or *not measurable* (its coverage cannot be"
+    w("Every count is of **source functions**: Floyd reports one entry per MIR body, and"
+      " entries are deduplicated within a crate by (source file, line, function name), so a"
+      " function compiled into both the library and a test harness, or instantiated several"
+      " times, counts once. Raw MIR-body counts are in a separate table under Notes."
+      " *Functions with a decision* is the denominator: functions with a decision Floyd"
+      " recovered (*recovered*, the JSON `candidates`) plus functions listed in"
+      " `out_of_scope` with a reason other than `no_decision`, i.e. that contain a decision"
+      " Floyd declined. `no_decision` functions (assert-only, derived impls, plain enum"
+      " matches, `?`/loop plumbing, drop flags) contain no user-written Boolean decision and"
+      " are listed separately below. A recovered function is either *analysed* (MC/DC"
+      " analysis against the tests' coverage) or *not measurable* (its coverage cannot be"
       " attributed; reasons as in the JSON). Condition columns count every condition of"
-      " every analysed decision, not only the decision the text report selects."
+      " every analysed function, not only the decision the text report selects."
       " *UNKNOWN (multi-evaluation)* is the `Ambiguous` status: a test evaluated the"
       " decision more than once and the aggregate counters cannot say which rows ran.")
     w("")
@@ -259,18 +393,21 @@ def render(sweep):
     for c in crates:
         flags = f"`{c['flags']}`" if c["flags"] else "-"
         verdict = f"{c['verdict']} ({c['exit']})" if c["exit"] is not None else c["verdict"]
+        name = c["name"]
+        if name in included_in:
+            name = f"{name} (included in {included_in[name]}, not in totals)"
         if c["verdict"] == "build_failed":
             n = len(head) - 4
-            row([c["name"], f"`{c['rev']}`", flags, verdict] + ["-"] * n)
+            row([f"{name} (not in totals)", f"`{c['rev']}`", flags, verdict] + ["-"] * n)
             continue
-        row([c["name"], f"`{c['rev']}`", flags, verdict, c["with_decision"], c["candidates"]]
+        row([name, f"`{c['rev']}`", flags, verdict, c["with_decision"], c["recovered"]]
             + [c["declined"].get(k, 0) for k in decl_cols]
             + ([c["residual"]] if show_residual else [])
             + [fmt_breakdown(c["nm"]), c["analysed"]]
             + [c["status"].get(k, 0) for k in stat_cols])
 
-    def total(key):
-        return sum(c[key] for c in ok)
+    def total(key, rows=None):
+        return sum(c[key] for c in (ok if rows is None else rows))
 
     def total_counter(key):
         t = collections.Counter()
@@ -279,8 +416,8 @@ def render(sweep):
         return t
 
     tdecl, tnm, tstat = total_counter("declined"), total_counter("nm"), total_counter("status")
-    row([f"**total ({len(ok)} crates with output)**", "", "", "",
-         f"**{total('with_decision')}**", f"**{total('candidates')}**"]
+    row([f"**total ({len(ok)} crates)**", "", "", "",
+         f"**{total('with_decision')}**", f"**{total('recovered')}**"]
         + [f"**{tdecl.get(k, 0)}**" for k in decl_cols]
         + ([f"**{total('residual')}**"] if show_residual else [])
         + [f"**{fmt_breakdown(tnm)}**", f"**{total('analysed')}**"]
@@ -289,53 +426,77 @@ def render(sweep):
 
     twd, tan = total("with_decision"), total("analysed")
     share = f"{100.0 * tan / twd:.1f}%" if twd else "n/a"
-    w(f"Analysed decisions over functions with a decision: {tan} / {twd} = {share}.")
+    w(f"Analysed functions over functions with a decision: {tan} / {twd} = {share}.")
     if not show_residual:
-        w("Every recovered decision is either analysed or not measurable.")
+        w("Every recovered function is either analysed or not measurable.")
     w("")
 
-    # Overlap between rows that ran on the same repository at the same commit
-    # (a workspace run can include a member that also has its own row).
     notes = []
-    for i, a in enumerate(ok):
-        for b in ok[i + 1:]:
-            if a["rev"] != b["rev"]:
-                continue
-            both = a["oos_keys"] & b["oos_keys"]
-            common = sum(both.values())
-            if common:
-                declined = sum(v for k, v in both.items() if k[3] != NO_DECISION)
-                notes.append(
-                    f"- `{a['name']}` and `{b['name']}` are the same repository at commit"
-                    f" `{a['rev']}`; {common} `out_of_scope` entries (same name, file, line"
-                    f" and reason) appear in both rows, {declined} of them declined (in the"
-                    " denominator) and the rest `no_decision`. The totals count them twice.")
+    for b, a in sorted(included_in.items()):
+        bc = next(c for c in built if c["name"] == b)
+        notes.append(
+            f"- `{b}` is a member of the `{a}` workspace at the same commit (`{bc['rev']}`),"
+            f" and every one of its {len(bc['keys'])} functions also appears in `{a}`'s run."
+            f" Its row is kept for reference and marked \"included in {a}\"; the totals count"
+            f" those functions once, under `{a}`.")
+    for a, b, common in partial:
+        notes.append(
+            f"- `{a['name']}` and `{b['name']}` are the same repository at commit"
+            f" `{a['rev']}` and share {common} functions; the totals count those twice.")
     for c in failed:
         err = c["error"] or {}
         msg = err.get("message") if isinstance(err, dict) else str(err)
         notes.append(f"- `{c['name']}`: build failed, no analysis (Floyd's error: \"{msg}\")."
                      " Excluded from the totals.")
-    if notes:
-        w("## Notes")
-        w("")
-        L.extend(notes)
-        w("")
+    mixed = [(c["name"], c["mixed_reason"]) for c in ok if c["mixed_reason"]]
+    if mixed:
+        notes.append("- Functions whose MIR bodies were declined in one copy and `no_decision`"
+                     " in another count as declined: "
+                     + ", ".join(f"{n} {v}" for n, v in mixed) + ".")
+    conflicts = [(c["name"], c["status_conflicts"]) for c in ok if c["status_conflicts"]]
+    if conflicts:
+        notes.append("- Analysed functions whose copies report different condition statuses"
+                     " (the first copy is counted): "
+                     + ", ".join(f"{n} {v}" for n, v in conflicts) + ".")
+    w("## Notes")
+    w("")
+    L.extend(notes)
+    w("")
+    w("**Raw MIR-body counts (not deduplicated).** For reference only: one per entry in"
+      " Floyd's JSON, so copies of one source function count separately. The main table"
+      " does not use these.")
+    w("")
+    h3 = ["crate", "candidates", "analyses", "not measurable", "out_of_scope declined",
+          "out_of_scope no_decision", "candidates + declined"]
+    w("| " + " | ".join(h3) + " |")
+    w("|---|" + "|".join(["---:"] * (len(h3) - 1)) + "|")
+    for c in built:
+        row([c["name"], c["raw_candidates"], c["raw_analyses"], c["raw_nm"], c["raw_declined"],
+             c["raw_no_decision"], c["raw_candidates"] + c["raw_declined"]])
+    row([f"**total ({len(ok)} crates, as above)**", f"**{total('raw_candidates')}**",
+         f"**{total('raw_analyses')}**", f"**{total('raw_nm')}**",
+         f"**{total('raw_declined')}**", f"**{total('raw_no_decision')}**",
+         f"**{total('raw_candidates') + total('raw_declined')}**"])
+    w("")
 
     w("## Not in the denominator")
     w("")
-    w("`no_decision` entries by detail, and CTFE bodies (compile-time evaluation copies of"
-      " runtime functions, `out_of_scope_summary.ctfe_bodies_skipped`), which Floyd counts"
-      " but does not list.")
+    w("`no_decision` functions by detail (deduplicated as above; a function with several"
+      " details is counted under the first alphabetically), and CTFE bodies (compile-time"
+      " evaluation copies of runtime functions, `out_of_scope_summary.ctfe_bodies_skipped`,"
+      " a raw count), which Floyd counts but does not list.")
     w("")
-    details = ordered({k for c in ok for k in c["no_dec_detail"]}, [])
+    details = ordered({k for c in built for k in c["no_dec_detail"]}, [])
     h2 = ["crate", "no_decision"] + [f"no_decision: {k}" for k in details] + ["CTFE bodies skipped"]
     w("| " + " | ".join(h2) + " |")
     w("|---|" + "|".join(["---:"] * (len(h2) - 1)) + "|")
-    for c in ok:
-        row([c["name"], c["no_decision"]] + [c["no_dec_detail"].get(k, 0) for k in details]
+    for c in built:
+        name = c["name"] + (" (included in %s)" % included_in[c["name"]]
+                            if c["name"] in included_in else "")
+        row([name, c["no_decision"]] + [c["no_dec_detail"].get(k, 0) for k in details]
             + [c["ctfe"]])
     tdet = total_counter("no_dec_detail")
-    row(["**total**", f"**{total('no_decision')}**"]
+    row([f"**total ({len(ok)} crates)**", f"**{total('no_decision')}**"]
         + [f"**{tdet.get(k, 0)}**" for k in details] + [f"**{total('ctfe')}**"])
     w("")
     return "\n".join(L).rstrip("\n") + "\n"
@@ -344,7 +505,8 @@ def render(sweep):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("sweep", help="sweep directory (contains <crate>/out/span.json)")
-    ap.add_argument("-o", "--output", default="YIELD.md", help="output file (default YIELD.md; '-' for stdout)")
+    ap.add_argument("-o", "--output", default="YIELD.md",
+                    help="output file (default YIELD.md; '-' for stdout)")
     args = ap.parse_args()
     text = render(args.sweep)
     if args.output == "-":

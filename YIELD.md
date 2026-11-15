@@ -5,17 +5,17 @@
 What Floyd recovers, declines and analyses on real crates, one row per crate,
 from a sweep of pinned open-source crates.
 
-- **Floyd commit:** `690e1075583b` (the `cargo-floyd` binary the sweep ran)
+- **Floyd commit:** `690e1075583b` (the `cargo-floyd` binary the sweep ran). Between `690e1075583b` and this checkout (Floyd 0.4.0), the engine sources (`floyd/`, `cargo-floyd/`, `Cargo.toml`, `Cargo.lock`) differ only in version numbers and comments (`Cargo.lock`, `cargo-floyd/Cargo.toml`, `floyd/Cargo.toml`, `floyd/src/lib.rs`), so the sweep ran the same engine code as Floyd 0.4.0 as checked in here.
 - **Toolchain:** `rustc 1.101.0-nightly (708c94ef0 2026-11-03)`
 - **Sweep date:** 2026-11-14
 - **Machine:** macOS 13.7 x86_64, host x86_64-apple-darwin, CARGO_BUILD_JOBS=3
 - **Crates:** 19 (1 did not build: heapless)
 - **Per crate:** `cargo floyd test --format=json --all-candidates <flags> .` at the pinned commit (crate list: [`tools/yield/crates.tsv`](tools/yield/crates.tsv))
-- **Regenerate this file:** `python3 tools/yield/render_yield.py ~/Documents/Rust/floyd-sweep/sweep11` from the repo root (the sweep directory is the output of [`tools/yield/sweep.sh`](tools/yield/sweep.sh); it is not checked in)
+- **Regenerate this file:** `python3 tools/yield/render_yield.py <sweep-dir>` from the repo root, where `<sweep-dir>` is the output of [`tools/yield/sweep.sh`](tools/yield/sweep.sh) (not checked in)
 
 ## How to read this
 
-*Functions with a decision* is the denominator: decisions Floyd recovered (*recovered*, the JSON `candidates`) plus `out_of_scope` entries whose reason is not `no_decision`, i.e. functions that contain a decision Floyd declined. Entries are counted as Floyd reports them, one per MIR body, so monomorphised or macro-stamped copies of one source function count separately. `no_decision` entries (assert-only, derived impls, plain enum matches, `?`/loop plumbing, drop flags) contain no user-written Boolean decision and are listed separately below. A recovered decision is either *analysed* (MC/DC analysis against the tests' coverage) or *not measurable* (its coverage cannot be attributed; reasons as in the JSON). Condition columns count every condition of every analysed decision, not only the decision the text report selects. *UNKNOWN (multi-evaluation)* is the `Ambiguous` status: a test evaluated the decision more than once and the aggregate counters cannot say which rows ran.
+Every count is of **source functions**: Floyd reports one entry per MIR body, and entries are deduplicated within a crate by (source file, line, function name), so a function compiled into both the library and a test harness, or instantiated several times, counts once. Raw MIR-body counts are in a separate table under Notes. *Functions with a decision* is the denominator: functions with a decision Floyd recovered (*recovered*, the JSON `candidates`) plus functions listed in `out_of_scope` with a reason other than `no_decision`, i.e. that contain a decision Floyd declined. `no_decision` functions (assert-only, derived impls, plain enum matches, `?`/loop plumbing, drop flags) contain no user-written Boolean decision and are listed separately below. A recovered function is either *analysed* (MC/DC analysis against the tests' coverage) or *not measurable* (its coverage cannot be attributed; reasons as in the JSON). Condition columns count every condition of every analysed function, not only the decision the text report selects. *UNKNOWN (multi-evaluation)* is the `Ambiguous` status: a test evaluated the decision more than once and the aggregate counters cannot say which rows ran.
 
 ## What this table does not claim
 
@@ -34,50 +34,75 @@ from a sweep of pinned open-source crates.
 | chrono | `6adaa52` | - | analysed (0) | 213 | 13 | 200 | 0 | 0 | 0 | 13 | 14 | 1 | 5 | 0 |
 | cortex-m | `b79801c` | - | no_candidates (1) | 44 | 0 | 44 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | dbc-parser | `bc28d7b` | - | analysed (2) | 37 | 1 | 36 | 0 | 0 | 0 | 1 | 0 | 0 | 1 | 0 |
-| fixed | `95fe9d1` | `--max-mir-size=200` | analysed (0) | 1255 | 32 | 1221 | 0 | 2 | 22 (ambiguous_spans 10, no_branch_region 12) | 10 | 8 | 0 | 2 | 0 |
+| fixed | `95fe9d1` | `--max-mir-size=200` | analysed (0) | 366 | 23 | 341 | 0 | 2 | 13 (ambiguous_spans 1, no_branch_region 12) | 10 | 8 | 0 | 2 | 0 |
 | hashbrown | `5b92ed0d` | - | analysed (2) | 95 | 1 | 93 | 0 | 1 | 0 | 1 | 0 | 0 | 1 | 0 |
-| heapless | `1d3dace9` | - | build_failed (1) | - | - | - | - | - | - | - | - | - | - | - |
+| heapless (not in totals) | `1d3dace9` | - | build_failed (1) | - | - | - | - | - | - | - | - | - | - | - |
 | hex | `e25a870` | - | no_candidates (1) | 6 | 0 | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | ipnet | `13c5c58` | - | analysed (2) | 41 | 2 | 39 | 0 | 0 | 0 | 2 | 0 | 0 | 2 | 0 |
-| percent-encoding | `cad4a84` | - | no_candidates (1) | 5 | 0 | 4 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 |
+| percent-encoding (included in url, not in totals) | `cad4a84` | - | no_candidates (1) | 5 | 0 | 4 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 |
 | regex | `94ac45b` | - | no_candidates (1) | 31 | 0 | 31 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | thiserror | `3b29f01` | - | no_candidates (1) | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| time | `3ce1048` | `--all-features --max-mir-size=150` | analysed (0) | 442 | 44 | 398 | 0 | 0 | 41 (ambiguous_spans 10, external_macro 4, no_branch_region 24, uninstrumented 3) | 3 | 2 | 0 | 1 | 0 |
-| unicode-ident | `28018f2` | - | no_candidates (1) | 6 | 0 | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| time | `3ce1048` | `--all-features --max-mir-size=150` | analysed (0) | 396 | 35 | 361 | 0 | 0 | 32 (ambiguous_spans 2, external_macro 4, no_branch_region 23, uninstrumented 3) | 3 | 2 | 0 | 1 | 0 |
+| unicode-ident | `28018f2` | - | no_candidates (1) | 4 | 0 | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | url | `cad4a84` | - | analysed (0) | 177 | 17 | 157 | 2 | 1 | 15 (external_macro 13, no_branch_region 2) | 2 | 2 | 0 | 0 | 0 |
 | uuid | `7c7326d` | - | analysed (0) | 27 | 1 | 26 | 0 | 0 | 0 | 1 | 1 | 0 | 0 | 0 |
-| **total (18 crates with output)** |  |  |  | **2846** | **118** | **2721** | **2** | **5** | **80 (ambiguous_spans 20, external_macro 17, no_branch_region 40, uninstrumented 3)** | **38** | **33** | **1** | **13** | **0** |
+| **total (17 crates)** |  |  |  | **1904** | **100** | **1798** | **2** | **4** | **62 (ambiguous_spans 3, external_macro 17, no_branch_region 39, uninstrumented 3)** | **38** | **33** | **1** | **13** | **0** |
 
-Analysed decisions over functions with a decision: 38 / 2846 = 1.3%.
-Every recovered decision is either analysed or not measurable.
+Analysed functions over functions with a decision: 38 / 1904 = 2.0%.
+Every recovered function is either analysed or not measurable.
 
 ## Notes
 
-- `percent-encoding` and `url` are the same repository at commit `cad4a84`; 30 `out_of_scope` entries (same name, file, line and reason) appear in both rows, 5 of them declined (in the denominator) and the rest `no_decision`. The totals count them twice.
+- `percent-encoding` is a member of the `url` workspace at the same commit (`cad4a84`), and every one of its 30 functions also appears in `url`'s run. Its row is kept for reference and marked "included in url"; the totals count those functions once, under `url`.
 - `heapless`: build failed, no analysis (Floyd's error: "instrumented build failed: rustc crashed (internal compiler error) (`heapless` (lib test))"). Excluded from the totals.
+- Functions whose MIR bodies were declined in one copy and `no_decision` in another count as declined: fixed 2.
+
+**Raw MIR-body counts (not deduplicated).** For reference only: one per entry in Floyd's JSON, so copies of one source function count separately. The main table does not use these.
+
+| crate | candidates | analyses | not measurable | out_of_scope declined | out_of_scope no_decision | candidates + declined |
+|---|---:|---:|---:|---:|---:|---:|
+| anyhow | 2 | 1 | 1 | 122 | 78 | 124 |
+| base64 | 2 | 2 | 0 | 50 | 162 | 52 |
+| blake3 | 1 | 0 | 1 | 43 | 56 | 44 |
+| bytes | 2 | 2 | 0 | 245 | 582 | 247 |
+| chrono | 13 | 13 | 0 | 200 | 456 | 213 |
+| cortex-m | 0 | 0 | 0 | 44 | 77 | 44 |
+| dbc-parser | 1 | 1 | 0 | 36 | 472 | 37 |
+| fixed | 32 | 10 | 22 | 1223 | 1076 | 1255 |
+| hashbrown | 1 | 1 | 0 | 94 | 267 | 95 |
+| hex | 0 | 0 | 0 | 6 | 23 | 6 |
+| ipnet | 2 | 2 | 0 | 39 | 102 | 41 |
+| percent-encoding | 0 | 0 | 0 | 5 | 25 | 5 |
+| regex | 0 | 0 | 0 | 31 | 73 | 31 |
+| thiserror | 0 | 0 | 0 | 0 | 63 | 0 |
+| time | 44 | 3 | 41 | 398 | 1473 | 442 |
+| unicode-ident | 0 | 0 | 0 | 6 | 6 | 6 |
+| url | 17 | 2 | 15 | 160 | 170 | 177 |
+| uuid | 1 | 1 | 0 | 26 | 84 | 27 |
+| **total (17 crates, as above)** | **118** | **38** | **80** | **2723** | **5220** | **2841** |
 
 ## Not in the denominator
 
-`no_decision` entries by detail, and CTFE bodies (compile-time evaluation copies of runtime functions, `out_of_scope_summary.ctfe_bodies_skipped`), which Floyd counts but does not list.
+`no_decision` functions by detail (deduplicated as above; a function with several details is counted under the first alphabetically), and CTFE bodies (compile-time evaluation copies of runtime functions, `out_of_scope_summary.ctfe_bodies_skipped`, a raw count), which Floyd counts but does not list.
 
 | crate | no_decision | no_decision: assert_only | no_decision: derived_impl | no_decision: drop_flags_only | no_decision: pattern_match_only | no_decision: question_mark_or_loop_only | no_decision: std_macro_only | CTFE bodies skipped |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| anyhow | 78 | 26 | 4 | 6 | 19 | 1 | 22 | 0 |
+| anyhow | 70 | 21 | 4 | 5 | 19 | 1 | 20 | 0 |
 | base64 | 162 | 9 | 13 | 6 | 29 | 49 | 56 | 7 |
 | blake3 | 56 | 7 | 4 | 1 | 8 | 11 | 25 | 0 |
-| bytes | 582 | 421 | 1 | 8 | 16 | 18 | 118 | 0 |
+| bytes | 580 | 421 | 1 | 8 | 16 | 18 | 116 | 0 |
 | chrono | 456 | 58 | 54 | 12 | 123 | 47 | 162 | 96 |
 | cortex-m | 77 | 4 | 36 | 2 | 12 | 8 | 15 | 3 |
-| dbc-parser | 472 | 5 | 349 | 0 | 15 | 22 | 81 | 0 |
-| fixed | 1076 | 435 | 3 | 49 | 505 | 42 | 42 | 1329 |
+| dbc-parser | 433 | 5 | 310 | 0 | 15 | 22 | 81 | 0 |
+| fixed | 245 | 67 | 3 | 5 | 104 | 24 | 42 | 1329 |
 | hashbrown | 267 | 71 | 3 | 34 | 93 | 35 | 31 | 2 |
 | hex | 23 | 0 | 2 | 2 | 5 | 0 | 14 | 0 |
 | ipnet | 102 | 7 | 23 | 0 | 43 | 3 | 26 | 5 |
-| percent-encoding | 25 | 2 | 1 | 0 | 4 | 3 | 15 | 0 |
+| percent-encoding (included in url) | 25 | 2 | 1 | 0 | 4 | 3 | 15 | 0 |
 | regex | 73 | 14 | 4 | 4 | 8 | 6 | 37 | 0 |
-| thiserror | 63 | 4 | 47 | 1 | 1 | 0 | 10 | 0 |
-| time | 1473 | 82 | 218 | 30 | 321 | 112 | 710 | 261 |
+| thiserror | 61 | 4 | 47 | 1 | 1 | 0 | 8 | 0 |
+| time | 1457 | 82 | 218 | 30 | 308 | 109 | 710 | 261 |
 | unicode-ident | 6 | 0 | 0 | 0 | 0 | 1 | 5 | 0 |
-| url | 170 | 31 | 23 | 7 | 39 | 9 | 61 | 4 |
+| url | 164 | 26 | 23 | 7 | 39 | 9 | 60 | 4 |
 | uuid | 84 | 25 | 9 | 2 | 7 | 13 | 28 | 16 |
-| **total** | **5245** | **1201** | **794** | **164** | **1248** | **380** | **1458** | **1723** |
+| **total (17 crates)** | **4316** | **821** | **754** | **119** | **830** | **356** | **1436** | **1723** |

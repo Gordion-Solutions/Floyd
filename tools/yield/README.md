@@ -16,8 +16,12 @@ python3 tools/yield/render_yield.py SWEEP_DIR            # writes ./YIELD.md
 python3 tools/yield/render_yield.py SWEEP_DIR -o -       # print instead
 ```
 
-The output depends only on `SWEEP_DIR` (no current date or environment), so running it twice
-gives the same file. The definitions behind each column are in the script's docstring and in
+The output depends only on `SWEEP_DIR` and on a read-only `git diff` between the sweep binary's
+commit and this checkout's engine sources (to state whether they match); there is no current
+date or environment in it, so running it twice gives the same file. Counts are of source
+functions: entries are deduplicated per crate by (source file, line, function name), and a
+row whose functions are all contained in another row's run (percent-encoding in url) is
+marked and left out of the totals. The definitions behind each column are in the script's docstring and in
 the "How to read this" section of `YIELD.md`.
 
 ## Re-run the sweep
