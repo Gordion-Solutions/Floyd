@@ -1,0 +1,21 @@
+# Pinned crate list for the yield sweep (sweep 11).
+# name	upstream	commit	package dir (relative to the clone)	cargo floyd flags
+heapless	https://github.com/rust-embedded/heapless	1d3dace9d0ec77f8546da87b0b94873a07b98ad9	.	
+hex	https://github.com/KokaKiwi/rust-hex	e25a8701f7f6b5ec4acedffcb4a45cfb69cc34eb	.	
+thiserror	https://github.com/dtolnay/thiserror	3b29f0107e7900860c7a061c069958569eb458e7	.	
+time	https://github.com/time-rs/time	3ce1048391093bfd058b06140357856a9a9e06e1	.	--all-features --max-mir-size=150
+unicode-ident	https://github.com/dtolnay/unicode-ident	28018f288934fa6be60a6e791e071b7a7195643e	.	
+base64	https://github.com/marshallpierce/rust-base64	5b98ee180cc7c2a64af6cb12c724b1721550e0d0	.	
+uuid	https://github.com/uuid-rs/uuid	7c7326d55fd502d890169100f64c941b753500da	.	
+fixed	https://gitlab.com/tspiteri/fixed	95fe9d1db5098d2fa273525a94baf8a53224c1e6	.	--max-mir-size=200
+chrono	https://github.com/chronotope/chrono	6adaa5240c26fecb7bd9077334a91f8f67f4f3fe	.	
+ipnet	https://github.com/krisprice/ipnet	13c5c5873c02127679b1e8e64b538e4e36942640	.	
+dbc-parser	https://github.com/oxibus/can-dbc	bc28d7b3d657a621e0ccdc0bcb85c7702d61424a	.	
+blake3	https://github.com/BLAKE3-team/BLAKE3	f55849f89cd85083c1c9daa2c5de20766f309c00	.	
+hashbrown	https://github.com/rust-lang/hashbrown	5b92ed0d3772945bfbb42876abe8e8c8f2eeecb0	.	
+url	https://github.com/servo/rust-url	cad4a844d8de6100f18b0ca17603ac3866a13c1f	.	
+percent-encoding	https://github.com/servo/rust-url	cad4a844d8de6100f18b0ca17603ac3866a13c1f	percent_encoding	
+cortex-m	https://github.com/rust-embedded/cortex-m	b79801ce4884fe46105b562f701a7d2fd5c586c7	.	
+regex	https://github.com/rust-lang/regex	94ac45b2a6e7b1c30927feb5b66c5ded5b7ad447	.	
+anyhow	https://github.com/dtolnay/anyhow	bb1b0f9af0f645d5fdf1ac63a1fcbf3975ee452c	.	
+bytes	https://github.com/tokio-rs/bytes	c08f87663a04eac3b9ab2dfa1976852d9b525a8c	.	
