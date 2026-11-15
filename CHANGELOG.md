@@ -33,6 +33,9 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `YIELD.md`: per-crate yield table (functions with a decision, recovered, declined by reason,
+  not measurable by reason, analysed, condition statuses) rendered by `tools/yield/render_yield.py`
+  from a pinned sweep of 19 public crates; `tools/yield/sweep.sh` and `crates.tsv` reproduce the sweep.
 - **`--toolchain=<name>|env|path:<dir>`** (or `FLOYD_TOOLCHAIN`;
   default `nightly`, the previous behaviour). `<name>` is a rustup
   toolchain (`cargo +<name>`); `env` uses `$CARGO` / `$RUSTC`, else
