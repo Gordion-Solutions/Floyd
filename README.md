@@ -716,16 +716,19 @@ whose outcome is the arm taken carries `lift` (`call_arms` or
 DO-178C, ISO 26262, and IEC 61508 require MC/DC analysis at the
 highest safety levels. Until recently `rustc` shipped partial MC/DC
 instrumentation behind `-Zcoverage-options=mcdc`, but that
-implementation was removed in August 2025 (PR #144999). No
+implementation was removed in August 2025 (PR #144999). AdaCore
+now leads the 2026 Rust project goal to reinstate it. No
 cargo-native open-source MC/DC tool exists at the time of writing.
 Floyd fills that gap.
 
 The closest neighbouring tool is AdaCore's [gnatcov][gnatcov],
-which is qualified for DO-178C Level A and ISO 26262 ASIL-D — but
-only on Ada and SPARK, and via the AdaCore toolchain. Floyd takes
+qualified for DO-178C Level A and ISO 26262 ASIL-D on Ada and
+SPARK, and since November 2026 offering MC/DC for Rust through
+GNAT Pro for Rust and its own instrumenting compiler. Floyd takes
 the qualification-by-validation route on rustc's existing
-instrumentation, with the differential corpus in this repo as the
-load-bearing evidence artifact.
+instrumentation, on stable or nightly toolchains, with the
+differential corpus in this repo as the load-bearing evidence
+artifact.
 
 [gnatcov]: https://www.adacore.com/gnatpro/toolsuite/gnatcoverage
 
