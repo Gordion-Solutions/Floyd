@@ -26,7 +26,11 @@ pub enum Mode {
 ///
 /// Expected: a candidate located in this file. The decision's spans
 /// all lie in `core`, so coverage cannot measure it:
-/// `not_measurable` with reason `external_macro`.
+/// `not_measurable` with reason `external_macro`, whether rustc
+/// prints those spans as `/rustc/<hash>/library/..` (no `rust-src`
+/// component, as on CI) or as the toolchain's
+/// `lib/rustlib/src/rust/library/..` (`rust-src` installed). Floyd
+/// once reported `no_branch_region` without `rust-src`.
 pub fn mode_is_live(m: Mode) -> bool {
     matches!(m, Mode::Armed | Mode::Test)
 }

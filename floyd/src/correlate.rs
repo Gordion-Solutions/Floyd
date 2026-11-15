@@ -942,8 +942,8 @@ fn integer_solutions(
             continue;
         };
         let p = system[row].0[column];
-        for j in 0..vars {
-            system[row].0[j] = system[row].0[j].div(p)?;
+        for coef in system[row].0.iter_mut().take(vars) {
+            *coef = coef.div(p)?;
         }
         system[row].1 = system[row].1.div(p)?;
         let (pivot_coefs, pivot_rhs) = system[row].clone();
@@ -1405,7 +1405,13 @@ impl CandidateCoverage {
 ///   decision, not a heuristic over names or spans.
 /// - [`NotMeasurableReason::ExternalMacro`]: `workspace` is `true`
 ///   (paths are normalised against the workspace root) and every
-///   decision span lies outside the root.
+///   decision span lies outside the root. The spans are the
+///   conditions' spans as rustc printed them, `/rustc/<hash>/library`
+///   ones included: [`PreparedMir::decision_spans`] leaves those out
+///   (they never join), but whether rustc prints `core`'s
+///   `matches!` as `/rustc/<hash>/library/..` or as the toolchain's
+///   `lib/rustlib/src/rust/library/..` depends only on whether the
+///   `rust-src` component is installed, and the verdict must not.
 ///
 /// `None` when neither applies; the join then decides.
 pub fn mir_not_measurable(
@@ -1426,7 +1432,7 @@ pub fn mir_not_measurable(
         });
     }
     let paths = paths?;
-    let spans = prepared.decision_spans(fn_idx, tree);
+    let spans = raw_decision_spans(f, tree);
     if !spans.is_empty() && spans.iter().all(|s| paths.is_outside_root(&s.file)) {
         return Some(NotMeasurable {
             reason: NotMeasurableReason::ExternalMacro,
@@ -1438,6 +1444,23 @@ pub fn mir_not_measurable(
         });
     }
     None
+}
+
+/// The spans of the conditions the first decision of `tree` tests,
+/// as rustc printed them (not normalised, `/rustc/` spans kept),
+/// sorted and deduplicated. Conditions with no span are left out.
+fn raw_decision_spans(f: &MirFunction, tree: &DecisionTree) -> Vec<SourceSpan> {
+    let Some(decision) = tree.decisions.first() else {
+        return Vec::new();
+    };
+    let spans = collect_condition_spans(f);
+    let mut out: Vec<SourceSpan> = crate::masking::collect_conditions(decision)
+        .iter()
+        .filter_map(|c| spans.get(c).cloned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Join one candidate to every test's [`CoverageIndex`].
@@ -3776,6 +3799,77 @@ fn parse_one_file::{closure#0}(_1: bool) -> bool {
         // Without a workspace root (single-file mode) it is left to
         // the join.
         assert_eq!(mir_not_measurable(&prepared, 0, &tree, true, None), None);
+    }
+
+    /// A user `matches!` (fixtures/mcdc-cases `mode_is_live`), as
+    /// nightly 1.102 prints it. The `switchInt` and arms are in
+    /// `core`'s `matches!`; only the discriminant read is in the
+    /// workspace. Without the `rust-src` component rustc prints the
+    /// `core` spans as `/rustc/<hash>/library/..`, with it as the
+    /// toolchain's `lib/rustlib/src/rust/library/..`: the verdict is
+    /// `ExternalMacro` either way (it was `NoBranchRegion` without
+    /// `rust-src`, because the normalised decision spans drop
+    /// `/rustc/` spans and so were empty).
+    #[test]
+    fn user_matches_is_external_with_or_without_rust_src() {
+        const MIR: &str = r#"
+fn no_decision::mode_is_live(_1: no_decision::Mode) -> bool {
+    debug m => _1;                       // in scope 0 at fixtures/mcdc-cases/src/no_decision.rs:30:21: 30:22
+    let mut _0: bool;                    // return place in scope 0 at fixtures/mcdc-cases/src/no_decision.rs:30:33: 30:37
+    let mut _2: isize;                   // in scope 0 at fixtures/mcdc-cases/src/no_decision.rs:31:17: 31:28
+    scope 1 {
+    }
+
+    coverage Code { bcb: bcb0 } => fixtures/mcdc-cases/src/no_decision.rs:30:1: 30:37 (#0);
+    coverage Code { bcb: bcb0 } => fixtures/mcdc-cases/src/no_decision.rs:31:5: 31:13 (#0);
+    coverage Code { bcb: bcb0 } => fixtures/mcdc-cases/src/no_decision.rs:31:14: 31:15 (#0);
+    coverage Code { bcb: bcb2 } => fixtures/mcdc-cases/src/no_decision.rs:32:1: 32:2 (#0);
+
+    bb0: {
+        Coverage::VirtualCounter(bcb0);  // scope 1 at CORE:434:9: 434:9
+        _2 = discriminant(_1);           // scope 1 at fixtures/mcdc-cases/src/no_decision.rs:31:14: 31:15
+        switchInt(move _2) -> [0: bb2, 1: bb2, 2: bb1, otherwise: bb4]; // scope 1 at CORE:434:9: 434:9
+    }
+
+    bb1: {
+        Coverage::VirtualCounter(bcb1);  // scope 1 at CORE:436:18: 436:23
+        _0 = const false;                // scope 1 at CORE:436:18: 436:23
+        goto -> bb3;                     // scope 1 at CORE:436:18: 436:23
+    }
+
+    bb2: {
+        Coverage::VirtualCounter(bcb3);  // scope 1 at fixtures/mcdc-cases/src/no_decision.rs:31:17: 31:41
+        _0 = const true;                 // scope 1 at CORE:435:39: 435:43
+        goto -> bb3;                     // scope 1 at CORE:435:39: 435:43
+    }
+
+    bb3: {
+        Coverage::VirtualCounter(bcb2);  // scope 0 at fixtures/mcdc-cases/src/no_decision.rs:32:2: 32:2
+        return;                          // scope 0 at fixtures/mcdc-cases/src/no_decision.rs:32:2: 32:2
+    }
+
+    bb4: {
+        unreachable;                     // scope 0 at fixtures/mcdc-cases/src/no_decision.rs:30:1: 32:2
+    }
+}
+"#;
+        let paths = PathNormaliser::new(Some(std::path::Path::new("/home/runner/work/floyd")));
+        for core in [
+            "/rustc/5f4effd579500175af844241eb179e756190f1e7/library/core/src/macros/mod.rs",
+            "/home/runner/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+        ] {
+            let mir = mir::parse_text(&MIR.replace("CORE", core)).expect("MIR parses");
+            let prepared = prepare_mir(&mir, &paths);
+            let node = decision::decompose_function(&mir.functions[0]).expect("decomposes");
+            let tree = DecisionTree {
+                decisions: vec![node],
+                ..Default::default()
+            };
+            let nm = mir_not_measurable(&prepared, 0, &tree, true, Some(&paths))
+                .unwrap_or_else(|| panic!("classified with core at {core}"));
+            assert_eq!(nm.reason, NotMeasurableReason::ExternalMacro, "{core}");
+            assert!(nm.detail.contains(core), "{core}: {}", nm.detail);
+        }
     }
 
     #[test]

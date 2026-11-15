@@ -43,7 +43,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   only (through `floyd-rustc-shim`), never for cargo, build scripts or
   the tests. `llvm-profdata` / `llvm-cov` come from the chosen
   toolchain's sysroot. The `fixtures/mcdc-cases` verdicts are identical
-  on stable 1.99.1 and nightly 1.101.
+  on stable 1.99.1 and 1.100 and on nightly 1.101 and 1.102, with or
+  without `rust-src`.
 - **Toolchain in every report:** a `Toolchain:` line in the text
   header, a JSON `toolchain` object (`name`, `version`, `release`,
   `host`, `channel`, `rustc_bootstrap`; `null` when the toolchain
@@ -110,6 +111,17 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   entry, a counted CTFE body, or left out by `--only`.
   `floyd::correlate::provenance_for` locates such a decision at the
   user's call, not in `core`.
+- **`not_measurable` reason depended on the `rust-src` component.**
+  A decision whose conditions all expand from `core` (a user
+  `matches!`) is `external_macro`. rustc prints those spans as the
+  toolchain's `lib/rustlib/src/rust/library/..` when `rust-src` is
+  installed and as `/rustc/<hash>/library/..` when it is not, and the
+  check read the normalised decision spans, which leave `/rustc/` spans
+  out: without `rust-src` (as on CI) the span list was empty, the check
+  never fired, and the same decision was reported `no_branch_region`.
+  The check now reads the condition spans as rustc printed them, so the
+  reason is `external_macro` with or without `rust-src`, on any
+  toolchain.
 - **Exponential decomposition.** rust-url's 40-alternative
   `is_url_code_point` took minutes and over a gigabyte of memory to
   decompose; it is now declined as `too_many_conditions` in
