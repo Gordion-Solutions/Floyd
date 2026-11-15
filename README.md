@@ -235,7 +235,8 @@ no Boolean decision the user wrote: only `assert_eq!`-style standard
 library macro code, derived impls, plain enum `match`es, `?` and
 `for` loops, assertions or drop flags. Floyd reports these as
 `no_decision` with a `detail`, separately from real declines (see
-[JSON summary](#json-summary)). Of the functions with a real
+[JSON summary](#json-summary)). Per-crate counts from the latest
+sweep are in [YIELD.md](YIELD.md). Of the functions with a real
 decision, the main shapes still declined, from a hand-classified
 sample (a function often shows several) are: conditions that are
 call results (`if self.low.get() && ..`, `==` on non-primitive types,
